@@ -9,6 +9,7 @@ export const OFFLINE_LOCAL_UID = 'local-offline-owner';
 
 export type OfflineSyncOpType =
   | 'SAVE_PARCEL'
+  | 'DELETE_PARCEL'
   | 'CREATE_HISTORY'
   | 'ARCHIVE_HISTORY'
   | 'DELETE_HISTORY';
@@ -35,6 +36,8 @@ export interface OfflineSyncOperation {
 export interface OfflineStorageAdapter {
   loadParcels(): Promise<ParcelRecord[]>;
   saveParcel(parcel: ParcelRecord): Promise<void>;
+  deleteParcel?(parcelId: string): Promise<void>;
+  loadDeletedParcelIds?(): Promise<string[]>;
   loadHistory(): Promise<UserHistoryRecord[]>;
   saveHistoryItem(item: UserHistoryRecord): Promise<void>;
   deleteHistoryItem(entryId: string): Promise<void>;
@@ -45,10 +48,12 @@ export interface OfflineStorageAdapter {
 
 export interface FirestoreSyncTransport {
   saveParcel: (uid: string, parcel: ParcelRecord) => Promise<void>;
+  deleteParcel?: (uid: string, parcelId: string) => Promise<void>;
   createHistory: (uid: string, entry: UserHistoryRecord) => Promise<void>;
   archiveHistory: (uid: string, entryId: string) => Promise<void>;
   deleteHistory: (uid: string, entryId: string) => Promise<void>;
   syncParcelToBackend?: (parcel: ParcelRecord) => Promise<void>;
+  deleteParcelFromBackend?: (parcelId: string) => Promise<void>;
 }
 
 export interface SyncFlushResult {
@@ -67,6 +72,7 @@ const STORE_HISTORY = 'history';
 const STORE_OUTBOX = 'outbox';
 
 const LS_KEY_PARCELS = 'fs_offline_parcels_v1';
+const LS_KEY_DELETED_PARCELS = 'fs_offline_deleted_parcels_v1';
 const LS_KEY_HISTORY = 'fs_offline_history_v1';
 const LS_KEY_OUTBOX = 'fs_offline_outbox_v1';
 
@@ -137,6 +143,11 @@ export function coalesceOutboxOperations(ops: OfflineSyncOperation[]): OfflineSy
 
   for (const op of sorted) {
     if (op.type === 'SAVE_PARCEL') {
+      for (let i = result.length - 1; i >= 0; i--) {
+        if (result[i].type === 'DELETE_PARCEL' && result[i].targetId === op.targetId) {
+          result.splice(i, 1);
+        }
+      }
       const existingIdx = result.findIndex(
         (r) => r.type === 'SAVE_PARCEL' && r.targetId === op.targetId
       );
@@ -144,9 +155,25 @@ export function coalesceOutboxOperations(ops: OfflineSyncOperation[]): OfflineSy
         result[existingIdx] = {
           ...result[existingIdx],
           ...op,
+          backendSynced: false,
           createdAtMs: result[existingIdx].createdAtMs,
         };
       } else {
+        result.push({ ...op });
+      }
+      continue;
+    }
+
+    if (op.type === 'DELETE_PARCEL') {
+      for (let i = result.length - 1; i >= 0; i--) {
+        if (result[i].type === 'SAVE_PARCEL' && result[i].targetId === op.targetId) {
+          result.splice(i, 1);
+        }
+      }
+      const alreadyQueuedDelete = result.some(
+        (r) => r.type === 'DELETE_PARCEL' && r.targetId === op.targetId
+      );
+      if (!alreadyQueuedDelete) {
         result.push({ ...op });
       }
       continue;
@@ -211,17 +238,22 @@ export function coalesceOutboxOperations(ops: OfflineSyncOperation[]): OfflineSy
 
 export function mergeParcelsWithOffline(
   baseParcels: ParcelRecord[],
-  offlineParcels: ParcelRecord[]
+  offlineParcels: ParcelRecord[],
+  deletedParcelIds: string[] = []
 ): ParcelRecord[] {
+  const deletedSet = new Set(deletedParcelIds);
   const byId = new Map<string, ParcelRecord>();
   for (const p of offlineParcels) {
-    byId.set(p.id, p);
+    if (!deletedSet.has(p.id)) {
+      byId.set(p.id, p);
+    }
   }
   const merged: ParcelRecord[] = [];
   const seen = new Set<string>();
 
   // Offline-created custom parcels first so newly created parcels appear at top of selector
   for (const p of offlineParcels) {
+    if (deletedSet.has(p.id)) continue;
     if (!baseParcels.some((b) => b.id === p.id)) {
       merged.push(p);
       seen.add(p.id);
@@ -229,9 +261,14 @@ export function mergeParcelsWithOffline(
   }
 
   for (const b of baseParcels) {
-    if (seen.has(b.id)) continue;
+    if (deletedSet.has(b.id) || seen.has(b.id)) continue;
     merged.push(byId.get(b.id) ?? b);
     seen.add(b.id);
+  }
+
+  // Safety invariant: always preserve at least 1 parcel so activeParcel is never undefined
+  if (merged.length === 0 && baseParcels.length > 0) {
+    return [baseParcels[0]];
   }
 
   return merged;
@@ -246,7 +283,7 @@ export function mergeHistoryWithOffline(params: {
   const { remoteItems, localItems, outbox, activeUid } = params;
   const pendingIds = new Set(
     outbox
-      .filter((op) => op.type !== 'SAVE_PARCEL')
+      .filter((op) => op.type !== 'SAVE_PARCEL' && op.type !== 'DELETE_PARCEL')
       .map((op) => op.targetId)
   );
   const deletedPendingIds = new Set(
@@ -328,6 +365,7 @@ function writeLocalStorageJson<T>(key: string, value: T): void {
  */
 export function createMemoryOfflineStorageAdapter(): OfflineStorageAdapter {
   const parcelsMap = new Map<string, ParcelRecord>();
+  const deletedParcelIdsSet = new Set<string>();
   const historyMap = new Map<string, UserHistoryRecord>();
   let outboxList: OfflineSyncOperation[] = [];
 
@@ -337,7 +375,15 @@ export function createMemoryOfflineStorageAdapter(): OfflineStorageAdapter {
       return Array.from(parcelsMap.values());
     },
     async saveParcel(parcel) {
+      deletedParcelIdsSet.delete(parcel.id);
       parcelsMap.set(parcel.id, structuredClone(parcel));
+    },
+    async deleteParcel(parcelId) {
+      parcelsMap.delete(parcelId);
+      deletedParcelIdsSet.add(parcelId);
+    },
+    async loadDeletedParcelIds() {
+      return Array.from(deletedParcelIdsSet);
     },
     async loadHistory() {
       return Array.from(historyMap.values());
@@ -484,6 +530,13 @@ export function createBrowserOfflineStorageAdapter(): OfflineStorageAdapter {
 
     async saveParcel(parcel) {
       await memFallback.saveParcel(parcel);
+      const deletedLs = readLocalStorageJson<string[]>(LS_KEY_DELETED_PARCELS, []);
+      if (deletedLs.includes(parcel.id)) {
+        writeLocalStorageJson(
+          LS_KEY_DELETED_PARCELS,
+          deletedLs.filter((id) => id !== parcel.id)
+        );
+      }
       const existingLs = readLocalStorageJson<ParcelRecord[]>(LS_KEY_PARCELS, []);
       const nextLs = [parcel, ...existingLs.filter((p) => p.id !== parcel.id)];
       writeLocalStorageJson(LS_KEY_PARCELS, nextLs);
@@ -492,6 +545,30 @@ export function createBrowserOfflineStorageAdapter(): OfflineStorageAdapter {
       if (db) {
         await idbPut(db, STORE_PARCELS, parcel);
       }
+    },
+
+    async deleteParcel(parcelId) {
+      await memFallback.deleteParcel?.(parcelId);
+      const existingLs = readLocalStorageJson<ParcelRecord[]>(LS_KEY_PARCELS, []);
+      writeLocalStorageJson(
+        LS_KEY_PARCELS,
+        existingLs.filter((p) => p.id !== parcelId)
+      );
+      const deletedLs = readLocalStorageJson<string[]>(LS_KEY_DELETED_PARCELS, []);
+      if (!deletedLs.includes(parcelId)) {
+        writeLocalStorageJson(LS_KEY_DELETED_PARCELS, [...deletedLs, parcelId]);
+      }
+
+      const db = await getDb();
+      if (db) {
+        await idbDelete(db, STORE_PARCELS, parcelId);
+      }
+    },
+
+    async loadDeletedParcelIds() {
+      const lsIds = readLocalStorageJson<string[]>(LS_KEY_DELETED_PARCELS, []);
+      if (lsIds.length > 0) return lsIds;
+      return (await memFallback.loadDeletedParcelIds?.()) ?? [];
     },
 
     async loadHistory() {
@@ -590,15 +667,17 @@ export class OfflineSyncCoordinator {
 
   async hydrateState(): Promise<{
     parcels: ParcelRecord[];
+    deletedParcelIds: string[];
     history: UserHistoryRecord[];
     outbox: OfflineSyncOperation[];
   }> {
-    const [parcels, history, outbox] = await Promise.all([
+    const [parcels, deletedParcelIds, history, outbox] = await Promise.all([
       this.storage.loadParcels(),
+      this.storage.loadDeletedParcelIds ? this.storage.loadDeletedParcelIds() : Promise.resolve([]),
       this.storage.loadHistory(),
       this.storage.loadOutbox(),
     ]);
-    return { parcels, history, outbox };
+    return { parcels, deletedParcelIds, history, outbox };
   }
 
   private enqueueMutation<T>(fn: () => Promise<T>): Promise<T> {
@@ -623,6 +702,32 @@ export class OfflineSyncCoordinator {
         targetId: parcel.id,
         uid: uid || undefined,
         parcel,
+        createdAtMs: Date.now(),
+        attempts: 0,
+      };
+      const nextOutbox = coalesceOutboxOperations([...currentOutbox, op]);
+      await this.storage.saveOutbox(nextOutbox);
+    });
+
+    const syncResult = await this.flushOutbox(uid);
+    const updatedOutbox = await this.storage.loadOutbox();
+    return { outbox: updatedOutbox, syncResult };
+  }
+
+  async recordParcelDelete(parcelIdRaw: string, uid?: string | null): Promise<{
+    outbox: OfflineSyncOperation[];
+    syncResult: SyncFlushResult;
+  }> {
+    const parcelId = sanitizeOfflineId(parcelIdRaw, 'parcel');
+
+    await this.enqueueMutation(async () => {
+      await this.storage.deleteParcel?.(parcelId);
+      const currentOutbox = await this.storage.loadOutbox();
+      const op: OfflineSyncOperation = {
+        opId: `op-parcel-delete-${parcelId}`,
+        type: 'DELETE_PARCEL',
+        targetId: parcelId,
+        uid: uid || undefined,
         createdAtMs: Date.now(),
         attempts: 0,
       };
@@ -793,6 +898,29 @@ export class OfflineSyncCoordinator {
           }
 
           await this.transport.saveParcel(effectiveUid, op.parcel);
+          syncedCount += 1;
+          continue;
+        }
+
+        if (op.type === 'DELETE_PARCEL') {
+          if (!op.backendSynced && this.transport.deleteParcelFromBackend) {
+            try {
+              await this.transport.deleteParcelFromBackend(op.targetId);
+              op.backendSynced = true;
+            } catch {
+              // Non-fatal if Express in-memory endpoint is unreachable
+            }
+          }
+
+          if (!effectiveUid) {
+            awaitingAuthCount += 1;
+            remaining.push(op);
+            continue;
+          }
+
+          if (this.transport.deleteParcel) {
+            await this.transport.deleteParcel(effectiveUid, op.targetId);
+          }
           syncedCount += 1;
           continue;
         }

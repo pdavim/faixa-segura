@@ -270,3 +270,33 @@ export interface UserAccountProfile {
   phone: string;
 }
 
+export type ParcelDocumentCategory =
+  | 'CADERNETA_PREDIAL'
+  | 'BUPI_RGG'
+  | 'FATURA_LIMPEZA'
+  | 'AUTO_CONFORMIDADE'
+  | 'AUTORIZACAO_ICNF'
+  | 'OUTRO';
+
+export interface ParcelDocumentRecord {
+  id: string;
+  parcelId: string;
+  fileName: string;
+  category: ParcelDocumentCategory;
+  mimeType: string;
+  sizeBytes: number;
+  notes: string;
+  uploadedAtIso: string;
+  dataUrl?: string;
+}
+
+export interface UserAppSettings {
+  pirAlertThreshold: 3 | 4;
+  proximityAlertRadiusKm: 10 | 15 | 25;
+  autoDownloadCertificatePdf: boolean;
+  defaultBufferRule: '50M_BUILDING' | '100M_SETTLEMENT';
+  offlineAutoSync: boolean;
+  notifyQuotesWhatsapp: boolean;
+}
+
+

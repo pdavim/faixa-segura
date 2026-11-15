@@ -33,6 +33,7 @@ interface UserHistoryModalProps {
   onClose: () => void;
   authReady: boolean;
   profile: UserAccountProfile | null;
+  isCloudSession?: boolean;
   historyItems: AnnotatedHistoryRecord[];
   activeParcel: ParcelRecord;
   todayForecast?: DailyPirForecast;
@@ -95,6 +96,7 @@ export const UserHistoryModal: React.FC<UserHistoryModalProps> = ({
   onClose,
   authReady,
   profile,
+  isCloudSession = false,
   historyItems,
   activeParcel,
   todayForecast,
@@ -370,7 +372,7 @@ export const UserHistoryModal: React.FC<UserHistoryModalProps> = ({
                       </span>
                       <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-[#16A34A]">
                         <UserCheck className="w-3.5 h-3.5" aria-hidden="true" />
-                        Sessão Ativa
+                        {isCloudSession ? 'Sessão Cloud Google' : 'Sessão Local no Dispositivo'}
                       </span>
                     </div>
                     <p className="text-xs text-slate-500 dark:text-slate-400 truncate tabular-nums">
@@ -381,6 +383,17 @@ export const UserHistoryModal: React.FC<UserHistoryModalProps> = ({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2 shrink-0">
+                  {!isCloudSession && isOnline && (
+                    <button
+                      type="button"
+                      disabled={signingIn}
+                      onClick={handleLoginClick}
+                      className="min-h-[40px] px-3 py-1.5 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] text-white dark:text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
+                    >
+                      <LogIn className="w-3.5 h-3.5" aria-hidden="true" />
+                      {signingIn ? 'A ligar...' : 'Ligar Google Cloud'}
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => setShowProfileEdit((v) => !v)}
@@ -394,10 +407,15 @@ export const UserHistoryModal: React.FC<UserHistoryModalProps> = ({
                     className="min-h-[40px] px-3 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap"
                   >
                     <LogOut className="w-3.5 h-3.5" aria-hidden="true" />
-                    Sair
+                    Terminar Sessão
                   </button>
                 </div>
               </div>
+              {authError && (
+                <p role="alert" className="text-xs font-semibold text-[#DC2626]">
+                  {authError}
+                </p>
+              )}
 
               {/* Optional Isolated PII Contact Editor */}
               {showProfileEdit && (
@@ -455,7 +473,7 @@ export const UserHistoryModal: React.FC<UserHistoryModalProps> = ({
                   <div className="flex justify-end">
                     <button
                       type="submit"
-                      disabled={savingProfile || !isOnline}
+                      disabled={savingProfile || (isCloudSession && !isOnline)}
                       className="min-h-[40px] px-4 py-1.5 rounded-xl bg-[#14532D] disabled:opacity-50 text-white dark:bg-[#22C55E] dark:text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap"
                     >
                       {profileSaved ? (

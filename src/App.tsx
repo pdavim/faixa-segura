@@ -7,13 +7,14 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   BookOpen,
   Download,
-  FileCheck2,
   History,
+  LogOut,
   Map as MapIcon,
   Moon,
   Sun,
   SunMedium,
   Tractor,
+  User as UserIcon,
   WifiOff,
 } from 'lucide-react';
 import type {
@@ -23,10 +24,12 @@ import type {
   ForestryProvider,
   MunicipalityInfo,
   NeighborComplaintRecord,
+  ParcelDocumentRecord,
   ParcelRecord,
   PirLevel,
   QuoteLead,
   UserAccountProfile,
+  UserAppSettings,
   UserHistoryCategory,
   UserHistoryRecord,
 } from './types/domain.ts';
@@ -45,7 +48,9 @@ import {
   archiveUserHistoryEntry,
   auth,
   deleteUserHistoryEntry,
+  deleteUserParcelFromCloud,
   ensureUserAnchorAndProfile,
+  isFirebaseConfigured,
   onAuthStateChanged,
   saveUserParcelToCloud,
   signInWithGooglePopup,
@@ -63,16 +68,38 @@ import {
   mergeParcelsWithOffline,
   type OfflineSyncOperation,
 } from './lib/offlineStorage.ts';
+import {
+  buildDefaultDemoProfile,
+  buildLocalSessionProfile,
+  clearLocalAuthSession,
+  detectEntryExperienceMode,
+  loadLocalAuthSession,
+  saveLocalAuthSession,
+  shouldAutoStartWorkspace,
+  type EntryModeOverride,
+} from './lib/appShellMode.ts';
+import {
+  createBrowserParcelDocumentStorage,
+  loadFavoriteProviderIds,
+  loadUserAppSettings,
+  removeParcelSafely,
+  saveFavoriteProviderIds,
+  saveUserAppSettings,
+  toggleFavoriteProviderId,
+} from './lib/userWorkspaceStore.ts';
 import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall.ts';
 import { TodayCockpitView } from './components/TodayCockpitView.tsx';
 import { MapZonesView } from './components/MapZonesView.tsx';
 import { CertifyQuotesView } from './components/CertifyQuotesView.tsx';
 import { ProvidersGuardianView } from './components/ProvidersGuardianView.tsx';
 import { DocsArchitectureView } from './components/DocsArchitectureView.tsx';
+import { UserManagementView } from './components/UserManagementView.tsx';
 import { CertificateVerifyModal } from './components/CertificateVerifyModal.tsx';
 import { UserHistoryModal } from './components/UserHistoryModal.tsx';
+import { PublicWebviewHomepage } from './components/PublicWebviewHomepage.tsx';
+import { WebAppOnboardingSplash } from './components/WebAppOnboardingSplash.tsx';
 
-type NavTab = 'today' | 'map' | 'certify' | 'providers' | 'docs';
+type NavTab = 'today' | 'map' | 'certify' | 'providers' | 'docs' | 'user';
 
 function buildInitialForecasts(dico: string): DailyPirForecast[] {
   const muni = MUNICIPALITIES.find((m) => m.dico === dico) ?? MUNICIPALITIES[0];
@@ -116,6 +143,12 @@ export default function App() {
   const [certificates, setCertificates] = useState<ComplianceCertificate[]>(INITIAL_CERTIFICATES);
   const [providers, setProviders] = useState<ForestryProvider[]>(INITIAL_PROVIDERS);
   const [quotes, setQuotes] = useState<QuoteLead[]>(INITIAL_QUOTES);
+  const [favoriteProviderIds, setFavoriteProviderIds] = useState<string[]>(() =>
+    loadFavoriteProviderIds()
+  );
+  const [userSettings, setUserSettings] = useState<UserAppSettings>(() => loadUserAppSettings());
+  const [parcelDocuments, setParcelDocuments] = useState<ParcelDocumentRecord[]>([]);
+  const docStorage = useMemo(() => createBrowserParcelDocumentStorage(), []);
 
   const activeParcel = parcels.find((p) => p.id === activeParcelId) ?? parcels[0];
 
@@ -136,9 +169,48 @@ export default function App() {
   const [verifyingCert, setVerifyingCert] = useState<ComplianceCertificate | null>(null);
   const [showIosInstallGuide, setShowIosInstallGuide] = useState(false);
 
-  // Firebase Auth + Offline-Resilient History & Parcel Sync State
+  // Firebase Cloud Auth + Persisted Local Field Session + Entry Mode State
   const [authReady, setAuthReady] = useState<boolean>(false);
-  const [userProfile, setUserProfile] = useState<UserAccountProfile | null>(null);
+  const [cloudUserProfile, setCloudUserProfile] = useState<UserAccountProfile | null>(null);
+  const [localSessionProfile, setLocalSessionProfile] = useState<UserAccountProfile | null>(() => {
+    const existing = loadLocalAuthSession();
+    if (existing) return existing;
+    if (typeof window !== 'undefined' && shouldAutoStartWorkspace(window.location.search)) {
+      const demo = buildDefaultDemoProfile(INITIAL_PARCELS[0].dico);
+      saveLocalAuthSession(demo);
+      return demo;
+    }
+    return null;
+  });
+  const [entryModeOverride, setEntryModeOverride] = useState<EntryModeOverride>(null);
+  const [isStandalonePwa, setIsStandalonePwa] = useState<boolean>(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return false;
+    return (
+      window.matchMedia('(display-mode: standalone)').matches ||
+      window.matchMedia('(display-mode: fullscreen)').matches
+    );
+  });
+
+  const userProfile = cloudUserProfile ?? localSessionProfile;
+  const isCloudSession = Boolean(cloudUserProfile);
+  const isAuthenticated = Boolean(userProfile);
+
+  const entryExperienceMode = useMemo(() => {
+    const search = typeof window !== 'undefined' ? window.location.search : '';
+    const navStandalone =
+      typeof window !== 'undefined'
+        ? (window.navigator as unknown as { standalone?: boolean }).standalone === true
+        : false;
+    const referrer = typeof document !== 'undefined' ? document.referrer : '';
+    return detectEntryExperienceMode({
+      search,
+      isStandaloneDisplay: isStandalonePwa,
+      navigatorStandalone: navStandalone,
+      referrer,
+      overrideMode: entryModeOverride,
+    });
+  }, [isStandalonePwa, entryModeOverride]);
+
   const [remoteHistory, setRemoteHistory] = useState<UserHistoryRecord[]>([]);
   const [localHistory, setLocalHistory] = useState<UserHistoryRecord[]>([]);
   const [outboxOps, setOutboxOps] = useState<OfflineSyncOperation[]>([]);
@@ -152,8 +224,11 @@ export default function App() {
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const isOnline = useOnlineStatus();
 
-  const userUidRef = useRef<string | null>(null);
-  userUidRef.current = userProfile?.uid ?? null;
+  // Only flush to Cloud Firestore when authenticated via real Firebase Auth (cloudUserProfile)
+  const cloudUidRef = useRef<string | null>(null);
+  cloudUidRef.current = cloudUserProfile?.uid ?? null;
+  const activeUidRef = useRef<string | null>(null);
+  activeUidRef.current = userProfile?.uid ?? null;
 
   const syncCoordinator = useMemo(() => {
     const storage = createBrowserOfflineStorageAdapter();
@@ -161,6 +236,7 @@ export default function App() {
       storage,
       transport: {
         saveParcel: saveUserParcelToCloud,
+        deleteParcel: deleteUserParcelFromCloud,
         createHistory: syncHistoryEntryToCloud,
         archiveHistory: archiveUserHistoryEntry,
         deleteHistory: deleteUserHistoryEntry,
@@ -169,14 +245,23 @@ export default function App() {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
+              id: parcel.id,
               label: parcel.label,
               dico: parcel.dico,
+              parish: parcel.parish,
               matrixArticle: parcel.matrixArticle,
+              bupiRggId: parcel.bupiRggId,
+              avgSlopePct: parcel.avgSlopePct,
               hasProtectedOaks: parcel.hasProtectedOaks,
               vertices: parcel.vertices,
               landClass: parcel.landClass,
               hasEredesLine: parcel.hasEredesLine,
             }),
+          });
+        },
+        deleteParcelFromBackend: async (parcelId) => {
+          await fetch(`/api/parcels/${encodeURIComponent(parcelId)}`, {
+            method: 'DELETE',
           });
         },
       },
@@ -189,15 +274,17 @@ export default function App() {
     setOutboxOps(hydrated.outbox);
     setOfflineParcelsCount(hydrated.parcels.length);
     setStorageBackend(syncCoordinator.getStorageBackend());
-    if (hydrated.parcels.length > 0) {
-      setParcels((prev) => mergeParcelsWithOffline(prev, hydrated.parcels));
+    if (hydrated.parcels.length > 0 || hydrated.deletedParcelIds.length > 0) {
+      setParcels((prev) =>
+        mergeParcelsWithOffline(prev, hydrated.parcels, hydrated.deletedParcelIds)
+      );
     }
     return hydrated;
   }, [syncCoordinator]);
 
   const flushPendingToFirestore = useCallback(
-    async (explicitUid?: string | null) => {
-      const targetUid = explicitUid !== undefined ? explicitUid : userUidRef.current;
+    async (explicitCloudUid?: string | null) => {
+      const targetUid = explicitCloudUid !== undefined ? explicitCloudUid : cloudUidRef.current;
       setIsSyncing(true);
       try {
         const res = await syncCoordinator.flushOutbox(targetUid);
@@ -218,12 +305,23 @@ export default function App() {
   );
 
   const recordParcelOfflineFirst = useCallback(
-    async (created: ParcelRecord) => {
-      setParcels((prev) => mergeParcelsWithOffline(prev, [created]));
-      setActiveParcelId(created.id);
+    async (parcelToSave: ParcelRecord, selectAfterSave = true) => {
+      setParcels((prev) => {
+        const exists = prev.some((p) => p.id === parcelToSave.id);
+        if (exists) {
+          return prev.map((p) => (p.id === parcelToSave.id ? parcelToSave : p));
+        }
+        return mergeParcelsWithOffline(prev, [parcelToSave]);
+      });
+      if (selectAfterSave) {
+        setActiveParcelId(parcelToSave.id);
+      }
       setIsSyncing(true);
       try {
-        const { syncResult } = await syncCoordinator.recordParcel(created, userUidRef.current);
+        const { syncResult } = await syncCoordinator.recordParcel(
+          parcelToSave,
+          cloudUidRef.current
+        );
         if (syncResult.lastSyncedAtIso) {
           setLastSyncedAtIso(syncResult.lastSyncedAtIso);
         }
@@ -250,13 +348,13 @@ export default function App() {
     }) => {
       const entry = buildLocalHistoryEntry({
         ...params,
-        uid: userUidRef.current || OFFLINE_LOCAL_UID,
+        uid: activeUidRef.current || OFFLINE_LOCAL_UID,
       });
       setIsSyncing(true);
       try {
         const { syncResult } = await syncCoordinator.recordHistoryCreation(
           entry,
-          userUidRef.current
+          cloudUidRef.current
         );
         if (syncResult.lastSyncedAtIso) {
           setLastSyncedAtIso(syncResult.lastSyncedAtIso);
@@ -287,27 +385,47 @@ export default function App() {
 
   const currentSoilMoisturePct = buildSevenDayPirSoilSeries(activeParcel, forecasts[0]).currentSoilMoisturePct;
 
-  // Hydrate offline IndexedDB / localStorage parcels, history, and outbox immediately on boot
+  // Hydrate offline IndexedDB / localStorage parcels, history, outbox, and parcel documents immediately on boot
   useEffect(() => {
     void refreshOfflineMirror();
   }, [refreshOfflineMirror]);
 
+  useEffect(() => {
+    void docStorage.loadDocuments().then((docs) => {
+      setParcelDocuments(docs);
+    });
+  }, [docStorage]);
+
+  // Track standalone display-mode changes dynamically (e.g. when user installs PWA)
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return;
+    const mq = window.matchMedia('(display-mode: standalone)');
+    const onChange = (e: MediaQueryListEvent) => setIsStandalonePwa(e.matches);
+    mq.addEventListener?.('change', onChange);
+    return () => mq.removeEventListener?.('change', onChange);
+  }, []);
+
   // Automatically resume Firestore synchronization whenever connection returns or tab regains focus
   useEffect(() => {
-    if (isOnline) {
-      void flushPendingToFirestore(userProfile?.uid ?? null);
+    if (userSettings.offlineAutoSync && isOnline && cloudUserProfile?.uid) {
+      void flushPendingToFirestore(cloudUserProfile.uid);
     }
-  }, [isOnline, userProfile?.uid, flushPendingToFirestore]);
+  }, [userSettings.offlineAutoSync, isOnline, cloudUserProfile?.uid, flushPendingToFirestore]);
 
   useEffect(() => {
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible' && navigator.onLine !== false) {
-        void flushPendingToFirestore(userUidRef.current);
+      if (
+        userSettings.offlineAutoSync &&
+        document.visibilityState === 'visible' &&
+        navigator.onLine !== false &&
+        cloudUidRef.current
+      ) {
+        void flushPendingToFirestore(cloudUidRef.current);
       }
     };
     document.addEventListener('visibilitychange', handleVisibility);
     return () => document.removeEventListener('visibilitychange', handleVisibility);
-  }, [flushPendingToFirestore]);
+  }, [userSettings.offlineAutoSync, flushPendingToFirestore]);
 
   // Listen to Firebase Auth state and attach real-time Firestore listener only when authenticated
   useEffect(() => {
@@ -320,7 +438,7 @@ export default function App() {
       }
 
       if (!fbUser) {
-        setUserProfile(null);
+        setCloudUserProfile(null);
         setRemoteHistory([]);
         setHistorySyncError(null);
         setAuthReady(true);
@@ -329,7 +447,7 @@ export default function App() {
 
       try {
         const hydrated = await ensureUserAnchorAndProfile(fbUser, activeParcel.dico);
-        setUserProfile(hydrated);
+        setCloudUserProfile(hydrated);
         setAuthReady(true);
         void flushPendingToFirestore(hydrated.uid);
 
@@ -374,7 +492,13 @@ export default function App() {
         const offlineState = await syncCoordinator.hydrateState();
         if (Array.isArray(data.municipalities)) setMunicipalities(data.municipalities);
         if (Array.isArray(data.parcels) && data.parcels.length > 0) {
-          setParcels(mergeParcelsWithOffline(data.parcels, offlineState.parcels));
+          setParcels(
+            mergeParcelsWithOffline(
+              data.parcels,
+              offlineState.parcels,
+              offlineState.deletedParcelIds
+            )
+          );
         }
         if (Array.isArray(data.certificates)) setCertificates(data.certificates);
         if (Array.isArray(data.providers)) setProviders(data.providers);
@@ -396,6 +520,7 @@ export default function App() {
   useEffect(() => {
     setForecasts(buildInitialForecasts(activeParcel.dico));
     const c = activeParcel.spatial.centroidWgs84;
+    const radiusKm = userSettings.proximityAlertRadiusKm;
 
     if (!isOnline) {
       const localFires = FALLBACK_ACTIVE_FIRES.map((f) => ({
@@ -403,7 +528,7 @@ export default function App() {
         distanceKm: haversineDistanceKm(c, { lat: f.lat, lon: f.lon }),
       }));
       setFires(localFires);
-      setWithin15KmCount(localFires.filter((f) => f.distanceKm <= 15).length);
+      setWithin15KmCount(localFires.filter((f) => f.distanceKm <= radiusKm).length);
       return;
     }
 
@@ -422,11 +547,14 @@ export default function App() {
       .then((data) => {
         if (Array.isArray(data?.incidents)) {
           setFires(data.incidents);
-          setWithin15KmCount(Number(data.within15KmCount ?? 0));
+          const countWithinRadius = data.incidents.filter(
+            (inc: ActiveFireIncident) => Number(inc.distanceKm) <= radiusKm
+          ).length;
+          setWithin15KmCount(countWithinRadius);
         }
       })
       .catch(() => {});
-  }, [activeParcel.id, activeParcel.dico, isOnline]);
+  }, [activeParcel.id, activeParcel.dico, isOnline, userSettings.proximityAlertRadiusKm]);
 
   const handleNavigate = (tab: NavTab, subMode?: string) => {
     setActiveTab(tab);
@@ -434,8 +562,185 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   };
 
+  const handleToggleFavoriteProvider = useCallback((providerId: string) => {
+    setFavoriteProviderIds((prev) => {
+      const next = toggleFavoriteProviderId(prev, providerId);
+      saveFavoriteProviderIds(next);
+      return next;
+    });
+  }, []);
+
+  const handleUpdateUserSettings = useCallback((nextSettings: UserAppSettings) => {
+    const clean = saveUserAppSettings(nextSettings);
+    setUserSettings(clean);
+  }, []);
+
+  const handleDeleteParcel = useCallback(
+    async (targetParcelId: string): Promise<{ ok: boolean; error?: string }> => {
+      const check = removeParcelSafely(parcels, activeParcel.id, targetParcelId);
+      if (!check.ok) {
+        return { ok: false, error: check.error };
+      }
+
+      const removedParcel = parcels.find((p) => p.id === targetParcelId);
+      setParcels(check.nextParcels);
+      setActiveParcelId(check.nextActiveParcelId);
+
+      await docStorage.deleteDocumentsByParcel(targetParcelId);
+      setParcelDocuments(await docStorage.loadDocuments());
+
+      setIsSyncing(true);
+      try {
+        const { syncResult } = await syncCoordinator.recordParcelDelete(
+          targetParcelId,
+          cloudUidRef.current
+        );
+        if (syncResult.lastSyncedAtIso) {
+          setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+        }
+        await refreshOfflineMirror();
+      } finally {
+        setIsSyncing(false);
+      }
+
+      if (removedParcel) {
+        void recordHistoryOfflineFirst({
+          category: 'PARCEL',
+          title: `Propriedade removida: ${removedParcel.label}`,
+          parcelId: removedParcel.id,
+          parcelLabel: removedParcel.label,
+          municipality: removedParcel.municipality,
+          referenceCode: removedParcel.bupiRggId,
+          areaM2: removedParcel.spatial.mandatoryCleanAreaM2,
+          pirLevel: forecasts[0]?.pirLevel ?? 2,
+          soilMoisturePct: currentSoilMoisturePct,
+          summary: `Propriedade eliminada da carteira pelo utilizador (${removedParcel.matrixArticle}).`,
+        });
+      }
+
+      return { ok: true };
+    },
+    [
+      parcels,
+      activeParcel.id,
+      docStorage,
+      syncCoordinator,
+      refreshOfflineMirror,
+      recordHistoryOfflineFirst,
+      forecasts,
+      currentSoilMoisturePct,
+    ]
+  );
+
+  const handleSignInLocalCustom = useCallback(
+    ({ displayName, nif }: { displayName: string; nif: string }) => {
+      const profile = buildLocalSessionProfile({
+        displayName,
+        nif,
+        preferredDico: activeParcel.dico,
+      });
+      saveLocalAuthSession(profile);
+      setLocalSessionProfile(profile);
+      window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+    },
+    [activeParcel.dico]
+  );
+
+  const handleSignInDemo = useCallback(() => {
+    const demo = buildDefaultDemoProfile(activeParcel.dico);
+    saveLocalAuthSession(demo);
+    setLocalSessionProfile(demo);
+    window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+  }, [activeParcel.dico]);
+
+  const handleSignOutAll = useCallback(async () => {
+    clearLocalAuthSession();
+    setLocalSessionProfile(null);
+    setShowHistoryModal(false);
+    if (cloudUserProfile) {
+      await signOutCurrentUser();
+    }
+    window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+  }, [cloudUserProfile]);
+
+  // PRE-LOGIN GATEWAY: Standard Browser WebView Homepage vs Standalone WebApp Onboarding Splash
+  if (!isAuthenticated) {
+    return (
+      <>
+        {entryExperienceMode === 'WEBAPP_ONBOARDING' ? (
+          <WebAppOnboardingSplash
+            darkMode={darkMode}
+            isOnline={isOnline}
+            isFirebaseConfigured={isFirebaseConfigured}
+            onToggleDarkMode={() => setDarkMode((d) => !d)}
+            onSignInGoogle={async () => {
+              await signInWithGooglePopup();
+            }}
+            onSignInLocalCustom={handleSignInLocalCustom}
+            onSignInDemo={handleSignInDemo}
+            onSwitchToWebviewHomepage={() => setEntryModeOverride('webview')}
+          />
+        ) : (
+          <PublicWebviewHomepage
+            darkMode={darkMode}
+            isOnline={isOnline}
+            isFirebaseConfigured={isFirebaseConfigured}
+            isInstallable={isInstallable}
+            isInstalled={isInstalled}
+            isIOS={isIOS}
+            onToggleDarkMode={() => setDarkMode((d) => !d)}
+            onSignInGoogle={async () => {
+              await signInWithGooglePopup();
+            }}
+            onSignInLocalCustom={handleSignInLocalCustom}
+            onSignInDemo={handleSignInDemo}
+            onSwitchToWebAppOnboarding={() => setEntryModeOverride('webapp')}
+            onInstallPwa={install}
+            onOpenIosGuide={() => setShowIosInstallGuide(true)}
+          />
+        )}
+
+        {/* Public SHA-256 QR Verification Modal remains accessible via ?verify= links */}
+        <CertificateVerifyModal
+          certificate={verifyingCert}
+          onClose={() => setVerifyingCert(null)}
+        />
+
+        {/* iOS Safari Install Instructions Dialog */}
+        {showIosInstallGuide && (
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label="Instruções de instalação no iOS"
+            className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4"
+          >
+            <div className="w-full max-w-sm rounded-2xl bg-white dark:bg-[#161E2E] p-5 border border-slate-300 dark:border-[#263248] space-y-3">
+              <h3 className="text-base font-bold text-slate-900 dark:text-white">
+                Instalar FaixaSegura no iPhone / iPad
+              </h3>
+              <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                1. Toque no botão <strong>Partilhar</strong> na barra do Safari.<br />
+                2. Escolha <strong>Adicionar ao Ecrã Principal</strong> para abrir em modo WebApp autónomo no terreno.
+              </p>
+              <button
+                type="button"
+                onClick={() => setShowIosInstallGuide(false)}
+                className="w-full min-h-[44px] rounded-xl bg-[#14532D] text-white text-xs font-semibold"
+              >
+                Entendido
+              </button>
+            </div>
+          </div>
+        )}
+      </>
+    );
+  }
+
   return (
-    <div className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-[#0B0F17] text-[#0F172A] dark:text-[#F8FAFC] pb-20 lg:pb-10">
+    <div
+      data-testid="authenticated-workspace"
+      className="min-h-screen flex flex-col bg-[#F8FAFC] dark:bg-[#0B0F17] text-[#0F172A] dark:text-[#F8FAFC] pb-20 lg:pb-10"
+    >
       {/* Strict 3-Zone Top Bar Contract (h-12 mobile = 48px, lg:h-16) */}
       <header className="sticky top-0 z-30 h-12 lg:h-16 bg-white/95 dark:bg-[#161E2E]/95 backdrop-blur-md border-b border-slate-200 dark:border-[#263248]">
         <div className="max-w-7xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-8">
@@ -480,17 +785,6 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => handleNavigate('certify', 'certificate')}
-              className={`py-1 transition-colors whitespace-nowrap shrink-0 hover:text-slate-950 dark:hover:text-white ${
-                activeTab === 'certify'
-                  ? 'text-[#14532D] dark:text-[#22C55E] font-semibold underline underline-offset-8 decoration-2'
-                  : ''
-              }`}
-            >
-              Certificar
-            </button>
-            <button
-              type="button"
               onClick={() => handleNavigate('providers')}
               className={`py-1 transition-colors whitespace-nowrap shrink-0 hover:text-slate-950 dark:hover:text-white ${
                 activeTab === 'providers'
@@ -510,6 +804,17 @@ export default function App() {
               }`}
             >
               Documentação
+            </button>
+            <button
+              type="button"
+              onClick={() => handleNavigate('user')}
+              className={`py-1 transition-colors whitespace-nowrap shrink-0 hover:text-slate-950 dark:hover:text-white ${
+                activeTab === 'user'
+                  ? 'text-[#14532D] dark:text-[#22C55E] font-semibold underline underline-offset-8 decoration-2'
+                  : ''
+              }`}
+            >
+              User
             </button>
           </nav>
 
@@ -547,40 +852,45 @@ export default function App() {
             </select>
           </div>
 
-          <div className="flex items-center justify-between sm:justify-end gap-2 w-full sm:w-auto">
+          <div className="flex flex-wrap items-center justify-between sm:justify-end gap-2 w-full sm:w-auto">
             {/* Mobile/Tablet Docs shortcut */}
             <button
               type="button"
               onClick={() => handleNavigate('docs')}
-              className={`lg:hidden min-h-[42px] px-3 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap ${
+              className={`lg:hidden min-h-[40px] px-2.5 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                 activeTab === 'docs'
                   ? 'border-[#14532D] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-slate-700 dark:text-slate-200'
               }`}
             >
               <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
-              PRD & Docs
+              Docs
             </button>
 
-            <div className="flex items-center gap-2 ml-auto sm:ml-0">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 ml-auto sm:ml-0">
               {/* User Account & Consultable History Trigger */}
               <button
                 type="button"
                 onClick={() => setShowHistoryModal(true)}
-                className={`min-h-[42px] px-3 py-1.5 rounded-xl border text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums ${
+                className={`min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl border text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 tabular-nums ${
                   userProfile
                     ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D]/10 dark:bg-[#22C55E]/15 text-[#14532D] dark:text-[#22C55E]'
                     : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
                 }`}
               >
                 <History className="w-3.5 h-3.5" aria-hidden="true" />
-                {userProfile
-                  ? `Histórico (${activeHistoryCount}) · ${userProfile.displayName.split(' ')[0]}${
-                      outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''
-                    }`
-                  : activeHistoryCount > 0 || outboxOps.length > 0
-                  ? `Histórico (${activeHistoryCount})${outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''}`
-                  : 'Entrar / Histórico'}
+                <span className="hidden sm:inline">
+                  {userProfile
+                    ? `Histórico (${activeHistoryCount}) · ${userProfile.displayName.split(' ')[0]}${
+                        outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''
+                      }`
+                    : activeHistoryCount > 0 || outboxOps.length > 0
+                    ? `Histórico (${activeHistoryCount})${outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''}`
+                    : 'Entrar / Histórico'}
+                </span>
+                <span className="sm:hidden">
+                  {`Histórico (${activeHistoryCount})`}
+                </span>
               </button>
 
               {/* PWA Install Button */}
@@ -588,7 +898,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={install}
-                  className="min-h-[42px] px-3 py-1.5 rounded-xl border border-[#14532D] dark:border-[#22C55E] text-xs font-semibold text-[#14532D] dark:text-[#22C55E] bg-white dark:bg-[#161E2E] inline-flex items-center gap-1.5 whitespace-nowrap"
+                  className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl border border-[#14532D] dark:border-[#22C55E] text-xs font-semibold text-[#14532D] dark:text-[#22C55E] bg-white dark:bg-[#161E2E] inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <Download className="w-3.5 h-3.5" aria-hidden="true" />
                   Instalar App
@@ -598,7 +908,7 @@ export default function App() {
                 <button
                   type="button"
                   onClick={() => setShowIosInstallGuide(true)}
-                  className="min-h-[42px] px-3 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-[#161E2E] whitespace-nowrap"
+                  className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-200 bg-white dark:bg-[#161E2E] whitespace-nowrap shrink-0"
                 >
                   Instalar no iOS
                 </button>
@@ -608,19 +918,33 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setDarkMode((d) => !d)}
-                className="min-h-[42px] px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 {darkMode ? (
                   <>
                     <Sun className="w-3.5 h-3.5 text-[#FACC15]" aria-hidden="true" />
-                    Modo Solar
+                    <span className="hidden sm:inline">Modo Solar</span>
+                    <span className="sm:hidden">Solar</span>
                   </>
                 ) : (
                   <>
-                    <Moon className="w-3.5 h-3.5 text-slate-600" aria-hidden="true" />
-                    Modo Noite
+                    <Moon className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" aria-hidden="true" />
+                    <span className="hidden sm:inline">Modo Noite</span>
+                    <span className="sm:hidden">Noite</span>
                   </>
                 )}
+              </button>
+
+              {/* Sign Out Button */}
+              <button
+                type="button"
+                onClick={() => void handleSignOutAll()}
+                aria-label="Terminar sessão"
+                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              >
+                <LogOut className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" aria-hidden="true" />
+                <span className="hidden sm:inline">Terminar Sessão</span>
+                <span className="sm:hidden">Sair</span>
               </button>
             </div>
           </div>
@@ -760,6 +1084,8 @@ export default function App() {
             providers={providers}
             quotes={quotes}
             municipalities={municipalities}
+            favoriteProviderIds={favoriteProviderIds}
+            onToggleFavoriteProvider={handleToggleFavoriteProvider}
             onSelectParcel={(id) => setActiveParcelId(id)}
             onInspectCertificate={(cert) => setVerifyingCert(cert)}
             onProviderRegistered={(prov) => setProviders((prev) => [prov, ...prev])}
@@ -770,6 +1096,138 @@ export default function App() {
         )}
 
         {activeTab === 'docs' && <DocsArchitectureView />}
+
+        {activeTab === 'user' && userProfile && (
+          <UserManagementView
+            profile={userProfile}
+            isCloudSession={isCloudSession}
+            isFirebaseConfigured={isFirebaseConfigured}
+            isOnline={isOnline}
+            darkMode={darkMode}
+            parcels={parcels}
+            activeParcel={activeParcel}
+            municipalities={municipalities}
+            providers={providers}
+            favoriteProviderIds={favoriteProviderIds}
+            parcelDocuments={parcelDocuments}
+            userSettings={userSettings}
+            certificates={certificates}
+            historyItems={displayedHistory}
+            pendingSyncCount={outboxOps.length}
+            isSyncing={isSyncing}
+            lastSyncedAtIso={lastSyncedAtIso}
+            storageBackend={storageBackend}
+            onToggleDarkMode={(nextDark) => setDarkMode(nextDark)}
+            onSelectParcel={(id) => setActiveParcelId(id)}
+            onCreateParcel={async (created) => {
+              await recordParcelOfflineFirst(created, true);
+              void recordHistoryOfflineFirst({
+                category: 'PARCEL',
+                title: `Terreno registado: ${created.label}`,
+                parcelId: created.id,
+                parcelLabel: created.label,
+                municipality: created.municipality,
+                referenceCode: created.bupiRggId,
+                areaM2: created.spatial.mandatoryCleanAreaM2,
+                pirLevel: forecasts[0]?.pirLevel ?? 2,
+                soilMoisturePct: currentSoilMoisturePct,
+                summary: `Área total ${created.spatial.totalAreaM2.toFixed(0)} m² · Limpeza exigível ${created.spatial.mandatoryCleanAreaM2.toFixed(0)} m² (${created.matrixArticle}).`,
+              });
+            }}
+            onUpdateParcel={async (updated) => {
+              await recordParcelOfflineFirst(updated, false);
+              void recordHistoryOfflineFirst({
+                category: 'PARCEL',
+                title: `Propriedade atualizada: ${updated.label}`,
+                parcelId: updated.id,
+                parcelLabel: updated.label,
+                municipality: updated.municipality,
+                referenceCode: updated.bupiRggId,
+                areaM2: updated.spatial.mandatoryCleanAreaM2,
+                pirLevel: forecasts[0]?.pirLevel ?? 2,
+                soilMoisturePct: currentSoilMoisturePct,
+                summary: `Dados cadastrais atualizados · Área obrigatória ${updated.spatial.mandatoryCleanAreaM2.toFixed(0)} m² (${updated.matrixArticle}).`,
+              });
+            }}
+            onDeleteParcel={handleDeleteParcel}
+            onUploadParcelDocument={async (docRecord) => {
+              await docStorage.saveDocument(docRecord);
+              setParcelDocuments(await docStorage.loadDocuments());
+            }}
+            onDeleteParcelDocument={async (docId) => {
+              await docStorage.deleteDocument(docId);
+              setParcelDocuments(await docStorage.loadDocuments());
+            }}
+            onToggleFavoriteProvider={handleToggleFavoriteProvider}
+            onUpdateProfile={async ({ displayName, email, nif, phone, preferredDico }) => {
+              if (cloudUserProfile) {
+                await updateUserContactProfile({
+                  uid: cloudUserProfile.uid,
+                  displayName,
+                  preferredDico,
+                  email,
+                  nif,
+                  phone,
+                });
+                setCloudUserProfile((prev) =>
+                  prev ? { ...prev, displayName, email, nif, phone, preferredDico } : null
+                );
+              } else {
+                const updatedLocal: UserAccountProfile = {
+                  ...userProfile,
+                  displayName,
+                  email,
+                  nif,
+                  phone,
+                  preferredDico,
+                };
+                saveLocalAuthSession(updatedLocal);
+                setLocalSessionProfile(updatedLocal);
+              }
+            }}
+            onUpdateSettings={handleUpdateUserSettings}
+            onManualSync={async () => {
+              await flushPendingToFirestore(cloudUserProfile?.uid ?? null);
+            }}
+            onSignInGoogle={async () => {
+              await signInWithGooglePopup();
+            }}
+            onSignOut={handleSignOutAll}
+            onInspectCertificate={(cert) => setVerifyingCert(cert)}
+            onOpenHistoryModal={() => setShowHistoryModal(true)}
+            onArchiveHistoryEntry={async (entryId) => {
+              setIsSyncing(true);
+              try {
+                const { syncResult } = await syncCoordinator.recordHistoryArchive(
+                  entryId,
+                  cloudUserProfile?.uid ?? null
+                );
+                if (syncResult.lastSyncedAtIso) {
+                  setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+                }
+                await refreshOfflineMirror();
+              } finally {
+                setIsSyncing(false);
+              }
+            }}
+            onDeleteHistoryEntry={async (entryId) => {
+              setIsSyncing(true);
+              try {
+                const { syncResult } = await syncCoordinator.recordHistoryDelete(
+                  entryId,
+                  cloudUserProfile?.uid ?? null
+                );
+                if (syncResult.lastSyncedAtIso) {
+                  setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+                }
+                await refreshOfflineMirror();
+              } finally {
+                setIsSyncing(false);
+              }
+            }}
+            onNavigateTab={handleNavigate}
+          />
+        )}
       </main>
 
       {/* Quiet Institutional Footer (Desktop) */}
@@ -815,19 +1273,6 @@ export default function App() {
 
         <button
           type="button"
-          onClick={() => handleNavigate('certify', 'certificate')}
-          className={`min-h-[48px] flex flex-col items-center justify-center transition-colors ${
-            activeTab === 'certify'
-              ? 'text-[#14532D] dark:text-[#22C55E] font-bold'
-              : 'text-slate-500 dark:text-slate-400'
-          }`}
-        >
-          <FileCheck2 className="w-5 h-5" aria-hidden="true" />
-          <span className="text-[10px] tracking-tight mt-0.5 whitespace-nowrap">Certificar</span>
-        </button>
-
-        <button
-          type="button"
           onClick={() => handleNavigate('providers')}
           className={`min-h-[48px] flex flex-col items-center justify-center transition-colors ${
             activeTab === 'providers'
@@ -837,6 +1282,19 @@ export default function App() {
         >
           <Tractor className="w-5 h-5" aria-hidden="true" />
           <span className="text-[10px] tracking-tight mt-0.5 whitespace-nowrap">Prestadores</span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => handleNavigate('user')}
+          className={`min-h-[48px] flex flex-col items-center justify-center transition-colors ${
+            activeTab === 'user'
+              ? 'text-[#14532D] dark:text-[#22C55E] font-bold'
+              : 'text-slate-500 dark:text-slate-400'
+          }`}
+        >
+          <UserIcon className="w-5 h-5" aria-hidden="true" />
+          <span className="text-[10px] tracking-tight mt-0.5 whitespace-nowrap">User</span>
         </button>
       </nav>
 
@@ -852,6 +1310,7 @@ export default function App() {
         onClose={() => setShowHistoryModal(false)}
         authReady={authReady}
         profile={userProfile}
+        isCloudSession={isCloudSession}
         historyItems={displayedHistory}
         activeParcel={activeParcel}
         todayForecast={forecasts[0]}
@@ -863,27 +1322,37 @@ export default function App() {
         lastSyncedAtIso={lastSyncedAtIso}
         storageBackend={storageBackend}
         onManualSync={async () => {
-          await flushPendingToFirestore(userProfile?.uid ?? null);
+          await flushPendingToFirestore(cloudUserProfile?.uid ?? null);
         }}
         onSignInGoogle={async () => {
           await signInWithGooglePopup();
         }}
-        onSignOut={async () => {
-          await signOutCurrentUser();
-        }}
+        onSignOut={handleSignOutAll}
         onUpdateProfile={async ({ displayName, nif, phone }) => {
           if (!userProfile) return;
-          await updateUserContactProfile({
-            uid: userProfile.uid,
-            displayName,
-            preferredDico: activeParcel.dico,
-            email: userProfile.email,
-            nif,
-            phone,
-          });
-          setUserProfile((prev) =>
-            prev ? { ...prev, displayName, nif, phone, preferredDico: activeParcel.dico } : null
-          );
+          if (cloudUserProfile) {
+            await updateUserContactProfile({
+              uid: cloudUserProfile.uid,
+              displayName,
+              preferredDico: activeParcel.dico,
+              email: cloudUserProfile.email,
+              nif,
+              phone,
+            });
+            setCloudUserProfile((prev) =>
+              prev ? { ...prev, displayName, nif, phone, preferredDico: activeParcel.dico } : null
+            );
+          } else {
+            const updatedLocal: UserAccountProfile = {
+              ...userProfile,
+              displayName,
+              nif,
+              phone,
+              preferredDico: activeParcel.dico,
+            };
+            saveLocalAuthSession(updatedLocal);
+            setLocalSessionProfile(updatedLocal);
+          }
         }}
         onCreateIntervention={async ({ title, summary, pirLevel, soilMoisturePct }: { title: string; summary: string; pirLevel: PirLevel; soilMoisturePct: number }) => {
           await recordHistoryOfflineFirst({
@@ -904,7 +1373,7 @@ export default function App() {
           try {
             const { syncResult } = await syncCoordinator.recordHistoryArchive(
               entryId,
-              userProfile?.uid ?? null
+              cloudUserProfile?.uid ?? null
             );
             if (syncResult.lastSyncedAtIso) {
               setLastSyncedAtIso(syncResult.lastSyncedAtIso);
@@ -919,7 +1388,7 @@ export default function App() {
           try {
             const { syncResult } = await syncCoordinator.recordHistoryDelete(
               entryId,
-              userProfile?.uid ?? null
+              cloudUserProfile?.uid ?? null
             );
             if (syncResult.lastSyncedAtIso) {
               setLastSyncedAtIso(syncResult.lastSyncedAtIso);

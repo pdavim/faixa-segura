@@ -20,7 +20,9 @@ services:
   faixasegura-redis:
     image: redis:7.2-alpine
     restart: unless-stopped
-    command: redis-server --save 60 1 --loglevel warning
+    # Cache efémero LRU sem snapshots RDB/AOF em disco (evita falhas de fork/BGSAVE caso o host tenha vm.overcommit_memory=0).
+    # Para silenciar também o aviso do kernel no servidor VPS/Dokploy, execute no host: sudo sysctl -w vm.overcommit_memory=1
+    command: redis-server --save "" --appendonly no --maxmemory 128mb --maxmemory-policy allkeys-lru --stop-writes-on-bgsave-error no --loglevel warning
     expose:
       - "6379"
     volumes:

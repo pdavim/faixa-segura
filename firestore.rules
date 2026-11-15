@@ -308,8 +308,14 @@ service cloud.firestore {
             && incoming().updatedAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'label',
+              'municipality',
+              'dico',
               'matrixArticle',
               'bupiRggId',
+              'landClass',
+              'totalAreaM2',
+              'mandatoryCleanAreaM2',
+              'avgSlopePct',
               'hasEredesLine',
               'hasProtectedOaks',
               'updatedAt'

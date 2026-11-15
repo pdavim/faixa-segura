@@ -583,3 +583,294 @@ test('buildParcelVerticesGeoJson exports RFC 7946 closed counterclockwise Polygo
   assert.equal((dedupParsed.features[0].geometry.coordinates as number[][][])[0].length, expectedVertexCount + 1);
 });
 
+test('appShellMode separates WebView Homepage vs WebApp Onboarding Splash, validates local sessions, and hardens Redis against vm.overcommit_memory=0', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const {
+    ONBOARDING_SLIDES,
+    buildLocalSessionProfile,
+    clearLocalAuthSession,
+    detectEntryExperienceMode,
+    loadLocalAuthSession,
+    saveLocalAuthSession,
+    shouldAutoStartWorkspace,
+    validateLocalSessionInput,
+  } = await import('./appShellMode.ts');
+
+  // 1. Standard browser webview defaults to Homepage
+  assert.equal(detectEntryExperienceMode({}), 'WEBVIEW_HOMEPAGE');
+  assert.equal(detectEntryExperienceMode({ search: '?utm_source=partilha' }), 'WEBVIEW_HOMEPAGE');
+
+  // 2. Standalone PWA, iOS navigator.standalone, Android TWA, and ?mode=webapp route to WebApp Onboarding Splash
+  assert.equal(detectEntryExperienceMode({ isStandaloneDisplay: true }), 'WEBAPP_ONBOARDING');
+  assert.equal(detectEntryExperienceMode({ navigatorStandalone: true }), 'WEBAPP_ONBOARDING');
+  assert.equal(detectEntryExperienceMode({ referrer: 'android-app://pt.faixasegura.twa' }), 'WEBAPP_ONBOARDING');
+  assert.equal(detectEntryExperienceMode({ search: '?mode=webapp' }), 'WEBAPP_ONBOARDING');
+  assert.equal(detectEntryExperienceMode({ search: '?pwa=1' }), 'WEBAPP_ONBOARDING');
+
+  // 3. Explicit override wins over display-mode
+  assert.equal(
+    detectEntryExperienceMode({ isStandaloneDisplay: true, overrideMode: 'webview' }),
+    'WEBVIEW_HOMEPAGE'
+  );
+  assert.equal(
+    detectEntryExperienceMode({ isStandaloneDisplay: false, overrideMode: 'webapp' }),
+    'WEBAPP_ONBOARDING'
+  );
+
+  // 4. ?autostart=1 detection & onboarding slides integrity
+  assert.equal(shouldAutoStartWorkspace(''), false);
+  assert.equal(shouldAutoStartWorkspace('?autostart=1'), true);
+  assert.equal(shouldAutoStartWorkspace('?mode=webapp&autostart=true'), true);
+  assert.equal(ONBOARDING_SLIDES.length, 3);
+
+  // 5. Strict local session validation (never bypasses invalid input) & persistence lifecycle
+  assert.equal(validateLocalSessionInput({ displayName: ' ' }).valid, false);
+  assert.equal(validateLocalSessionInput({ displayName: 'Ana Costa', nif: '12345' }).valid, false);
+  const validRes = validateLocalSessionInput({ displayName: '  Maria   Silva ', nif: '218 492 310' });
+  assert.equal(validRes.valid, true);
+  assert.equal(validRes.sanitizedName, 'Maria Silva');
+  assert.equal(validRes.sanitizedNif, '218492310');
+
+  const memMap = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => memMap.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      memMap.set(k, v);
+    },
+    removeItem: (k: string) => {
+      memMap.delete(k);
+    },
+  };
+  assert.equal(loadLocalAuthSession(mockStorage), null);
+  const createdProfile = buildLocalSessionProfile({
+    displayName: 'Maria Silva',
+    nif: '218492310',
+    preferredDico: '1009',
+  });
+  saveLocalAuthSession(createdProfile, mockStorage);
+  const restored = loadLocalAuthSession(mockStorage);
+  assert.ok(restored);
+  assert.equal(restored.displayName, 'Maria Silva');
+  assert.equal(restored.nif, '218492310');
+  assert.equal(restored.preferredDico, '1009');
+  clearLocalAuthSession(mockStorage);
+  assert.equal(loadLocalAuthSession(mockStorage), null);
+
+  // 6. Verify docker-compose.yml configures Redis without fork BGSAVE snapshots and without forbidden vm.* sysctls
+  const compose = fs.readFileSync(path.join(process.cwd(), 'docker-compose.yml'), 'utf8');
+  assert.ok(compose.includes('--save ""'), 'Redis should disable RDB fork saves when used as TTL cache');
+  assert.ok(compose.includes('--appendonly no'), 'Redis should disable AOF fork rewrites');
+  assert.ok(compose.includes('--maxmemory 128mb'), 'Redis should cap memory with allkeys-lru');
+  assert.ok(!compose.includes('sysctls:'), 'Compose must not set non-namespaced vm.overcommit_memory sysctl');
+});
+
+test('userWorkspaceStore handles parcel CRUD, EPSG:3763 spatial recomputation, per-parcel document uploads, favorite providers, settings, and DELETE_PARCEL offline sync', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const {
+    MAX_PARCEL_DOCUMENT_BYTES,
+    applyParcelUpdate,
+    buildParcelDocumentRecord,
+    createMemoryParcelDocumentStorage,
+    filterDocumentsForParcel,
+    formatVerticesMultiline,
+    loadFavoriteProviderIds,
+    loadUserAppSettings,
+    parseVerticesMultiline,
+    removeParcelSafely,
+    saveFavoriteProviderIds,
+    saveUserAppSettings,
+    toggleFavoriteProviderId,
+    validateDocumentUploadInput,
+    validateParcelMutationInput,
+  } = await import('./userWorkspaceStore.ts');
+  const {
+    OfflineSyncCoordinator,
+    coalesceOutboxOperations,
+    createMemoryOfflineStorageAdapter,
+    mergeParcelsWithOffline,
+  } = await import('./offlineStorage.ts');
+
+  // 1. Parcel validation & multiline vertex parsing
+  assert.equal(validateParcelMutationInput({ label: 'A', avgSlopePct: 12 }).valid, false);
+  assert.equal(validateParcelMutationInput({ label: 'Quinta Nova', avgSlopePct: 140 }).valid, false);
+  assert.equal(validateParcelMutationInput({ label: 'Quinta Nova', avgSlopePct: 18 }).valid, true);
+
+  const badVerts = parseVerticesMultiline('38.7984, -9.4621\n38.7991, -9.4620');
+  assert.equal(badVerts.valid, false);
+
+  const baseParcel = INITIAL_PARCELS[0];
+  const serializedVerts = formatVerticesMultiline(baseParcel.vertices);
+  const parsedVerts = parseVerticesMultiline(serializedVerts);
+  assert.equal(parsedVerts.valid, true);
+  assert.equal(parsedVerts.vertices.length, baseParcel.vertices.length);
+
+  // 2. applyParcelUpdate recomputes mandatory FGC buffer & E-REDES easement
+  const updatedAgri = applyParcelUpdate(baseParcel, {
+    label: '  Casal do Pinheiro Renovado  ',
+    dico: '1009', // Leiria
+    landClass: 'AGRICULTURE',
+    hasEredesLine: false,
+    hasProtectedOaks: false,
+    avgSlopePct: 21.4,
+  });
+  assert.equal(updatedAgri.label, 'Casal do Pinheiro Renovado');
+  assert.equal(updatedAgri.municipality, 'Leiria');
+  assert.equal(updatedAgri.dico, '1009');
+  assert.equal(updatedAgri.landClass, 'AGRICULTURE');
+  assert.equal(updatedAgri.hasEredesLine, false);
+  assert.equal(updatedAgri.eredesType, 'Sem linha aérea');
+  assert.equal(updatedAgri.spatial.thirdPartyEasementM2, 0);
+  assert.equal(updatedAgri.spatial.estimatedEredesSavingsEur, 0);
+  // Switching FOREST_SCRUB + E-REDES -> AGRICULTURE without E-REDES changes mandatory clean area
+  assert.notEqual(updatedAgri.spatial.mandatoryCleanAreaM2, baseParcel.spatial.mandatoryCleanAreaM2);
+
+  // 3. removeParcelSafely protects last remaining parcel and switches activeParcelId when needed
+  const delActive = removeParcelSafely(INITIAL_PARCELS, INITIAL_PARCELS[0].id, INITIAL_PARCELS[0].id);
+  assert.equal(delActive.ok, true);
+  assert.equal(delActive.nextParcels.length, INITIAL_PARCELS.length - 1);
+  assert.equal(delActive.nextActiveParcelId, INITIAL_PARCELS[1].id);
+
+  const singleList = [INITIAL_PARCELS[0]];
+  const blockedLast = removeParcelSafely(singleList, INITIAL_PARCELS[0].id, INITIAL_PARCELS[0].id);
+  assert.equal(blockedLast.ok, false);
+  assert.equal(blockedLast.nextParcels.length, 1);
+
+  // 4. Per-parcel document validation & storage lifecycle
+  assert.equal(
+    validateDocumentUploadInput({ parcelId: baseParcel.id, fileName: 'caderneta.pdf', sizeBytes: 0 }).valid,
+    false
+  );
+  assert.equal(
+    validateDocumentUploadInput({
+      parcelId: baseParcel.id,
+      fileName: 'huge.pdf',
+      sizeBytes: MAX_PARCEL_DOCUMENT_BYTES + 10,
+    }).valid,
+    false
+  );
+  assert.equal(
+    validateDocumentUploadInput({ parcelId: baseParcel.id, fileName: 'caderneta.pdf', sizeBytes: 24_500 }).valid,
+    true
+  );
+
+  const docStore = createMemoryParcelDocumentStorage(true);
+  const seededDocs = await docStore.loadDocuments();
+  assert.equal(seededDocs.length, 2);
+  assert.equal(filterDocumentsForParcel(seededDocs, baseParcel.id).length, 2);
+
+  const customDoc = buildParcelDocumentRecord({
+    id: 'doc-custom-fatura-1',
+    parcelId: INITIAL_PARCELS[1].id,
+    fileName: 'Fatura_Limpeza_2026.pdf',
+    category: 'FATURA_LIMPEZA',
+    mimeType: 'application/pdf',
+    sizeBytes: 48_120,
+    notes: 'Intervenção concluída na faixa de 50m.',
+  });
+  await docStore.saveDocument(customDoc);
+  assert.equal(filterDocumentsForParcel(await docStore.loadDocuments(), INITIAL_PARCELS[1].id).length, 1);
+
+  await docStore.deleteDocumentsByParcel(baseParcel.id);
+  assert.equal(filterDocumentsForParcel(await docStore.loadDocuments(), baseParcel.id).length, 0);
+  assert.equal(filterDocumentsForParcel(await docStore.loadDocuments(), INITIAL_PARCELS[1].id).length, 1);
+
+  // 5. Favorite providers & user app settings persistence
+  const kvMap = new Map<string, string>();
+  const kv = {
+    getItem: (k: string) => kvMap.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      kvMap.set(k, v);
+    },
+    removeItem: (k: string) => {
+      kvMap.delete(k);
+    },
+  };
+  let favs = loadFavoriteProviderIds(kv);
+  assert.equal(favs.length, 1);
+  favs = toggleFavoriteProviderId(favs, 'prov-serra-limpa');
+  saveFavoriteProviderIds(favs, kv);
+  assert.ok(loadFavoriteProviderIds(kv).includes('prov-serra-limpa'));
+  favs = toggleFavoriteProviderId(favs, 'prov-serra-limpa');
+  saveFavoriteProviderIds(favs, kv);
+  assert.ok(!loadFavoriteProviderIds(kv).includes('prov-serra-limpa'));
+
+  const savedSettings = saveUserAppSettings(
+    {
+      pirAlertThreshold: 3,
+      proximityAlertRadiusKm: 25,
+      autoDownloadCertificatePdf: true,
+      defaultBufferRule: '100M_SETTLEMENT',
+      offlineAutoSync: false,
+      notifyQuotesWhatsapp: false,
+    },
+    kv
+  );
+  assert.equal(savedSettings.pirAlertThreshold, 3);
+  assert.equal(loadUserAppSettings(kv).proximityAlertRadiusKm, 25);
+  assert.equal(loadUserAppSettings(kv).offlineAutoSync, false);
+
+  // 6. DELETE_PARCEL offline sync & outbox coalescing
+  const coalesced = coalesceOutboxOperations([
+    {
+      opId: '1',
+      type: 'SAVE_PARCEL',
+      targetId: 'parcel-temp-99',
+      parcel: baseParcel,
+      createdAtMs: 100,
+      attempts: 0,
+    },
+    {
+      opId: '2',
+      type: 'DELETE_PARCEL',
+      targetId: 'parcel-temp-99',
+      createdAtMs: 200,
+      attempts: 0,
+    },
+  ]);
+  assert.equal(coalesced.length, 1);
+  assert.equal(coalesced[0].type, 'DELETE_PARCEL');
+
+  let online = false;
+  const cloudDeleted: string[] = [];
+  const backendDeleted: string[] = [];
+  const offlineAdapter = createMemoryOfflineStorageAdapter();
+  const coordinator = new OfflineSyncCoordinator({
+    storage: offlineAdapter,
+    isOnline: () => online,
+    transport: {
+      saveParcel: async () => {},
+      deleteParcel: async (_uid, pid) => {
+        cloudDeleted.push(pid);
+      },
+      deleteParcelFromBackend: async (pid) => {
+        backendDeleted.push(pid);
+      },
+      createHistory: async () => {},
+      archiveHistory: async () => {},
+      deleteHistory: async () => {},
+    },
+  });
+
+  await coordinator.recordParcelDelete(baseParcel.id, 'uid-owner-1');
+  const hydratedOffline = await coordinator.hydrateState();
+  assert.ok(hydratedOffline.deletedParcelIds.includes(baseParcel.id));
+  assert.equal(hydratedOffline.outbox.length, 1);
+  assert.equal(hydratedOffline.outbox[0].type, 'DELETE_PARCEL');
+
+  const mergedAfterDelete = mergeParcelsWithOffline(
+    INITIAL_PARCELS,
+    hydratedOffline.parcels,
+    hydratedOffline.deletedParcelIds
+  );
+  assert.equal(mergedAfterDelete.some((p) => p.id === baseParcel.id), false);
+
+  online = true;
+  const flushRes = await coordinator.flushOutbox('uid-owner-1');
+  assert.equal(flushRes.syncedCount, 1);
+  assert.deepEqual(cloudDeleted, [baseParcel.id]);
+  assert.deepEqual(backendDeleted, [baseParcel.id]);
+});
+
+
+

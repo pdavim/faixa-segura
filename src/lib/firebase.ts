@@ -446,8 +446,20 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
   }
 
   const label = clampString(parcel.label, 2, 120, 'Parcela BUPi');
+  const municipality = clampString(parcel.municipality, 2, 80, 'Sintra');
+  const dico = sanitizeDico(parcel.dico);
   const matrixArticle = clampString(parcel.matrixArticle, 1, 80, 'Rústico');
   const bupiRggId = clampString(parcel.bupiRggId, 1, 40, 'RGG-LOCAL');
+  const landClass =
+    parcel.landClass === 'AGRICULTURE' || parcel.landClass === 'URBAN_BUILT'
+      ? parcel.landClass
+      : 'FOREST_SCRUB';
+  const totalAreaM2 = Math.max(1, Math.min(100_000_000, Number(parcel.spatial.totalAreaM2) || 1000));
+  const mandatoryCleanAreaM2 = Math.max(
+    0,
+    Math.min(100_000_000, Number(parcel.spatial.mandatoryCleanAreaM2) || 0)
+  );
+  const avgSlopePct = Math.max(0, Math.min(100, Number(parcel.avgSlopePct) || 0));
   const hasEredesLine = Boolean(parcel.hasEredesLine);
   const hasProtectedOaks = Boolean(parcel.hasProtectedOaks);
 
@@ -455,8 +467,14 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
     try {
       await updateDoc(parcelRef, {
         label,
+        municipality,
+        dico,
         matrixArticle,
         bupiRggId,
+        landClass,
+        totalAreaM2,
+        mandatoryCleanAreaM2,
+        avgSlopePct,
         hasEredesLine,
         hasProtectedOaks,
         updatedAt: serverTimestamp(),
@@ -472,17 +490,14 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
       uid,
       parcelId,
       label,
-      municipality: clampString(parcel.municipality, 2, 80, 'Sintra'),
-      dico: sanitizeDico(parcel.dico),
+      municipality,
+      dico,
       matrixArticle,
       bupiRggId,
-      landClass: parcel.landClass,
-      totalAreaM2: Math.max(1, Math.min(100_000_000, Number(parcel.spatial.totalAreaM2) || 1000)),
-      mandatoryCleanAreaM2: Math.max(
-        0,
-        Math.min(100_000_000, Number(parcel.spatial.mandatoryCleanAreaM2) || 0)
-      ),
-      avgSlopePct: Math.max(0, Math.min(100, Number(parcel.avgSlopePct) || 0)),
+      landClass,
+      totalAreaM2,
+      mandatoryCleanAreaM2,
+      avgSlopePct,
       hasEredesLine,
       hasProtectedOaks,
       createdAt: serverTimestamp(),
@@ -490,6 +505,37 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
+export async function deleteUserParcelFromCloud(
+  uidRaw: string,
+  parcelIdRaw: string
+): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    throw new Error('Ligação Firestore indisponível (offline ou configuração ausente).');
+  }
+
+  const uid = sanitizeSafeId(uidRaw, 'usr');
+  const parcelId = sanitizeSafeId(parcelIdRaw, 'parcel');
+  const path = `users/${uid}/parcels/${parcelId}`;
+  const parcelRef = doc(db, 'users', uid, 'parcels', parcelId);
+
+  let existingSnap;
+  try {
+    existingSnap = await getDoc(parcelRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  if (!existingSnap.exists()) {
+    return;
+  }
+
+  try {
+    await deleteDoc(parcelRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.DELETE, path);
   }
 }
 

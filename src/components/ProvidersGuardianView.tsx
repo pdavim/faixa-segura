@@ -8,6 +8,7 @@ import {
   LockOpen,
   QrCode,
   ShieldCheck,
+  Star,
   Tractor,
 } from 'lucide-react';
 import type {
@@ -26,6 +27,8 @@ interface ProvidersGuardianViewProps {
   providers: ForestryProvider[];
   quotes: QuoteLead[];
   municipalities: MunicipalityInfo[];
+  favoriteProviderIds?: string[];
+  onToggleFavoriteProvider?: (providerId: string) => void;
   onSelectParcel: (parcelId: string) => void;
   onInspectCertificate: (cert: ComplianceCertificate) => void;
   onProviderRegistered: (provider: ForestryProvider) => void;
@@ -46,6 +49,8 @@ export const ProvidersGuardianView: React.FC<ProvidersGuardianViewProps> = ({
   providers,
   quotes,
   municipalities,
+  favoriteProviderIds = [],
+  onToggleFavoriteProvider,
   onSelectParcel,
   onInspectCertificate,
   onProviderRegistered,
@@ -276,34 +281,61 @@ export const ProvidersGuardianView: React.FC<ProvidersGuardianViewProps> = ({
             <h2 className="text-base font-bold text-slate-900 dark:text-white">
               Empresas Florestais Credenciadas ({providers.length})
             </h2>
-            {providers.map((prov) => (
-              <div
-                key={prov.id}
-                className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-4 space-y-2.5"
-              >
-                <div className="flex items-start justify-between gap-2">
-                  <div>
-                    <h3 className="text-sm font-bold text-slate-900 dark:text-white">
-                      {prov.companyName}
-                    </h3>
-                    <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
-                      NIF {prov.nif} · CAE {prov.caeCode} · Mín. {prov.minAreaM2} m²
-                    </p>
+            {providers.map((prov) => {
+              const isFav = favoriteProviderIds.includes(prov.id);
+              return (
+                <div
+                  key={prov.id}
+                  className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-4 space-y-2.5"
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div>
+                      <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                        {prov.companyName}
+                      </h3>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums">
+                        NIF {prov.nif} · CAE {prov.caeCode} · Mín. {prov.minAreaM2} m²
+                      </p>
+                    </div>
+                    <div className="flex items-center gap-2 shrink-0">
+                      <span className="text-xs font-mono font-bold tabular-nums text-[#14532D] dark:text-[#4ADE80]">
+                        {prov.completedCertificates} Autos
+                      </span>
+                      {onToggleFavoriteProvider && (
+                        <button
+                          type="button"
+                          onClick={() => onToggleFavoriteProvider(prov.id)}
+                          aria-label={
+                            isFav
+                              ? `Remover ${prov.companyName} dos prestadores favoritos`
+                              : `Guardar ${prov.companyName} nos prestadores favoritos`
+                          }
+                          className={`min-h-[38px] px-2.5 py-1 rounded-lg border text-xs font-semibold inline-flex items-center gap-1 transition-colors whitespace-nowrap shrink-0 ${
+                            isFav
+                              ? 'border-[#D97706] bg-[#D97706]/10 text-[#B45309] dark:text-[#FBBF24]'
+                              : 'border-slate-300 dark:border-[#263248] text-slate-600 dark:text-slate-300 hover:bg-slate-50 dark:hover:bg-slate-800'
+                          }`}
+                        >
+                          <Star
+                            className={`w-3.5 h-3.5 ${isFav ? 'fill-current' : ''}`}
+                            aria-hidden="true"
+                          />
+                          {isFav ? 'Favorito' : 'Guardar'}
+                        </button>
+                      )}
+                    </div>
                   </div>
-                  <span className="text-xs font-mono font-bold text-[#14532D] dark:text-[#4ADE80] shrink-0">
-                    {prov.completedCertificates} Autos
-                  </span>
+                  <p className="text-xs text-slate-600 dark:text-slate-300">
+                    <strong>Concelhos:</strong> {prov.coveredMunicipalities.join(', ')}
+                  </p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    Seguro RC Ativo
+                    {prov.hasSparkArrestor ? ' · Retenção de Faúlhas' : ''}
+                    {prov.hasIcnfOakCredential ? ' · Credenciado Quercíneas ICNF' : ''}
+                  </p>
                 </div>
-                <p className="text-xs text-slate-600 dark:text-slate-300">
-                  <strong>Concelhos:</strong> {prov.coveredMunicipalities.join(', ')}
-                </p>
-                <p className="text-xs text-slate-500 dark:text-slate-400">
-                  Seguro RC Ativo
-                  {prov.hasSparkArrestor ? ' · Retenção de Faúlhas' : ''}
-                  {prov.hasIcnfOakCredential ? ' · Credenciado Quercíneas ICNF' : ''}
-                </p>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}

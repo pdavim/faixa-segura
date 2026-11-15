@@ -20,7 +20,7 @@ export default defineConfig(() => {
           theme_color: '#14532D',
           background_color: '#F8FAFC',
           display: 'standalone',
-          start_url: '/',
+          start_url: '/?mode=webapp',
           scope: '/',
           icons: [
             {
@@ -45,7 +45,7 @@ export default defineConfig(() => {
         },
         workbox: {
           maximumFileSizeToCacheInBytes: 10 * 1024 * 1024,
-          globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
+          globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,woff2}'],
           runtimeCaching: [
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,

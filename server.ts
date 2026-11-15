@@ -314,7 +314,7 @@ async function startServer() {
     });
   });
 
-  // 4. Compute & Save Custom / Imported Parcel (EPSG:3763)
+  // 4. Compute, Save, Update & Delete Custom / Imported Parcel (EPSG:3763)
   app.post('/api/parcels', (req, res) => {
     const body = req.body as Partial<ParcelRecord> & { dico?: string };
     if (!body.label || !Array.isArray(body.vertices) || body.vertices.length < 3) {
@@ -332,8 +332,13 @@ async function startServer() {
       neighborDistanceOverrideM: 4.6,
     });
 
+    const requestedId =
+      typeof body.id === 'string' && /^[a-zA-Z0-9_-]{2,128}$/.test(body.id)
+        ? body.id
+        : `parcel-${Date.now()}`;
+
     const newParcel: ParcelRecord = {
-      id: `parcel-${Date.now()}`,
+      id: requestedId,
       label: body.label.trim(),
       parish: body.parish?.trim() || muni.name,
       municipality: muni.name,
@@ -372,8 +377,84 @@ async function startServer() {
       spatial,
     };
 
+    const existingIdx = parcelsStore.findIndex((p) => p.id === requestedId);
+    if (existingIdx !== -1) {
+      parcelsStore[existingIdx] = newParcel;
+      res.status(200).json(newParcel);
+      return;
+    }
+
     parcelsStore.unshift(newParcel);
     res.status(201).json(newParcel);
+  });
+
+  app.put('/api/parcels/:id', (req, res) => {
+    const targetId = req.params.id;
+    const idx = parcelsStore.findIndex((p) => p.id === targetId);
+    if (idx === -1) {
+      res.status(404).json({ error: 'Terreno não encontrado no servidor.' });
+      return;
+    }
+    const existing = parcelsStore[idx];
+    const body = req.body as Partial<ParcelRecord> & { dico?: string };
+    const muni = MUNICIPALITIES.find((m) => m.dico === (body.dico ?? existing.dico)) ?? MUNICIPALITIES[0];
+    const vertices =
+      Array.isArray(body.vertices) && body.vertices.length >= 3
+        ? body.vertices
+        : existing.vertices;
+    const landClass = body.landClass ?? existing.landClass;
+    const hasEredesLine =
+      body.hasEredesLine !== undefined ? Boolean(body.hasEredesLine) : existing.hasEredesLine;
+    const hasProtectedOaks =
+      body.hasProtectedOaks !== undefined ? Boolean(body.hasProtectedOaks) : existing.hasProtectedOaks;
+
+    const spatial = computeParcelFgc({
+      vertices,
+      landClass,
+      hasEredesLine,
+      neighborDistanceOverrideM: existing.spatial.neighborMinDistanceM,
+    });
+
+    const updated: ParcelRecord = {
+      ...existing,
+      label: body.label?.trim() || existing.label,
+      parish: body.parish?.trim() || existing.parish,
+      municipality: muni.name,
+      district: muni.district,
+      dico: muni.dico,
+      dicofre: muni.dico !== existing.dico ? muni.dicofreDefault : existing.dicofre,
+      matrixArticle: body.matrixArticle?.trim() || existing.matrixArticle,
+      bupiRggId: body.bupiRggId?.trim() || existing.bupiRggId,
+      landClass,
+      avgSlopePct: body.avgSlopePct !== undefined ? Number(body.avgSlopePct) : existing.avgSlopePct,
+      hasEredesLine,
+      eredesType: hasEredesLine ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea',
+      hasProtectedOaks,
+      protectedOakNotes: hasProtectedOaks
+        ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
+        : 'Sem quercíneas protegidas assinaladas no polígono.',
+      vertices,
+      buildingCenter: spatial.centroidWgs84,
+      spatial,
+    };
+
+    parcelsStore[idx] = updated;
+    res.json(updated);
+  });
+
+  app.delete('/api/parcels/:id', (req, res) => {
+    const targetId = req.params.id;
+    const idx = parcelsStore.findIndex((p) => p.id === targetId);
+    if (idx === -1) {
+      res.status(204).end();
+      return;
+    }
+    if (parcelsStore.length <= 1) {
+      res.status(400).json({ error: 'Deve manter pelo menos um terreno ativo.' });
+      return;
+    }
+    parcelsStore.splice(idx, 1);
+    res.status(204).end();
   });
 
   // 5. Issue SHA-256 Compliance Certificate

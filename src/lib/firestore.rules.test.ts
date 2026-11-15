@@ -110,6 +110,62 @@ function isValidUserHistoryEntry(data: Record<string, unknown>, authUid: string)
   );
 }
 
+function isValidUserSavedParcel(data: Record<string, unknown>, authUid: string): boolean {
+  const keys = [
+    'uid',
+    'parcelId',
+    'label',
+    'municipality',
+    'dico',
+    'matrixArticle',
+    'bupiRggId',
+    'landClass',
+    'totalAreaM2',
+    'mandatoryCleanAreaM2',
+    'avgSlopePct',
+    'hasEredesLine',
+    'hasProtectedOaks',
+    'createdAt',
+    'updatedAt',
+  ];
+  return (
+    hasExactKeys(data, keys) &&
+    isValidId(data.uid) &&
+    data.uid === authUid &&
+    isValidId(data.parcelId) &&
+    typeof data.label === 'string' &&
+    data.label.length >= 2 &&
+    data.label.length <= 120 &&
+    typeof data.municipality === 'string' &&
+    data.municipality.length >= 2 &&
+    data.municipality.length <= 80 &&
+    typeof data.dico === 'string' &&
+    data.dico.length === 4 &&
+    DICO_RE.test(data.dico) &&
+    typeof data.matrixArticle === 'string' &&
+    data.matrixArticle.length >= 1 &&
+    data.matrixArticle.length <= 80 &&
+    typeof data.bupiRggId === 'string' &&
+    data.bupiRggId.length >= 1 &&
+    data.bupiRggId.length <= 40 &&
+    typeof data.landClass === 'string' &&
+    ['FOREST_SCRUB', 'AGRICULTURE', 'URBAN_BUILT'].includes(data.landClass) &&
+    typeof data.totalAreaM2 === 'number' &&
+    data.totalAreaM2 > 0 &&
+    data.totalAreaM2 <= 100_000_000 &&
+    typeof data.mandatoryCleanAreaM2 === 'number' &&
+    data.mandatoryCleanAreaM2 >= 0 &&
+    data.mandatoryCleanAreaM2 <= 100_000_000 &&
+    typeof data.avgSlopePct === 'number' &&
+    data.avgSlopePct >= 0 &&
+    data.avgSlopePct <= 100 &&
+    typeof data.hasEredesLine === 'boolean' &&
+    typeof data.hasProtectedOaks === 'boolean' &&
+    typeof data.createdAt === 'number' &&
+    typeof data.updatedAt === 'number'
+  );
+}
+
 /**
  * Deterministic security rule evaluator mirroring firestore.rules Boolean gates
  * to verify all 12 Dirty Dozen adversarial payloads return PERMISSION_DENIED.
@@ -202,6 +258,71 @@ function evaluateFirestoreRule(ctx: RequestContext): 'ALLOWED' | 'PERMISSION_DEN
       if (!isValidUserHistoryEntry(ctx.incomingData, ctx.auth.uid)) return 'PERMISSION_DENIED';
       if (ctx.existingData.status === 'ARCHIVED') return 'PERMISSION_DENIED';
       if (ctx.incomingData.updatedAt !== ctx.nowMs) return 'PERMISSION_DENIED';
+      return 'ALLOWED';
+    }
+  }
+
+  // /users/{userId}/parcels/{parcelId}
+  if (seg.length === 4 && seg[0] === 'users' && seg[2] === 'parcels') {
+    const [, userId, , parcelId] = seg;
+    if (ctx.auth.uid !== userId) return 'PERMISSION_DENIED';
+
+    if (ctx.operation === 'list') {
+      return ctx.existingData?.uid === ctx.auth.uid ? 'ALLOWED' : 'PERMISSION_DENIED';
+    }
+
+    if (!isValidId(userId) || !isValidId(parcelId)) return 'PERMISSION_DENIED';
+    if (!ctx.existingDocs.has(`users/${userId}`)) return 'PERMISSION_DENIED';
+
+    if (ctx.operation === 'create') {
+      if (!ctx.incomingData) return 'PERMISSION_DENIED';
+      if (
+        ctx.incomingData.parcelId === parcelId &&
+        isValidUserSavedParcel(ctx.incomingData, ctx.auth.uid) &&
+        ctx.incomingData.createdAt === ctx.nowMs &&
+        ctx.incomingData.updatedAt === ctx.nowMs
+      ) {
+        return 'ALLOWED';
+      }
+      return 'PERMISSION_DENIED';
+    }
+
+    if (ctx.operation === 'update') {
+      if (!ctx.incomingData || !ctx.existingData) return 'PERMISSION_DENIED';
+      if (!isValidUserSavedParcel(ctx.incomingData, ctx.auth.uid)) return 'PERMISSION_DENIED';
+      const changedKeys = Object.keys(ctx.incomingData).filter(
+        (k) => ctx.incomingData![k] !== ctx.existingData![k]
+      );
+      const allowedDiff = changedKeys.every((k) =>
+        [
+          'label',
+          'municipality',
+          'dico',
+          'matrixArticle',
+          'bupiRggId',
+          'landClass',
+          'totalAreaM2',
+          'mandatoryCleanAreaM2',
+          'avgSlopePct',
+          'hasEredesLine',
+          'hasProtectedOaks',
+          'updatedAt',
+        ].includes(k)
+      );
+      if (
+        allowedDiff &&
+        ctx.incomingData.uid === ctx.existingData.uid &&
+        ctx.incomingData.parcelId === ctx.existingData.parcelId &&
+        ctx.incomingData.createdAt === ctx.existingData.createdAt &&
+        ctx.incomingData.updatedAt === ctx.nowMs
+      ) {
+        return 'ALLOWED';
+      }
+      return 'PERMISSION_DENIED';
+    }
+
+    if (ctx.operation === 'delete') {
+      if (!ctx.existingData || ctx.existingData.uid !== ctx.auth.uid) return 'PERMISSION_DENIED';
       return 'ALLOWED';
     }
   }
@@ -418,5 +539,87 @@ test('Dirty Dozen adversarial payloads all return PERMISSION_DENIED while legiti
       existingDocs,
     }),
     'PERMISSION_DENIED'
+  );
+
+  // 13. Parcel Create, Update (recomputed area & landClass), Delete, and Shadow/Immutable Guard
+  const validParcelPayload = {
+    uid: 'user_1',
+    parcelId: 'parcel-101',
+    label: 'Pinhal Novo da Serra',
+    municipality: 'Sintra',
+    dico: '1111',
+    matrixArticle: 'Rústico Art. 88',
+    bupiRggId: 'RGG-101',
+    landClass: 'FOREST_SCRUB',
+    totalAreaM2: 6200,
+    mandatoryCleanAreaM2: 2400,
+    avgSlopePct: 14,
+    hasEredesLine: false,
+    hasProtectedOaks: true,
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'create',
+      nowMs: now,
+      incomingData: validParcelPayload,
+      existingDocs,
+    }),
+    'ALLOWED'
+  );
+
+  // Owner updates label, landClass, municipality, and mandatoryCleanAreaM2
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'update',
+      nowMs: now + 5000,
+      existingData: validParcelPayload,
+      incomingData: {
+        ...validParcelPayload,
+        label: 'Pinhal Renovado',
+        landClass: 'AGRICULTURE',
+        mandatoryCleanAreaM2: 1120,
+        updatedAt: now + 5000,
+      },
+      existingDocs,
+    }),
+    'ALLOWED'
+  );
+
+  // Reject mutating immutable parcelId or injecting shadow field on parcel update
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'update',
+      nowMs: now + 5000,
+      existingData: validParcelPayload,
+      incomingData: {
+        ...validParcelPayload,
+        parcelId: 'parcel-hijack',
+        updatedAt: now + 5000,
+      },
+      existingDocs,
+    }),
+    'PERMISSION_DENIED'
+  );
+
+  // Owner deletes parcel
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'delete',
+      nowMs: now + 9000,
+      existingData: validParcelPayload,
+      existingDocs,
+    }),
+    'ALLOWED'
   );
 });
