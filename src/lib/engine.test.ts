@@ -663,6 +663,15 @@ test('appShellMode separates WebView Homepage vs WebApp Onboarding Splash, valid
   assert.ok(compose.includes('--appendonly no'), 'Redis should disable AOF fork rewrites');
   assert.ok(compose.includes('--maxmemory 128mb'), 'Redis should cap memory with allkeys-lru');
   assert.ok(!compose.includes('sysctls:'), 'Compose must not set non-namespaced vm.overcommit_memory sysctl');
+
+  // 7. Verify docs/server-setup.md documents vm.overcommit_memory = 1 in /etc/sysctl.conf and live application for Redis
+  const serverSetupPath = path.join(process.cwd(), 'docs', 'server-setup.md');
+  assert.ok(fs.existsSync(serverSetupPath), 'docs/server-setup.md must exist');
+  const serverSetupDoc = fs.readFileSync(serverSetupPath, 'utf8');
+  assert.ok(serverSetupDoc.includes('vm.overcommit_memory = 1'));
+  assert.ok(serverSetupDoc.includes('/etc/sysctl.conf'));
+  assert.ok(serverSetupDoc.includes('sysctl vm.overcommit_memory=1'));
+  assert.ok(serverSetupDoc.includes('jemalloc/issues/1328'));
 });
 
 test('userWorkspaceStore handles parcel CRUD, EPSG:3763 spatial recomputation, per-parcel document uploads, favorite providers, settings, and DELETE_PARCEL offline sync', async () => {
