@@ -5,12 +5,13 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  BookOpen,
+  Check,
   Download,
   History,
   LogOut,
   Map as MapIcon,
   Moon,
+  Share2,
   Sun,
   SunMedium,
   Tractor,
@@ -71,9 +72,13 @@ import {
 import {
   buildDefaultDemoProfile,
   buildLocalSessionProfile,
+  buildParcelShareUrl,
   clearLocalAuthSession,
+  copyDeepLinkToClipboard,
   detectEntryExperienceMode,
+  extractRequestedParcelId,
   loadLocalAuthSession,
+  resolveDeepLinkParcelSelection,
   saveLocalAuthSession,
   shouldAutoStartWorkspace,
   type EntryModeOverride,
@@ -92,8 +97,7 @@ import { TodayCockpitView } from './components/TodayCockpitView.tsx';
 import { MapZonesView } from './components/MapZonesView.tsx';
 import { CertifyQuotesView } from './components/CertifyQuotesView.tsx';
 import { ProvidersGuardianView } from './components/ProvidersGuardianView.tsx';
-import { DocsArchitectureView } from './components/DocsArchitectureView.tsx';
-import { UserManagementView } from './components/UserManagementView.tsx';
+import { UserManagementView, type UserSubTab } from './components/UserManagementView.tsx';
 import { CertificateVerifyModal } from './components/CertificateVerifyModal.tsx';
 import { UserHistoryModal } from './components/UserHistoryModal.tsx';
 import { PublicWebviewHomepage } from './components/PublicWebviewHomepage.tsx';
@@ -134,12 +138,34 @@ function buildInitialForecasts(dico: string): DailyPirForecast[] {
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('today');
   const [certifySubMode, setCertifySubMode] = useState<string>('certificate');
+  const [userInitialSubTab, setUserInitialSubTab] = useState<UserSubTab>('properties');
+  const [userSubTabNonce, setUserSubTabNonce] = useState<number>(0);
   const [darkMode, setDarkMode] = useState<boolean>(false);
 
   // Domain state initialized deterministically so zero-latency rendering works immediately
+  const initialDeepLinkParcelId = useMemo(
+    () => (typeof window !== 'undefined' ? extractRequestedParcelId(window.location.search) : null),
+    []
+  );
+  const initialParcelResolution = useMemo(
+    () =>
+      resolveDeepLinkParcelSelection(
+        INITIAL_PARCELS,
+        initialDeepLinkParcelId,
+        INITIAL_PARCELS[0].id
+      ),
+    [initialDeepLinkParcelId]
+  );
+
   const [municipalities, setMunicipalities] = useState<MunicipalityInfo[]>(MUNICIPALITIES);
   const [parcels, setParcels] = useState<ParcelRecord[]>(INITIAL_PARCELS);
-  const [activeParcelId, setActiveParcelId] = useState<string>(INITIAL_PARCELS[0].id);
+  const [activeParcelId, setActiveParcelId] = useState<string>(initialParcelResolution.selectedId);
+  const pendingDeepLinkParcelIdRef = useRef<string | null>(
+    initialDeepLinkParcelId && !initialParcelResolution.matched ? initialDeepLinkParcelId : null
+  );
+  const [shareToast, setShareToast] = useState<{ parcelId: string; shareUrl: string } | null>(null);
+  const shareResetTimerRef = useRef<number | null>(null);
+
   const [certificates, setCertificates] = useState<ComplianceCertificate[]>(INITIAL_CERTIFICATES);
   const [providers, setProviders] = useState<ForestryProvider[]>(INITIAL_PROVIDERS);
   const [quotes, setQuotes] = useState<QuoteLead[]>(INITIAL_QUOTES);
@@ -153,13 +179,13 @@ export default function App() {
   const activeParcel = parcels.find((p) => p.id === activeParcelId) ?? parcels[0];
 
   const [forecasts, setForecasts] = useState<DailyPirForecast[]>(() =>
-    buildInitialForecasts(INITIAL_PARCELS[0].dico)
+    buildInitialForecasts(activeParcel.dico)
   );
   const [pirSource, setPirSource] = useState<string>('IPMA RCM');
   const [fires, setFires] = useState<ActiveFireIncident[]>(() =>
     FALLBACK_ACTIVE_FIRES.map((f) => ({
       ...f,
-      distanceKm: haversineDistanceKm(INITIAL_PARCELS[0].spatial.centroidWgs84, {
+      distanceKm: haversineDistanceKm(activeParcel.spatial.centroidWgs84, {
         lat: f.lat,
         lon: f.lon,
       }),
@@ -176,7 +202,9 @@ export default function App() {
     const existing = loadLocalAuthSession();
     if (existing) return existing;
     if (typeof window !== 'undefined' && shouldAutoStartWorkspace(window.location.search)) {
-      const demo = buildDefaultDemoProfile(INITIAL_PARCELS[0].dico);
+      const targetParcel =
+        INITIAL_PARCELS.find((p) => p.id === initialDeepLinkParcelId) ?? INITIAL_PARCELS[0];
+      const demo = buildDefaultDemoProfile(targetParcel.dico);
       saveLocalAuthSession(demo);
       return demo;
     }
@@ -483,6 +511,63 @@ export default function App() {
     }
   }, [darkMode]);
 
+  // Resolve pending ?parcel=<id> deep-link if the target parcel arrives asynchronously (API / IndexedDB)
+  useEffect(() => {
+    const pendingId = pendingDeepLinkParcelIdRef.current;
+    if (!pendingId) return;
+    const resolution = resolveDeepLinkParcelSelection(parcels, pendingId, activeParcelId);
+    if (resolution.matched) {
+      setActiveParcelId(resolution.selectedId);
+      pendingDeepLinkParcelIdRef.current = null;
+    }
+  }, [parcels, activeParcelId]);
+
+  // Support browser back/forward navigation across shared ?parcel=<id> URLs
+  useEffect(() => {
+    const onPopState = () => {
+      const reqId = extractRequestedParcelId(window.location.search);
+      if (!reqId) return;
+      const resolution = resolveDeepLinkParcelSelection(parcels, reqId, activeParcelId);
+      if (resolution.matched) {
+        setActiveParcelId(resolution.selectedId);
+      } else {
+        pendingDeepLinkParcelIdRef.current = reqId;
+      }
+    };
+    window.addEventListener('popstate', onPopState);
+    return () => window.removeEventListener('popstate', onPopState);
+  }, [parcels, activeParcelId]);
+
+  useEffect(() => {
+    return () => {
+      if (shareResetTimerRef.current !== null) {
+        window.clearTimeout(shareResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  const handleShareActiveParcel = useCallback(async () => {
+    if (typeof window === 'undefined') return;
+    const shareUrl = buildParcelShareUrl(window.location.href, activeParcel.id);
+
+    try {
+      window.history.replaceState(null, '', shareUrl);
+    } catch {
+      // Ignore history security restrictions in constrained frames
+    }
+
+    await copyDeepLinkToClipboard(shareUrl);
+
+    setShareToast({ parcelId: activeParcel.id, shareUrl });
+    if (shareResetTimerRef.current !== null) {
+      window.clearTimeout(shareResetTimerRef.current);
+    }
+    shareResetTimerRef.current = window.setTimeout(() => {
+      setShareToast(null);
+      shareResetTimerRef.current = null;
+    }, 2800);
+  }, [activeParcel.id]);
+
   // Hydrate live backend state and check ?verify= query param while preserving offline-created parcels
   useEffect(() => {
     fetch('/api/state')
@@ -557,8 +642,20 @@ export default function App() {
   }, [activeParcel.id, activeParcel.dico, isOnline, userSettings.proximityAlertRadiusKm]);
 
   const handleNavigate = (tab: NavTab, subMode?: string) => {
+    if (tab === 'docs') {
+      setActiveTab('user');
+      setUserInitialSubTab('docs');
+      setUserSubTabNonce((n) => n + 1);
+      window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+      return;
+    }
     setActiveTab(tab);
-    if (subMode) setCertifySubMode(subMode);
+    if (tab === 'user' && subMode) {
+      setUserInitialSubTab(subMode as UserSubTab);
+      setUserSubTabNonce((n) => n + 1);
+    } else if (subMode) {
+      setCertifySubMode(subMode);
+    }
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   };
 
@@ -796,17 +893,6 @@ export default function App() {
             </button>
             <button
               type="button"
-              onClick={() => handleNavigate('docs')}
-              className={`py-1 transition-colors whitespace-nowrap shrink-0 hover:text-slate-950 dark:hover:text-white ${
-                activeTab === 'docs'
-                  ? 'text-[#14532D] dark:text-[#22C55E] font-semibold underline underline-offset-8 decoration-2'
-                  : ''
-              }`}
-            >
-              Documentação
-            </button>
-            <button
-              type="button"
               onClick={() => handleNavigate('user')}
               className={`py-1 transition-colors whitespace-nowrap shrink-0 hover:text-slate-950 dark:hover:text-white ${
                 activeTab === 'user'
@@ -834,15 +920,29 @@ export default function App() {
       {/* Non-sticky Workspace Context Toolbar (Parcel Switcher, Solar/Dark Theme, PWA Install) */}
       <div className="border-b border-slate-200 dark:border-[#263248] bg-slate-100/70 dark:bg-[#0F1624]">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 py-2.5 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2.5">
-          <div className="flex items-center gap-2.5 w-full sm:w-auto min-w-0">
+          <div className="flex items-center gap-2 w-full sm:w-auto min-w-0">
             <label htmlFor="workspace-parcel-select" className="text-xs font-semibold text-slate-600 dark:text-slate-400 whitespace-nowrap shrink-0">
               Terreno:
             </label>
             <select
               id="workspace-parcel-select"
               value={activeParcel.id}
-              onChange={(e) => setActiveParcelId(e.target.value)}
-              className="min-h-[42px] flex-1 sm:flex-initial sm:w-72 min-w-0 px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-900 dark:text-white truncate"
+              onChange={(e) => {
+                const nextId = e.target.value;
+                setActiveParcelId(nextId);
+                if (typeof window !== 'undefined' && extractRequestedParcelId(window.location.search)) {
+                  try {
+                    window.history.replaceState(
+                      null,
+                      '',
+                      buildParcelShareUrl(window.location.href, nextId)
+                    );
+                  } catch {
+                    // Ignore history update errors
+                  }
+                }
+              }}
+              className="min-h-[42px] flex-1 sm:flex-initial sm:w-60 lg:w-72 min-w-0 px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-900 dark:text-white truncate"
             >
               {parcels.map((p) => (
                 <option key={p.id} value={p.id}>
@@ -850,24 +950,25 @@ export default function App() {
                 </option>
               ))}
             </select>
-          </div>
-
-          <div className="flex flex-wrap items-center justify-between sm:justify-end gap-2 w-full sm:w-auto">
-            {/* Mobile/Tablet Docs shortcut */}
             <button
               type="button"
-              onClick={() => handleNavigate('docs')}
-              className={`lg:hidden min-h-[40px] px-2.5 py-1.5 rounded-xl border text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
-                activeTab === 'docs'
-                  ? 'border-[#14532D] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                  : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-slate-700 dark:text-slate-200'
+              id="workspace-parcel-share-btn"
+              data-testid="share-parcel-button"
+              onClick={() => void handleShareActiveParcel()}
+              aria-label={`Share deep-link for ${activeParcel.label}`}
+              title={`Copy deep-link URL for ${activeParcel.label}`}
+              className={`min-h-[42px] min-w-[44px] px-3 py-1.5 rounded-xl border transition-colors inline-flex items-center justify-center shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E] ${
+                shareToast?.parcelId === activeParcel.id
+                  ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] dark:bg-[#22C55E] text-white dark:text-slate-950'
+                  : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-[#14532D] dark:text-[#22C55E] hover:bg-[#14532D]/10 dark:hover:bg-[#22C55E]/15'
               }`}
             >
-              <BookOpen className="w-3.5 h-3.5" aria-hidden="true" />
-              Docs
+              <Share2 className="w-4 h-4 shrink-0" aria-hidden="true" />
             </button>
+          </div>
 
-            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 ml-auto sm:ml-0">
+          <div className="flex flex-wrap items-center justify-end gap-2 w-full sm:w-auto">
+            <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 w-full sm:w-auto justify-end">
               {/* User Account & Consultable History Trigger */}
               <button
                 type="button"
@@ -1095,10 +1196,10 @@ export default function App() {
           />
         )}
 
-        {activeTab === 'docs' && <DocsArchitectureView />}
-
         {activeTab === 'user' && userProfile && (
           <UserManagementView
+            initialSubTab={userInitialSubTab}
+            subTabRequestNonce={userSubTabNonce}
             profile={userProfile}
             isCloudSession={isCloudSession}
             isFirebaseConfigured={isFirebaseConfigured}
@@ -1424,6 +1525,25 @@ export default function App() {
               Entendido
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Deep-Link Share 'Copied!' Toast Notification */}
+      {shareToast && (
+        <div
+          role="status"
+          aria-live="polite"
+          data-testid="share-copied-toast"
+          className="fixed bottom-20 lg:bottom-6 right-4 sm:right-6 z-50 flex items-center gap-2.5 px-4 py-3 rounded-xl bg-[#0F172A] dark:bg-[#161E2E] text-white border border-[#14532D] dark:border-[#22C55E] shadow-lg text-xs font-semibold"
+        >
+          <Check className="w-4 h-4 text-[#22C55E] shrink-0" aria-hidden="true" />
+          <span>Copied!</span>
+          <span aria-hidden="true" className="text-slate-400">
+            ·
+          </span>
+          <span className="font-mono text-[11px] text-slate-300 max-w-[200px] sm:max-w-[260px] truncate">
+            ?parcel={shareToast.parcelId}
+          </span>
         </div>
       )}
     </div>

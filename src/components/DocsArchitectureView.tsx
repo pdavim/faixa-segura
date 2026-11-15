@@ -36,9 +36,9 @@ export const DocsArchitectureView: React.FC = () => {
     <div className="space-y-6">
       <div className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-5 flex flex-col gap-4">
         <div>
-          <h1 className="text-xl font-bold text-slate-900 dark:text-white">
+          <h2 className="text-lg sm:text-xl font-bold text-slate-900 dark:text-white">
             Documentação Técnica Detalhada & PRD — FaixaSegura (2026)
-          </h1>
+          </h2>
           <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
             Arquitetura isolada (PostgreSQL 16 + PostGIS 3.4, Redis 7, Node/TS, ollama.innovaive.com) · DL n.º 82/2021 + Despacho n.º 675/2026
           </p>
@@ -52,10 +52,10 @@ export const DocsArchitectureView: React.FC = () => {
           <button
             type="button"
             onClick={() => setActiveDocTab('prd')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap ${
+            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg border text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
               activeDocTab === 'prd'
-                ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'text-slate-700 dark:text-slate-300'
+                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
             }`}
           >
             01. PRD & Benchmark
@@ -63,10 +63,10 @@ export const DocsArchitectureView: React.FC = () => {
           <button
             type="button"
             onClick={() => setActiveDocTab('apis')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap ${
+            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg border text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
               activeDocTab === 'apis'
-                ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'text-slate-700 dark:text-slate-300'
+                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
             }`}
           >
             02. 8 APIs & IA Privada
@@ -74,10 +74,10 @@ export const DocsArchitectureView: React.FC = () => {
           <button
             type="button"
             onClick={() => setActiveDocTab('spatial')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap ${
+            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg border text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
               activeDocTab === 'spatial'
-                ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'text-slate-700 dark:text-slate-300'
+                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
             }`}
           >
             03. PostGIS & Despacho 675/2026
@@ -85,10 +85,10 @@ export const DocsArchitectureView: React.FC = () => {
           <button
             type="button"
             onClick={() => setActiveDocTab('roadmap')}
-            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg text-xs font-semibold whitespace-nowrap ${
+            className={`min-h-[40px] px-3.5 py-1.5 rounded-lg border text-xs font-semibold whitespace-nowrap shrink-0 transition-colors ${
               activeDocTab === 'roadmap'
-                ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'text-slate-700 dark:text-slate-300'
+                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
             }`}
           >
             04. Modelo Negócio & Roadmap

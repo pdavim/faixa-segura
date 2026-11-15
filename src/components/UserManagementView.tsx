@@ -1,6 +1,7 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   Archive,
+  BookOpen,
   CheckCircle2,
   Download,
   Edit3,
@@ -50,9 +51,13 @@ import {
   validateParcelMutationInput,
 } from '../lib/userWorkspaceStore.ts';
 
-type UserSubTab = 'properties' | 'favorites' | 'settings' | 'history';
+import { DocsArchitectureView } from './DocsArchitectureView.tsx';
+
+export type UserSubTab = 'properties' | 'favorites' | 'settings' | 'history' | 'docs';
 
 interface UserManagementViewProps {
+  initialSubTab?: UserSubTab;
+  subTabRequestNonce?: number;
   profile: UserAccountProfile;
   isCloudSession: boolean;
   isFirebaseConfigured: boolean;
@@ -107,6 +112,8 @@ const LAND_CLASS_LABELS: Record<LandClass, string> = {
 };
 
 export const UserManagementView: React.FC<UserManagementViewProps> = ({
+  initialSubTab = 'properties',
+  subTabRequestNonce = 0,
   profile,
   isCloudSession,
   isFirebaseConfigured,
@@ -144,7 +151,13 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   onDeleteHistoryEntry,
   onNavigateTab,
 }) => {
-  const [subTab, setSubTab] = useState<UserSubTab>('properties');
+  const [subTab, setSubTab] = useState<UserSubTab>(initialSubTab);
+
+  useEffect(() => {
+    if (subTabRequestNonce > 0) {
+      setSubTab(initialSubTab);
+    }
+  }, [initialSubTab, subTabRequestNonce]);
 
   // ==================== 1. PROPERTY CRUD & PER-PARCEL DOCUMENTS STATE ====================
   const [parcelSearch, setParcelSearch] = useState('');
@@ -545,7 +558,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
         <div
           role="tablist"
           aria-label="Secções da Área do Utilizador"
-          className="grid grid-cols-2 lg:flex items-center gap-1.5 p-1.5 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
+          className="grid grid-cols-2 sm:grid-cols-3 lg:flex items-center gap-1.5 p-1.5 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
         >
           <button
             type="button"
@@ -609,6 +622,21 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             <History className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             <span className="hidden sm:inline">Histórico & Autos ({historyItems.length})</span>
             <span className="sm:hidden">Histórico ({historyItems.length})</span>
+          </button>
+
+          <button
+            type="button"
+            role="tab"
+            aria-selected={subTab === 'docs'}
+            onClick={() => setSubTab('docs')}
+            className={`col-span-2 sm:col-span-1 min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 inline-flex items-center justify-center lg:justify-start gap-1.5 ${
+              subTab === 'docs'
+                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
+            }`}
+          >
+            <BookOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+            <span>Documentação</span>
           </button>
         </div>
       </section>
@@ -2169,6 +2197,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
           </section>
         </div>
       )}
+
+      {/* ==================== TAB 5: DOCUMENTAÇÃO TÉCNICA & PRD ==================== */}
+      {subTab === 'docs' && <DocsArchitectureView />}
     </div>
   );
 };

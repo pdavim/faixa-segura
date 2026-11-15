@@ -586,3 +586,84 @@ export function buildParcelVerticesGeoJson(
   return JSON.stringify(featureCollection, null, 2);
 }
 
+export interface ParcelLeafletBounds {
+  southWest: LatLon;
+  northEast: LatLon;
+  center: LatLon;
+  leafletBounds: [[number, number], [number, number]];
+}
+
+/**
+ * Computes WGS84 bounding box coordinates for centering and fitting a Leaflet map
+ * onto the active parcel's boundary vertices with safe fallback padding.
+ */
+export function computeParcelLeafletBounds(parcel: ParcelRecord): ParcelLeafletBounds {
+  const sourceVertices =
+    parcel.vertices.length >= 3
+      ? parcel.vertices
+      : parcel.spatial.polygons.parcel.length >= 3
+        ? parcel.spatial.polygons.parcel
+        : [];
+
+  if (sourceVertices.length === 0) {
+    const c = parcel.spatial.centroidWgs84;
+    const sw = offsetMetersFromWgs84(c, -40, -40);
+    const ne = offsetMetersFromWgs84(c, 40, 40);
+    return {
+      southWest: sw,
+      northEast: ne,
+      center: c,
+      leafletBounds: [
+        [sw.lat, sw.lon],
+        [ne.lat, ne.lon],
+      ],
+    };
+  }
+
+  let minLat = Infinity;
+  let maxLat = -Infinity;
+  let minLon = Infinity;
+  let maxLon = -Infinity;
+
+  for (const pt of sourceVertices) {
+    if (pt.lat < minLat) minLat = pt.lat;
+    if (pt.lat > maxLat) maxLat = pt.lat;
+    if (pt.lon < minLon) minLon = pt.lon;
+    if (pt.lon > maxLon) maxLon = pt.lon;
+  }
+
+  // Ensure non-zero span even on collinear / ultra-tight vertices
+  if (maxLat - minLat < 0.00015) {
+    minLat -= 0.00015;
+    maxLat += 0.00015;
+  }
+  if (maxLon - minLon < 0.00015) {
+    minLon -= 0.00015;
+    maxLon += 0.00015;
+  }
+
+  const southWest: LatLon = {
+    lat: Number(minLat.toFixed(6)),
+    lon: Number(minLon.toFixed(6)),
+  };
+  const northEast: LatLon = {
+    lat: Number(maxLat.toFixed(6)),
+    lon: Number(maxLon.toFixed(6)),
+  };
+  const center: LatLon = {
+    lat: Number(((minLat + maxLat) / 2).toFixed(6)),
+    lon: Number(((minLon + maxLon) / 2).toFixed(6)),
+  };
+
+  return {
+    southWest,
+    northEast,
+    center,
+    leafletBounds: [
+      [southWest.lat, southWest.lon],
+      [northEast.lat, northEast.lon],
+    ],
+  };
+}
+
+

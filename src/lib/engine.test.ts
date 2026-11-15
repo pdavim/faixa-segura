@@ -881,5 +881,236 @@ test('userWorkspaceStore handles parcel CRUD, EPSG:3763 spatial recomputation, p
   assert.deepEqual(backendDeleted, [baseParcel.id]);
 });
 
+test('parcel share deep-link helpers and computeParcelLeafletBounds resolve shared parcels and exact active parcel bounds', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const {
+    buildParcelShareUrl,
+    copyDeepLinkToClipboard,
+    extractRequestedParcelId,
+    resolveDeepLinkParcelSelection,
+    shouldAutoStartWorkspace,
+  } = await import('./appShellMode.ts');
+  const { computeParcelLeafletBounds } = await import('./spatialEngine.ts');
 
+  // 1. Deep-link URL generation strips transient params & hashes while encoding ?parcel=<id>
+  const secondParcel = INITIAL_PARCELS[1];
+  const shareUrl = buildParcelShareUrl(
+    'https://faixasegura.pt/?autostart=1&mode=webapp&utm_source=campo#top',
+    secondParcel.id
+  );
+  assert.equal(
+    shareUrl,
+    `https://faixasegura.pt/?utm_source=campo&parcel=${encodeURIComponent(secondParcel.id)}`
+  );
 
+  let writtenClipboardText = '';
+  const copiedOk = await copyDeepLinkToClipboard(shareUrl, {
+    writeText: async (text: string) => {
+      writtenClipboardText = text;
+    },
+  });
+  assert.equal(copiedOk, true);
+  assert.equal(writtenClipboardText, shareUrl);
+
+  const rejectedFallback = await copyDeepLinkToClipboard(shareUrl, {
+    writeText: async () => {
+      throw new Error('NotAllowedError');
+    },
+  });
+  assert.equal(rejectedFallback, false);
+
+  // 2. Extraction, workspace auto-start for recipients, and selection resolution
+  const urlObj = new URL(shareUrl);
+  assert.equal(extractRequestedParcelId(urlObj.search), secondParcel.id);
+  assert.equal(extractRequestedParcelId('?parcel='), null);
+  assert.equal(extractRequestedParcelId('?parcel=bad%20space!'), null);
+  assert.equal(shouldAutoStartWorkspace(urlObj.search), true);
+
+  const matched = resolveDeepLinkParcelSelection(
+    INITIAL_PARCELS,
+    secondParcel.id,
+    INITIAL_PARCELS[0].id
+  );
+  assert.equal(matched.matched, true);
+  assert.equal(matched.selectedId, secondParcel.id);
+
+  const unmatched = resolveDeepLinkParcelSelection(
+    INITIAL_PARCELS,
+    'parcel-custom-not-loaded-yet',
+    INITIAL_PARCELS[0].id
+  );
+  assert.equal(unmatched.matched, false);
+  assert.equal(unmatched.selectedId, INITIAL_PARCELS[0].id);
+
+  // 3. computeParcelLeafletBounds tightly encloses all parcel vertices and handles degenerate inputs
+  for (const parcel of INITIAL_PARCELS) {
+    const bounds = computeParcelLeafletBounds(parcel);
+    assert.ok(bounds.southWest.lat < bounds.northEast.lat);
+    assert.ok(bounds.southWest.lon < bounds.northEast.lon);
+    assert.deepEqual(bounds.leafletBounds, [
+      [bounds.southWest.lat, bounds.southWest.lon],
+      [bounds.northEast.lat, bounds.northEast.lon],
+    ]);
+    for (const v of parcel.vertices) {
+      assert.ok(v.lat >= bounds.southWest.lat - 1e-6 && v.lat <= bounds.northEast.lat + 1e-6);
+      assert.ok(v.lon >= bounds.southWest.lon - 1e-6 && v.lon <= bounds.northEast.lon + 1e-6);
+    }
+  }
+
+  const degenerateParcel = {
+    ...INITIAL_PARCELS[0],
+    vertices: [],
+    spatial: {
+      ...INITIAL_PARCELS[0].spatial,
+      polygons: {
+        ...INITIAL_PARCELS[0].spatial.polygons,
+        parcel: [],
+      },
+    },
+  };
+  const fallbackBounds = computeParcelLeafletBounds(degenerateParcel);
+  assert.ok(fallbackBounds.northEast.lat > fallbackBounds.southWest.lat);
+  assert.ok(fallbackBounds.northEast.lon > fallbackBounds.southWest.lon);
+});
+
+test('OfflineTileCacheManager enumerates Web Mercator XYZ tiles, pre-downloads Orthophoto + Vector snapshots, serves CacheFirst offline without network, and enforces LRU limits', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const { computeParcelLeafletBounds } = await import('./spatialEngine.ts');
+  const {
+    OfflineTileCacheManager,
+    buildOfflineFallbackTileSvgDataUrl,
+    buildTileCacheKey,
+    buildTileUrl,
+    createMemoryTileStorageAdapter,
+    enumerateParcelSnapshotTiles,
+    formatByteSizePt,
+    latLonToTileXY,
+  } = await import('./offlineTileCache.ts');
+
+  const sintraParcel = INITIAL_PARCELS[0];
+  const bounds = computeParcelLeafletBounds(sintraParcel);
+
+  // 1. Web Mercator Slippy Map tile coordinates & provider URL axis order (Esri z/y/x vs CARTO z/x/y)
+  const tile18 = latLonToTileXY(bounds.center.lat, bounds.center.lon, 18);
+  assert.ok(tile18.x > 120000 && tile18.x < 130000, `Expected Portuguese Z18 X tile, got ${tile18.x}`);
+  assert.ok(tile18.y > 95000 && tile18.y < 105000, `Expected Portuguese Z18 Y tile, got ${tile18.y}`);
+
+  const orthoUrl = buildTileUrl('ORTHOPHOTO', 18, tile18.x, tile18.y);
+  const vectorUrl = buildTileUrl('VECTOR', 18, tile18.x, tile18.y);
+  assert.ok(
+    orthoUrl.endsWith(`/tile/18/${tile18.y}/${tile18.x}`),
+    'Esri World Imagery must format URL as /tile/{z}/{y}/{x}'
+  );
+  assert.ok(
+    vectorUrl.endsWith(`/light_all/18/${tile18.x}/${tile18.y}.png`),
+    'CARTO Vector must format URL as /light_all/{z}/{x}/{y}.png'
+  );
+
+  const enumerated = enumerateParcelSnapshotTiles(bounds, {
+    zoomLevels: [17, 18],
+    styles: ['ORTHOPHOTO', 'VECTOR'],
+    marginTiles: 1,
+  });
+  assert.ok(enumerated.length >= 18, 'Expected multi-zoom Orthophoto + Vector tile coverage');
+  assert.ok(
+    enumerated.some((t) => t.key === buildTileCacheKey('ORTHOPHOTO', 18, tile18.x, tile18.y))
+  );
+  assert.ok(
+    enumerated.some((t) => t.key === buildTileCacheKey('VECTOR', 18, tile18.x, tile18.y))
+  );
+
+  // 2. Snapshot pre-download while online -> switch to offline -> 100% CacheFirst hits with zero network calls
+  let online = true;
+  let networkFetchCount = 0;
+  let clockMs = 1763220000000;
+  const storage = createMemoryTileStorageAdapter();
+
+  const capLimit = enumerated.length + 10;
+  const manager = new OfflineTileCacheManager({
+    storage,
+    isOnline: () => online,
+    maxCachedTiles: capLimit,
+    nowMs: () => {
+      clockMs += 10;
+      return clockMs;
+    },
+    fetchFn: async (url) => {
+      networkFetchCount += 1;
+      const bytes = new TextEncoder().encode(`TILE_BINARY:${url}`);
+      return {
+        ok: true,
+        mimeType: url.endsWith('.png') ? 'image/png' : 'image/jpeg',
+        arrayBuffer: async () => bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength),
+      };
+    },
+  });
+
+  const progressUpdates: number[] = [];
+  const snapshot = await manager.downloadParcelSnapshot(
+    sintraParcel,
+    (prog) => progressUpdates.push(prog.completedTiles),
+    { zoomLevels: [17, 18], marginTiles: 1, concurrency: 4 }
+  );
+
+  assert.equal(snapshot.parcelId, sintraParcel.id);
+  assert.equal(snapshot.tileCount, enumerated.length);
+  assert.equal(networkFetchCount, enumerated.length);
+  assert.equal(progressUpdates[progressUpdates.length - 1], enumerated.length);
+  assert.ok(formatByteSizePt(snapshot.totalBytes).includes('KB') || formatByteSizePt(snapshot.totalBytes).includes('B'));
+
+  // Go completely offline and verify both ORTHOPHOTO and VECTOR tiles resolve from cache without calling fetchFn
+  online = false;
+  const fetchesBeforeOfflineReads = networkFetchCount;
+
+  for (const t of enumerated) {
+    const served = await manager.getOrFetchTile({
+      style: t.style,
+      z: t.z,
+      x: t.x,
+      y: t.y,
+      parcelId: sintraParcel.id,
+    });
+    assert.ok(served, `Expected cached offline tile for ${t.key}`);
+    assert.equal(served.source, 'CACHE');
+    assert.ok(served.data.byteLength > 0);
+  }
+  assert.equal(networkFetchCount, fetchesBeforeOfflineReads, 'Zero network calls allowed while offline');
+
+  // Uncached distant tile while offline returns null cleanly and SVG fallback generator produces valid SVG data URI
+  const uncachedOffline = await manager.getOrFetchTile({
+    style: 'ORTHOPHOTO',
+    z: 18,
+    x: 10,
+    y: 10,
+  });
+  assert.equal(uncachedOffline, null);
+  const svgFallback = buildOfflineFallbackTileSvgDataUrl('ORTHOPHOTO', 18, 10, 10);
+  assert.ok(svgFallback.startsWith('data:image/svg+xml;charset=utf-8,'));
+  assert.ok(decodeURIComponent(svgFallback).includes('Z18 (10,10)'));
+
+  // Attempting to download a new snapshot while offline rejects cleanly
+  await assert.rejects(() => manager.downloadParcelSnapshot(INITIAL_PARCELS[1]));
+
+  // 3. Reconnect online & exceed maxCachedTiles -> opportunistic non-pinned tiles evicted before pinned snapshot tiles
+  online = true;
+  for (let extraX = 500; extraX < 530; extraX++) {
+    await manager.getOrFetchTile({ style: 'VECTOR', z: 16, x: extraX, y: 500, parcelId: null });
+  }
+  const statsAfterCap = await manager.getStats();
+  assert.ok(
+    statsAfterCap.tileCount <= capLimit,
+    `Expected <= ${capLimit} tiles after LRU cap, got ${statsAfterCap.tileCount}`
+  );
+
+  // Pinned Sintra center tile remains intact even after opportunistic overflow
+  const stillPinned = await manager.getCachedTile('ORTHOPHOTO', 18, tile18.x, tile18.y);
+  assert.ok(stillPinned, 'Pinned parcel snapshot tile must survive opportunistic LRU eviction');
+
+  // 4. Deleting snapshot & clearing cache cleans up tiles and metadata
+  await manager.deleteParcelSnapshot(sintraParcel.id);
+  assert.equal((await manager.listSnapshots()).length, 0);
+  await manager.clearAll();
+  const emptyStats = await manager.getStats();
+  assert.equal(emptyStats.tileCount, 0);
+  assert.equal(emptyStats.snapshotCount, 0);
+});

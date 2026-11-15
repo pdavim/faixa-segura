@@ -65,6 +65,24 @@ export default defineConfig(() => {
                 cacheableResponse: { statuses: [0, 200] },
               },
             },
+            {
+              urlPattern: /^https:\/\/server\.arcgisonline\.com\/ArcGIS\/rest\/services\/World_Imagery\/MapServer\/tile\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'faixasegura-map-tiles-v1',
+                expiration: { maxEntries: 600, maxAgeSeconds: 60 * 60 * 24 * 30 },
+                cacheableResponse: { statuses: [0, 200] },
+              },
+            },
+            {
+              urlPattern: /^https:\/\/[a-d]\.basemaps\.cartocdn\.com\/light_all\/.*/i,
+              handler: 'CacheFirst',
+              options: {
+                cacheName: 'faixasegura-map-tiles-v1',
+                expiration: { maxEntries: 600, maxAgeSeconds: 60 * 60 * 24 * 30 },
+                cacheableResponse: { statuses: [0, 200] },
+              },
+            },
           ],
         },
         devOptions: {

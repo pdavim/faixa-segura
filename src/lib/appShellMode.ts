@@ -88,16 +88,118 @@ export function detectEntryExperienceMode(input: DetectEntryModeInput): EntryExp
   return 'WEBVIEW_HOMEPAGE';
 }
 
+export const PARCEL_DEEP_LINK_PARAM = 'parcel';
+
 /**
- * Supports `?autostart=1` so automated verification or direct deep-links can skip straight
- * to the authenticated workspace using the deterministic demo profile.
+ * Extracts a safe parcel identifier from `?parcel=<id>` query strings.
+ */
+export function extractRequestedParcelId(search: string): string | null {
+  const clean = search.trim();
+  if (!clean) return null;
+  const params = new URLSearchParams(clean.startsWith('?') ? clean : `?${clean}`);
+  const rawId = (params.get(PARCEL_DEEP_LINK_PARAM) ?? '').trim();
+  if (!rawId || !/^[a-zA-Z0-9._:-]{1,128}$/.test(rawId)) {
+    return null;
+  }
+  return rawId;
+}
+
+/**
+ * Builds a clean shareable deep-link URL containing `?parcel=<id>` while stripping transient UI params.
+ */
+export function buildParcelShareUrl(baseHref: string, parcelId: string): string {
+  const cleanId = parcelId.trim();
+  let url: URL;
+  try {
+    url = new URL(baseHref);
+  } catch {
+    url = new URL(baseHref || '/', 'http://localhost:3000');
+  }
+  url.searchParams.delete('autostart');
+  url.searchParams.delete('verify');
+  url.searchParams.delete('mode');
+  url.searchParams.delete('pwa');
+  if (cleanId) {
+    url.searchParams.set(PARCEL_DEEP_LINK_PARAM, cleanId);
+  }
+  url.hash = '';
+  return url.toString();
+}
+
+/**
+ * Copies a generated deep-link URL to the clipboard using navigator.clipboard with a safe DOM fallback.
+ */
+export async function copyDeepLinkToClipboard(
+  shareUrl: string,
+  clipboardApi?: { writeText?: (text: string) => Promise<void> } | null
+): Promise<boolean> {
+  const targetClipboard =
+    clipboardApi !== undefined
+      ? clipboardApi
+      : typeof navigator !== 'undefined'
+        ? navigator.clipboard
+        : null;
+
+  if (targetClipboard && typeof targetClipboard.writeText === 'function') {
+    try {
+      await targetClipboard.writeText(shareUrl);
+      return true;
+    } catch {
+      // Fall through to execCommand fallback in restricted iframe contexts
+    }
+  }
+
+  if (typeof document !== 'undefined' && document.body) {
+    try {
+      const tempInput = document.createElement('textarea');
+      tempInput.value = shareUrl;
+      tempInput.setAttribute('readonly', 'true');
+      tempInput.style.position = 'fixed';
+      tempInput.style.opacity = '0';
+      tempInput.style.pointerEvents = 'none';
+      document.body.appendChild(tempInput);
+      tempInput.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(tempInput);
+      return Boolean(ok);
+    } catch {
+      return false;
+    }
+  }
+
+  return false;
+}
+
+/**
+ * Resolves which parcel ID should be selected given a deep-linked `?parcel=<id>` and available parcels.
+ */
+export function resolveDeepLinkParcelSelection<T extends { id: string }>(
+  parcels: readonly T[],
+  requestedParcelId: string | null | undefined,
+  fallbackParcelId: string
+): { selectedId: string; matched: boolean } {
+  const target = (requestedParcelId ?? '').trim();
+  if (target && parcels.some((p) => p.id === target)) {
+    return { selectedId: target, matched: true };
+  }
+  const safeFallback =
+    parcels.some((p) => p.id === fallbackParcelId)
+      ? fallbackParcelId
+      : (parcels[0]?.id ?? fallbackParcelId);
+  return { selectedId: safeFallback, matched: false };
+}
+
+/**
+ * Supports `?autostart=1` as well as `?parcel=<id>` share deep-links so recipients opening
+ * a shared parcel URL enter the workspace directly with that parcel selected.
  */
 export function shouldAutoStartWorkspace(search: string): boolean {
   const clean = search.trim();
   if (!clean) return false;
   const params = new URLSearchParams(clean.startsWith('?') ? clean : `?${clean}`);
   const val = (params.get('autostart') ?? '').toLowerCase();
-  return val === '1' || val === 'true';
+  if (val === '1' || val === 'true') return true;
+  return extractRequestedParcelId(clean) !== null;
 }
 
 export function buildDefaultDemoProfile(preferredDico = '1111'): UserAccountProfile {

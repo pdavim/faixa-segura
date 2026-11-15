@@ -1,15 +1,24 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import L from 'leaflet';
 import {
   Check,
+  CloudOff,
   Download,
   FileText,
+  HardDriveDownload,
   Layers,
+  LocateFixed,
   MapPin,
+  Minus,
   PenTool,
+  Plus,
   PlusCircle,
+  RefreshCw,
   RotateCcw,
   ShieldAlert,
+  Trash2,
+  Wifi,
   Zap,
 } from 'lucide-react';
 import type {
@@ -22,12 +31,134 @@ import type {
 import {
   buildParcelGeoJsonFilename,
   buildParcelVerticesGeoJson,
+  computeParcelLeafletBounds,
   computePolygonMetrics3763,
 } from '../lib/spatialEngine.ts';
 import {
   buildLocalParcelRecord,
   extractCadernetaOffline,
 } from '../lib/offlineParcelBuilder.ts';
+import {
+  buildOfflineFallbackTileSvgDataUrl,
+  buildTileUrl,
+  formatByteSizePt,
+  getSharedOfflineTileCacheManager,
+  type MapTileStyle,
+  type OfflineParcelMapSnapshot,
+  type OfflineTileCacheManager,
+  type OfflineTileCacheStats,
+  type SnapshotDownloadProgress,
+  type TileServeSource,
+} from '../lib/offlineTileCache.ts';
+import { useOnlineStatus } from '../hooks/usePWAInstall.ts';
+
+class OfflineAwareLeafletTileLayer extends L.TileLayer {
+  private readonly tileStyle: MapTileStyle;
+  private readonly tileCacheManager: OfflineTileCacheManager;
+  private readonly getActiveParcelId: () => string;
+  private readonly onTileServed?: (source: TileServeSource) => void;
+
+  constructor(params: {
+    style: MapTileStyle;
+    maxZoom: number;
+    tileCacheManager: OfflineTileCacheManager;
+    getActiveParcelId: () => string;
+    onTileServed?: (source: TileServeSource) => void;
+  }) {
+    const templateUrl =
+      params.style === 'ORTHOPHOTO'
+        ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+        : 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png';
+
+    super(templateUrl, {
+      maxZoom: params.maxZoom,
+      attribution:
+        params.style === 'ORTHOPHOTO'
+          ? 'Ortofoto Aérea / Satélite · Cache Offline EPSG:3763'
+          : 'Cartografia Vetorial OpenStreetMap / CARTO · Cache Offline',
+    });
+
+    this.tileStyle = params.style;
+    this.tileCacheManager = params.tileCacheManager;
+    this.getActiveParcelId = params.getActiveParcelId;
+    this.onTileServed = params.onTileServed;
+  }
+
+  // Exact 2 arguments (coords, done) so Leaflet GridLayer awaits async completion
+  protected override createTile(coords: L.Coords, done: L.DoneCallback): HTMLElement {
+    const img = document.createElement('img');
+    img.alt = '';
+    img.setAttribute('role', 'presentation');
+    img.decoding = 'async';
+
+    const style = this.tileStyle;
+    const maxTileIndex = Math.pow(2, coords.z);
+    const normX = ((coords.x % maxTileIndex) + maxTileIndex) % maxTileIndex;
+    const normY = coords.y;
+
+    const applyFallbackSvg = () => {
+      img.onload = () => {
+        this.onTileServed?.('FALLBACK_SVG');
+        done(undefined, img);
+      };
+      img.onerror = () => {
+        done(undefined, img);
+      };
+      img.src = buildOfflineFallbackTileSvgDataUrl(style, coords.z, normX, normY);
+    };
+
+    if (normY < 0 || normY >= maxTileIndex) {
+      applyFallbackSvg();
+      return img;
+    }
+
+    void this.tileCacheManager
+      .getOrFetchTile({
+        style,
+        z: coords.z,
+        x: normX,
+        y: normY,
+        parcelId: this.getActiveParcelId(),
+      })
+      .then((lookup) => {
+        if (!lookup) {
+          applyFallbackSvg();
+          return;
+        }
+
+        const blob = new Blob([lookup.data], { type: lookup.mimeType });
+        const objectUrl = URL.createObjectURL(blob);
+        img.setAttribute('data-tile-source', lookup.source);
+        img.setAttribute('data-tile-url', buildTileUrl(style, coords.z, normX, normY));
+
+        img.onload = () => {
+          URL.revokeObjectURL(objectUrl);
+          this.onTileServed?.(lookup.source);
+          done(undefined, img);
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(objectUrl);
+          applyFallbackSvg();
+        };
+        img.src = objectUrl;
+      })
+      .catch(() => {
+        applyFallbackSvg();
+      });
+
+    return img;
+  }
+}
+
+function createOfflineAwareLeafletTileLayer(params: {
+  style: MapTileStyle;
+  maxZoom: number;
+  tileCacheManager: OfflineTileCacheManager;
+  getActiveParcelId: () => string;
+  onTileServed?: (source: TileServeSource) => void;
+}): L.TileLayer {
+  return new OfflineAwareLeafletTileLayer(params);
+}
 
 interface MapZonesViewProps {
   parcels: ParcelRecord[];
@@ -85,28 +216,112 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   const mapToolModeRef = useRef(mapToolMode);
   mapToolModeRef.current = mapToolMode;
 
-  // Initialize Leaflet Map once
+  const activeParcelIdRef = useRef(activeParcel.id);
+  activeParcelIdRef.current = activeParcel.id;
+
+  const isOnline = useOnlineStatus();
+  const tileCacheManagerRef = useRef<OfflineTileCacheManager>(getSharedOfflineTileCacheManager());
+  const statsRefreshTimerRef = useRef<number | null>(null);
+
+  const [savedSnapshots, setSavedSnapshots] = useState<OfflineParcelMapSnapshot[]>([]);
+  const [cacheStats, setCacheStats] = useState<OfflineTileCacheStats>({
+    tileCount: 0,
+    totalBytes: 0,
+    snapshotCount: 0,
+  });
+  const [downloadProgress, setDownloadProgress] = useState<SnapshotDownloadProgress | null>(null);
+  const [cacheFeedback, setCacheFeedback] = useState<string | null>(null);
+  const [cacheError, setCacheError] = useState<string | null>(null);
+  const [offlineCacheHits, setOfflineCacheHits] = useState(0);
+
+  const refreshCacheOverview = useCallback(async () => {
+    const manager = tileCacheManagerRef.current;
+    const [snaps, stats] = await Promise.all([manager.listSnapshots(), manager.getStats()]);
+    setSavedSnapshots(snaps);
+    setCacheStats(stats);
+  }, []);
+
+  const scheduleStatsRefresh = useCallback(() => {
+    if (statsRefreshTimerRef.current !== null) return;
+    statsRefreshTimerRef.current = window.setTimeout(() => {
+      statsRefreshTimerRef.current = null;
+      void refreshCacheOverview();
+    }, 550);
+  }, [refreshCacheOverview]);
+
+  useEffect(() => {
+    void refreshCacheOverview();
+    return () => {
+      if (statsRefreshTimerRef.current !== null) {
+        window.clearTimeout(statsRefreshTimerRef.current);
+      }
+    };
+  }, [refreshCacheOverview]);
+
+  const handleTileServed = useCallback(
+    (source: TileServeSource) => {
+      if (source === 'CACHE') {
+        setOfflineCacheHits((prev) => prev + 1);
+      } else if (source === 'NETWORK') {
+        scheduleStatsRefresh();
+      }
+    },
+    [scheduleStatsRefresh]
+  );
+
+  const handleTileServedRef = useRef(handleTileServed);
+  handleTileServedRef.current = handleTileServed;
+
+  const [leafletControlsHost, setLeafletControlsHost] = useState<HTMLElement | null>(null);
+  const [currentZoom, setCurrentZoom] = useState<number>(18);
+  const MIN_MAP_ZOOM = 6;
+  const MAX_MAP_ZOOM = 19;
+
+  // Initialize Leaflet Map once with custom branded mobile-first controls
   useEffect(() => {
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
-    const center = activeParcel.spatial.centroidWgs84;
+    const initialBounds = computeParcelLeafletBounds(activeParcel);
     const map = L.map(mapContainerRef.current, {
-      center: [center.lat, center.lon],
+      center: [initialBounds.center.lat, initialBounds.center.lon],
       zoom: 18,
-      zoomControl: true,
+      minZoom: MIN_MAP_ZOOM,
+      maxZoom: MAX_MAP_ZOOM,
+      zoomControl: false,
     });
 
-    const orthoLayer = L.tileLayer(
-      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-      {
-        maxZoom: 19,
-        attribution: 'Ortofoto / Satélite DGT & Esri · EPSG:3763 Motor FaixaSegura',
-      }
-    ).addTo(map);
+    const initialTileLayer = createOfflineAwareLeafletTileLayer({
+      style: 'ORTHOPHOTO',
+      maxZoom: MAX_MAP_ZOOM,
+      tileCacheManager: tileCacheManagerRef.current,
+      getActiveParcelId: () => activeParcelIdRef.current,
+      onTileServed: (src) => handleTileServedRef.current(src),
+    }).addTo(map);
 
-    tileLayerRef.current = orthoLayer;
+    tileLayerRef.current = initialTileLayer;
     overlaysGroupRef.current = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;
+
+    map.fitBounds(initialBounds.leafletBounds, {
+      padding: [36, 36],
+      maxZoom: 18,
+      animate: false,
+    });
+    setCurrentZoom(map.getZoom());
+
+    // Mount propagation-isolated custom control host directly inside .leaflet-container
+    const controlsHost = L.DomUtil.create(
+      'div',
+      'leaflet-faixasegura-controls absolute right-3 bottom-7 z-[1000] pointer-events-auto'
+    );
+    L.DomEvent.disableClickPropagation(controlsHost);
+    L.DomEvent.disableScrollPropagation(controlsHost);
+    map.getContainer().appendChild(controlsHost);
+    setLeafletControlsHost(controlsHost);
+
+    map.on('zoomend', () => {
+      setCurrentZoom(map.getZoom());
+    });
 
     map.on('click', (ev: L.LeafletMouseEvent) => {
       if (mapToolModeRef.current === 'DRAW') {
@@ -118,41 +333,66 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     });
 
     return () => {
+      setLeafletControlsHost(null);
       map.remove();
       mapInstanceRef.current = null;
     };
   }, []);
 
-  // Switch tile layer (Orthophoto vs Vector)
+  // Switch tile layer (Orthophoto vs Vector) using CacheFirst offline-aware tile layer
+  const isInitialStyleRenderRef = useRef(true);
   useEffect(() => {
+    if (isInitialStyleRenderRef.current) {
+      isInitialStyleRenderRef.current = false;
+      return;
+    }
     const map = mapInstanceRef.current;
     if (!map) return;
     if (tileLayerRef.current) {
       map.removeLayer(tileLayerRef.current);
     }
 
-    const url =
-      baseMapStyle === 'ORTHOPHOTO'
-        ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-        : 'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png';
-
-    tileLayerRef.current = L.tileLayer(url, {
-      maxZoom: 19,
-      attribution:
-        baseMapStyle === 'ORTHOPHOTO'
-          ? 'Ortofoto Aérea / Satélite · Motor EPSG:3763'
-          : 'Cartografia Vetorial OpenStreetMap / CARTO',
+    tileLayerRef.current = createOfflineAwareLeafletTileLayer({
+      style: baseMapStyle,
+      maxZoom: MAX_MAP_ZOOM,
+      tileCacheManager: tileCacheManagerRef.current,
+      getActiveParcelId: () => activeParcelIdRef.current,
+      onTileServed: (src) => handleTileServedRef.current(src),
     }).addTo(map);
   }, [baseMapStyle]);
 
-  // Recenter when activeParcel changes
-  useEffect(() => {
+  const handleCenterOnActiveParcel = useCallback(
+    (animate = true) => {
+      const map = mapInstanceRef.current;
+      if (!map) return;
+      const bounds = computeParcelLeafletBounds(activeParcel);
+      map.fitBounds(bounds.leafletBounds, {
+        padding: [36, 36],
+        maxZoom: 18,
+        animate,
+      });
+      setCurrentZoom(map.getZoom());
+    },
+    [activeParcel]
+  );
+
+  const handleZoomIn = useCallback(() => {
     const map = mapInstanceRef.current;
     if (!map) return;
-    const c = activeParcel.spatial.centroidWgs84;
-    map.setView([c.lat, c.lon], 18, { animate: false });
+    map.zoomIn(1);
+  }, []);
+
+  const handleZoomOut = useCallback(() => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    map.zoomOut(1);
+  }, []);
+
+  // Fit active parcel bounds when activeParcel changes
+  useEffect(() => {
+    handleCenterOnActiveParcel(false);
     setSelectedZoneCallout(null);
-  }, [activeParcel.id]);
+  }, [activeParcel.id, handleCenterOnActiveParcel]);
 
   // Render spatial polygons on map
   useEffect(() => {
@@ -482,6 +722,72 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     });
   };
 
+  const activeParcelSnapshot =
+    savedSnapshots.find((snap) => snap.parcelId === activeParcel.id) ?? null;
+  const isDownloadingSnapshot = downloadProgress !== null;
+
+  const handleDownloadOfflineSnapshot = async () => {
+    if (isDownloadingSnapshot) return;
+    setCacheError(null);
+    setCacheFeedback(null);
+
+    if (!isOnline) {
+      setCacheError(
+        'Sem ligação à internet. Pré-descarregue o snapshot antes de entrar numa zona sem cobertura.'
+      );
+      return;
+    }
+
+    try {
+      const snapshot = await tileCacheManagerRef.current.downloadParcelSnapshot(
+        activeParcel,
+        (prog) => setDownloadProgress(prog)
+      );
+      await refreshCacheOverview();
+      tileLayerRef.current?.redraw();
+      setCacheFeedback(
+        `Snapshot guardado: ${snapshot.tileCount} mosaicos (Ortofoto + Vetorial · Z${Math.min(...snapshot.zoomLevels)}–Z${Math.max(...snapshot.zoomLevels)} · ${formatByteSizePt(snapshot.totalBytes)}) disponíveis sem internet.`
+      );
+    } catch (err) {
+      setCacheError(
+        err instanceof Error
+          ? err.message
+          : 'Não foi possível guardar o snapshot offline da parcela.'
+      );
+    } finally {
+      setDownloadProgress(null);
+    }
+  };
+
+  const handleSelectSavedSnapshot = (snapshot: OfflineParcelMapSnapshot) => {
+    setCacheError(null);
+    onSelectParcel(snapshot.parcelId);
+    const map = mapInstanceRef.current;
+    if (map) {
+      map.fitBounds(snapshot.bounds.leafletBounds, {
+        padding: [36, 36],
+        maxZoom: 18,
+        animate: true,
+      });
+      setCurrentZoom(map.getZoom());
+    }
+  };
+
+  const handleDeleteSnapshot = async (parcelId: string, parcelLabel: string) => {
+    setCacheError(null);
+    await tileCacheManagerRef.current.deleteParcelSnapshot(parcelId);
+    await refreshCacheOverview();
+    setCacheFeedback(`Snapshot offline removido para ${parcelLabel}.`);
+  };
+
+  const handleClearAllTileCache = async () => {
+    setCacheError(null);
+    await tileCacheManagerRef.current.clearAll();
+    setOfflineCacheHits(0);
+    await refreshCacheOverview();
+    setCacheFeedback('Cache cartográfica offline limpa deste dispositivo.');
+  };
+
   return (
     <div className="space-y-5">
       {/* Top Mode Bar */}
@@ -495,47 +801,50 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2 w-full md:w-auto">
           <div
             role="group"
             aria-label="Modo de interação cartográfica"
-            className="flex items-center gap-1 p-1 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
+            className="grid grid-cols-3 sm:inline-flex items-center gap-1 p-1 w-full sm:w-auto rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
           >
             <button
               type="button"
               onClick={() => setMapToolMode('INSPECT')}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap ${
                 mapToolMode === 'INSPECT'
                   ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'text-slate-700 dark:text-slate-300'
               }`}
             >
-              <MapPin className="w-3.5 h-3.5" aria-hidden="true" />
-              BUPi / Zonas
+              <MapPin className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span className="hidden sm:inline">BUPi / Zonas</span>
+              <span className="sm:hidden">Zonas</span>
             </button>
             <button
               type="button"
               onClick={() => setMapToolMode('DRAW')}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap ${
                 mapToolMode === 'DRAW'
                   ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'text-slate-700 dark:text-slate-300'
               }`}
             >
-              <PenTool className="w-3.5 h-3.5" aria-hidden="true" />
-              Desenhar Lote
+              <PenTool className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span className="hidden sm:inline">Desenhar Lote</span>
+              <span className="sm:hidden">Desenhar</span>
             </button>
             <button
               type="button"
               onClick={() => setMapToolMode('CADERNETA')}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap ${
                 mapToolMode === 'CADERNETA'
                   ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'text-slate-700 dark:text-slate-300'
               }`}
             >
-              <FileText className="w-3.5 h-3.5" aria-hidden="true" />
-              Caderneta AT
+              <FileText className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span className="hidden sm:inline">Caderneta AT</span>
+              <span className="sm:hidden">Caderneta</span>
             </button>
           </div>
 
@@ -544,9 +853,9 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             onClick={() =>
               setBaseMapStyle((prev) => (prev === 'ORTHOPHOTO' ? 'VECTOR' : 'ORTHOPHOTO'))
             }
-            className="min-h-[42px] px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap"
+            className="min-h-[42px] w-full sm:w-auto px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap"
           >
-            <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+            <Layers className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
             {baseMapStyle === 'ORTHOPHOTO' ? 'Ver Mapa Vetorial' : 'Ver Ortofoto 25 cm'}
           </button>
         </div>
@@ -560,64 +869,301 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             <div
               ref={mapContainerRef}
               data-testid="faixasegura-leaflet-map"
-              className="w-full h-[380px] sm:h-[460px] z-0"
+              data-zoom={currentZoom}
+              className="w-full h-[360px] sm:h-[420px] z-0"
             />
+            {leafletControlsHost &&
+              createPortal(
+                <div
+                  role="group"
+                  aria-label="Controlos de zoom e enquadramento da parcela"
+                  data-testid="custom-leaflet-controls"
+                  className="flex flex-col items-end gap-2 select-none"
+                >
+                  <div className="flex flex-col rounded-2xl overflow-hidden bg-white/95 dark:bg-[#161E2E]/95 backdrop-blur-md border-2 border-[#14532D]/35 dark:border-[#22C55E]/45 shadow-lg divide-y divide-slate-200 dark:divide-[#263248]">
+                    <button
+                      type="button"
+                      data-testid="leaflet-zoom-in-btn"
+                      onClick={handleZoomIn}
+                      disabled={currentZoom >= MAX_MAP_ZOOM}
+                      aria-label="Aumentar zoom do mapa"
+                      title="Aumentar zoom"
+                      className="min-h-[46px] min-w-[46px] flex items-center justify-center text-[#14532D] dark:text-[#22C55E] hover:bg-[#14532D]/10 dark:hover:bg-[#22C55E]/15 active:scale-95 transition disabled:opacity-40 disabled:pointer-events-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
+                    >
+                      <Plus className="w-5 h-5 stroke-[2.5]" aria-hidden="true" />
+                    </button>
+                    <button
+                      type="button"
+                      data-testid="leaflet-zoom-out-btn"
+                      onClick={handleZoomOut}
+                      disabled={currentZoom <= MIN_MAP_ZOOM}
+                      aria-label="Diminuir zoom do mapa"
+                      title="Diminuir zoom"
+                      className="min-h-[46px] min-w-[46px] flex items-center justify-center text-[#14532D] dark:text-[#22C55E] hover:bg-[#14532D]/10 dark:hover:bg-[#22C55E]/15 active:scale-95 transition disabled:opacity-40 disabled:pointer-events-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
+                    >
+                      <Minus className="w-5 h-5 stroke-[2.5]" aria-hidden="true" />
+                    </button>
+                  </div>
+
+                  <button
+                    type="button"
+                    data-testid="leaflet-center-parcel-btn"
+                    onClick={() => handleCenterOnActiveParcel(true)}
+                    aria-label={`Centrar mapa nos limites de ${activeParcel.label}`}
+                    title={`Enquadrar limites de ${activeParcel.label}`}
+                    className="min-h-[46px] min-w-[46px] px-3.5 py-2 rounded-2xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] text-white dark:text-slate-950 border-2 border-[#FACC15] dark:border-[#0B0F17] shadow-lg inline-flex items-center justify-center gap-1.5 text-xs font-bold whitespace-nowrap active:scale-95 transition focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#FACC15]"
+                  >
+                    <LocateFixed className="w-4 h-4 shrink-0" aria-hidden="true" />
+                    <span>Centrar Lote</span>
+                  </button>
+                </div>,
+                leafletControlsHost
+              )}
           </div>
 
           {/* Layer Visibility Toggles (Solar high-contrast) */}
-          <div className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-3.5 flex flex-wrap items-center gap-2">
-            <span className="text-xs font-semibold text-slate-600 dark:text-slate-400 mr-1">
-              Camadas Espaciais:
+          <div className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-3 flex flex-wrap items-center gap-1.5">
+            <span className="text-xs font-semibold text-slate-600 dark:text-slate-400 mr-0.5 whitespace-nowrap">
+              Camadas:
             </span>
             <button
               type="button"
               onClick={() => setVisibleLayers((v) => ({ ...v, zones675: !v.zones675 }))}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-2 ${
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                 visibleLayers.zones675
                   ? 'border-[#E11D48] bg-[#E11D48]/10 text-slate-900 dark:text-white'
                   : 'border-slate-300 dark:border-slate-700 text-slate-500'
               }`}
             >
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#E11D48]" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-sm bg-[#E11D48] shrink-0" aria-hidden="true" />
               Faixas 0–2–10–50m
             </button>
             <button
               type="button"
               onClick={() => setVisibleLayers((v) => ({ ...v, eredes: !v.eredes }))}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-2 ${
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                 visibleLayers.eredes
                   ? 'border-[#06B6D4] bg-[#06B6D4]/10 text-slate-900 dark:text-white'
                   : 'border-slate-300 dark:border-slate-700 text-slate-500'
               }`}
             >
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#06B6D4]" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-sm bg-[#06B6D4] shrink-0" aria-hidden="true" />
               Servidão E-REDES
             </button>
             <button
               type="button"
               onClick={() => setVisibleLayers((v) => ({ ...v, exempt: !v.exempt }))}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-2 ${
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                 visibleLayers.exempt
                   ? 'border-[#16A34A] bg-[#4ADE80]/15 text-slate-900 dark:text-white'
                   : 'border-slate-300 dark:border-slate-700 text-slate-500'
               }`}
             >
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#4ADE80]" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-sm bg-[#4ADE80] shrink-0" aria-hidden="true" />
               Zona Isenta
             </button>
             <button
               type="button"
               onClick={() => setVisibleLayers((v) => ({ ...v, neighborRisk: !v.neighborRisk }))}
-              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-2 ${
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
                 visibleLayers.neighborRisk
                   ? 'border-[#A855F7] bg-[#A855F7]/15 text-slate-900 dark:text-white'
                   : 'border-slate-300 dark:border-slate-700 text-slate-500'
               }`}
             >
-              <span className="w-2.5 h-2.5 rounded-sm bg-[#A855F7]" aria-hidden="true" />
+              <span className="w-2.5 h-2.5 rounded-sm bg-[#A855F7] shrink-0" aria-hidden="true" />
               Vizinho em Risco
             </button>
           </div>
+
+          {/* Offline Tile Snapshot & Cache Strategy Panel */}
+          <section
+            aria-label="Cache offline de mapas"
+            data-testid="offline-map-cache-panel"
+            className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-4 space-y-3"
+          >
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                  {isOnline ? (
+                    <Wifi className="w-4 h-4 text-[#16A34A] shrink-0" aria-hidden="true" />
+                  ) : (
+                    <CloudOff className="w-4 h-4 text-[#D97706] shrink-0" aria-hidden="true" />
+                  )}
+                  <span className="truncate">Snapshots de Mapa Offline</span>
+                </div>
+                <p
+                  data-testid="offline-cache-status-line"
+                  className="text-xs text-slate-500 dark:text-slate-400 mt-0.5 tabular-nums"
+                >
+                  {!isOnline ? (
+                    <>
+                      <span className="font-semibold text-[#B45309] dark:text-[#FBBF24]">
+                        Modo sem rede ativo
+                      </span>
+                      <span aria-hidden="true"> · </span>
+                      <span>
+                        {activeParcelSnapshot
+                          ? `Snapshot local pronto (${activeParcelSnapshot.tileCount} mosaicos · Z15–Z19)`
+                          : `${cacheStats.tileCount} mosaicos em cache local`}
+                      </span>
+                      {offlineCacheHits > 0 && (
+                        <>
+                          <span aria-hidden="true"> · </span>
+                          <span>{offlineCacheHits} servidos offline</span>
+                        </>
+                      )}
+                    </>
+                  ) : activeParcelSnapshot ? (
+                    <>
+                      <span className="font-semibold text-[#14532D] dark:text-[#4ADE80]">
+                        Snapshot Offline Pronto
+                      </span>
+                      <span aria-hidden="true"> · </span>
+                      <span>{activeParcelSnapshot.tileCount} mosaicos (Ortofoto + Vetorial)</span>
+                      <span aria-hidden="true"> · </span>
+                      <span>Z15–Z19</span>
+                      <span aria-hidden="true"> · </span>
+                      <span>{formatByteSizePt(activeParcelSnapshot.totalBytes)}</span>
+                    </>
+                  ) : (
+                    <>
+                      <span>Cache local: {cacheStats.tileCount} mosaicos</span>
+                      <span aria-hidden="true"> · </span>
+                      <span>{formatByteSizePt(cacheStats.totalBytes)}</span>
+                      <span aria-hidden="true"> · </span>
+                      <span>Guarde o lote antes de ir para zonas sem rede</span>
+                    </>
+                  )}
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  data-testid="save-offline-snapshot-btn"
+                  disabled={!isOnline || isDownloadingSnapshot}
+                  onClick={handleDownloadOfflineSnapshot}
+                  title={
+                    !isOnline
+                      ? 'Ligue-se à internet para pré-descarregar novos mosaicos'
+                      : 'Guardar mosaicos de satélite e mapa vetorial para consulta sem rede'
+                  }
+                  className="min-h-[42px] px-3.5 py-2 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] text-white dark:text-slate-950 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50 disabled:pointer-events-none focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
+                >
+                  {isDownloadingSnapshot ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin shrink-0" aria-hidden="true" />
+                      <span className="tabular-nums">
+                        A guardar {downloadProgress.completedTiles}/{downloadProgress.totalTiles}
+                      </span>
+                    </>
+                  ) : activeParcelSnapshot ? (
+                    <>
+                      <RefreshCw className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>Atualizar Snapshot</span>
+                    </>
+                  ) : (
+                    <>
+                      <HardDriveDownload className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                      <span>Guardar Mapa Offline</span>
+                    </>
+                  )}
+                </button>
+
+                {cacheStats.tileCount > 0 && !isDownloadingSnapshot && (
+                  <button
+                    type="button"
+                    data-testid="clear-offline-cache-btn"
+                    onClick={handleClearAllTileCache}
+                    aria-label="Limpar cache cartográfica offline"
+                    title="Limpar todos os mosaicos guardados"
+                    className="min-h-[42px] px-3 py-2 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>Limpar Cache</span>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {downloadProgress && (
+              <div className="space-y-1.5" role="status" aria-live="polite">
+                <progress
+                  aria-label="Progresso de transferência do snapshot offline"
+                  value={downloadProgress.completedTiles}
+                  max={Math.max(1, downloadProgress.totalTiles)}
+                  className="w-full h-2 rounded-full overflow-hidden block [&::-webkit-progress-bar]:bg-slate-200 dark:[&::-webkit-progress-bar]:bg-[#0B0F17] [&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-value]:bg-[#14532D] dark:[&::-webkit-progress-value]:bg-[#22C55E] [&::-webkit-progress-value]:rounded-full [&::-moz-progress-bar]:bg-[#14532D] dark:[&::-moz-progress-bar]:bg-[#22C55E]"
+                />
+                <p className="text-xs text-slate-600 dark:text-slate-400 tabular-nums">
+                  A pré-carregar Ortofoto + Mapa Vetorial (Z15–Z19): {downloadProgress.completedTiles} de{' '}
+                  {downloadProgress.totalTiles} mosaicos · {formatByteSizePt(downloadProgress.bytesStored)}
+                </p>
+              </div>
+            )}
+
+            {savedSnapshots.length > 0 && (
+              <div className="pt-2.5 border-t border-slate-200 dark:border-[#263248] space-y-2">
+                <div className="flex items-center justify-between gap-2 text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                  <span className="whitespace-nowrap">Snapshots prontos sem rede ({savedSnapshots.length})</span>
+                  <span className="whitespace-nowrap shrink-0">Total: {formatByteSizePt(cacheStats.totalBytes)}</span>
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {savedSnapshots.map((snap) => {
+                    const isSelected = snap.parcelId === activeParcel.id;
+                    return (
+                      <div
+                        key={snap.parcelId}
+                        className={`inline-flex items-center rounded-xl border text-xs transition-colors max-w-full ${
+                          isSelected
+                            ? 'border-[#14532D] bg-[#14532D]/10 dark:border-[#22C55E] dark:bg-[#22C55E]/15 text-slate-900 dark:text-white'
+                            : 'border-slate-300 dark:border-[#263248] bg-slate-50 dark:bg-[#0B0F17] text-slate-700 dark:text-slate-300'
+                        }`}
+                      >
+                        <button
+                          type="button"
+                          onClick={() => handleSelectSavedSnapshot(snap)}
+                          className="min-h-[40px] px-3 py-1.5 font-semibold inline-flex items-center gap-1.5 truncate max-w-[230px] sm:max-w-[280px]"
+                        >
+                          <LocateFixed className="w-3.5 h-3.5 shrink-0 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />
+                          <span className="truncate">{snap.parcelLabel}</span>
+                          <span className="font-mono font-normal text-slate-500 dark:text-slate-400 tabular-nums shrink-0">
+                            · {snap.tileCount}
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDeleteSnapshot(snap.parcelId, snap.parcelLabel)}
+                          aria-label={`Remover snapshot offline de ${snap.parcelLabel}`}
+                          title="Remover snapshot desta parcela"
+                          className="min-h-[40px] min-w-[36px] px-2 text-slate-400 hover:text-[#DC2626] transition-colors inline-flex items-center justify-center border-l border-slate-200 dark:border-[#263248]"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {cacheFeedback && !downloadProgress && (
+              <p
+                role="status"
+                aria-live="polite"
+                className="text-xs text-[#14532D] dark:text-[#4ADE80] flex items-center gap-1.5 tabular-nums"
+              >
+                <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>{cacheFeedback}</span>
+              </p>
+            )}
+
+            {cacheError && (
+              <p role="alert" className="text-xs font-semibold text-[#DC2626]">
+                {cacheError}
+              </p>
+            )}
+          </section>
 
           {selectedZoneCallout && (
             <div className="rounded-xl p-3.5 bg-slate-900 text-white text-xs leading-relaxed flex flex-col sm:flex-row sm:items-center justify-between gap-3">
