@@ -6,6 +6,7 @@ coverage
 .gitignore
 .playwright-cli
 .aistudio
+public/assets/aistudio
 *.log
 .env
 .env.*

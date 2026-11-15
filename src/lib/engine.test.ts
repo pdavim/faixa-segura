@@ -304,11 +304,13 @@ test('Docker & Dokploy deployment manifests include valid package-lock.json, res
     packages?: Record<string, { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }>;
   };
 
+  assert.ok(pkg.dependencies['react-is'], 'recharts peer dependency react-is must be explicitly in dependencies when using --legacy-peer-deps');
   assert.ok(lock.lockfileVersion >= 2, 'Expected lockfileVersion >= 2 for npm ci');
   const rootLockEntry = lock.packages?.[''];
   assert.ok(rootLockEntry, 'Expected root package entry in package-lock.json');
   assert.deepEqual(rootLockEntry.dependencies, pkg.dependencies);
   assert.deepEqual(rootLockEntry.devDependencies, pkg.devDependencies);
+  assert.ok(lock.packages?.['node_modules/react-is'], 'Expected node_modules/react-is in package-lock.json');
 
   const dockerfile = fs.readFileSync(path.join(rootDir, 'Dockerfile'), 'utf8');
   assert.ok(dockerfile.includes('NPM_CONFIG_LEGACY_PEER_DEPS=true'), 'Dockerfile should enforce legacy-peer-deps without requiring .npmrc');

@@ -77,6 +77,9 @@ export default defineConfig(() => {
         '@': path.resolve(import.meta.dirname, '.'),
       },
     },
+    build: {
+      chunkSizeWarningLimit: 2500,
+    },
     server: {
       allowedHosts: true as const,
       hmr: process.env.DISABLE_HMR !== 'true',
