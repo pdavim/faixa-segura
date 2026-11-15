@@ -1,0 +1,906 @@
+ajuda e Cria o Documento de Arquitetura Técnica e PRD do FaixaSegura para o seu desenvolvimento pormenorizado e abordagem util da aplicacao. verifica toda estas conversas anterior para contexto. faz todas as perguntas necessarias. ajuda a desenvolver esta apciacao com comparaçºao com as semelhantes.
+
+
+O FaixaSegura transforma a complexidade jurídica e cartográfica do Sistema de Gestão Integrada de Fogos Rurais (SGIFR — Decreto-Lei n.º 82/2021, na sua redação atualizada) numa ferramenta móvel de diagnóstico instantâneo, monitorização por satélite e prova legal para proprietários particulares nas periferias da Área Metropolitana de Lisboa (AML) e da Área Metropolitana do Porto (AMP), mantendo total compatibilidade com a tua infraestrutura partilhada (PostgreSQL 16 + PostGIS, Redis 7, Node.js/TypeScript e ollama.innovaive.com).
+
+1. Benchmark de Mercado: Comparação com Soluções Semelhantes
+O ecossistema atual divide-se entre portais estatais fragmentados (focados no registo cadastral ou na emergência reativa) e plataformas B2B caras destinadas a grandes gestores florestais ou utilities elétricas. Nenhum produto B2C em Portugal responde à pergunta prática do proprietário: "Quais os metros exatos que tenho de limpar no meu terreno, se posso usar a motorroçadora este sábado e como provo à Câmara/GNR que cumpri a lei?"
+
+Aplicação / Plataforma
+Foco Principal
+Prós
+Contras face ao FaixaSegura
+App BUPi & GeoPortal eBUPi (Estado — Justiça/DGT)
+Georreferenciação gratuita de limites de propriedades rústicas (RGG).
+Dados oficiais abertos; permite caminhar no terreno com GPS ou desenhar polígonos; largamente adotado em 2025–2026.
+Zero apoio à gestão de combustível: mostra o limite do terreno, mas não calcula faixas de 10m/50m/100m, não alerta prazos nem liga a empresas de limpeza. (No FaixaSegura funciona como fonte de importação direta).
+Queimas e Queimadas (ICNF — Portal/App)
+Registo obrigatório e autorização camarária para queima de sobrantes.
+Canal legal vinculativo junto das autarquias e GNR; valida o índice diário de perigo de incêndio.
+Interface datada e difícil em ecrãs móveis; não abrange limpeza mecânica (motorroçadoras), não desenha faixas no lote nem monitoriza o crescimento do mato.
+Fogos.pt / Fogos Agora PT / Google Wildfire
+Monitorização em tempo real de incêndios ativos e meios ANEPC.
+Excelente rapidez em emergência; notificações de proximidade e visualização de frentes de fogo.
+100% reativos: só entram em ação quando o incêndio já deflagrou; não ajudam a evitar coimas antes do prazo anual de 31 de maio / 30 de junho.
+Tesselo / Overstory / E-REDES Analytics (B2B Enterprise)
+Monitorização por satélite e IA de biomassa junto a redes elétricas e floresta.
+Elevada precisão multiespectral (Sentinel-2 / alta resolução) na deteção de invasão vegetativa.
+Fechados ao segmento corporativo/utilities com contratos de dezenas de milhares de euros; inacessíveis ao proprietário de um lote em Sintra, Mafra ou Valongo.
+Fire Aside (EUA — WUI Defensible Space)
+Relatórios digitais de inspeção de faixas defensivas para moradores e seguradoras.
+Modelo validado de relatório casa-a-casa com fotos acionáveis, micro-grants e descontos em seguros.
+Exclusivo para o mercado norte-americano e dependente de vistoria presencial por bombeiros locais, sem cálculo autónomo via dados abertos nacionais.
+
+2. Product Requirements Document (PRD)
+2.1 Problema Real & Oportunidade na AML e AMP
+Nos concelhos de interface urbano-florestal da AML (Sintra, Mafra, Cascais, Loures, Vila Franca de Xira, Palmela, Sesimbra, Setúbal) e da AMP (Valongo, Paredes, Gondomar, Santo Tirso, Santa Maria da Feira, Trofa, Arouca), dezenas de milhares de famílias vivem em moradias confinantes com mato ou herdaram terrenos rústicos/urbanos não edificados. Todos os anos enfrentam quatro dores críticas:
+
+Incerteza Geométrica e Legal: A lei não manda limpar sempre tudo; exige 50 m em redor de edifícios isolados em espaço florestal/rústico, 100 m em redor de aglomerados populacionais, ou 10 m em contextos agrícolas/vias, além de regras estritas de desramação (4 m acima do solo ou 50% da altura) e afastamento entre copas (4 m geral; 10 m para pinheiro-bravo e eucalipto), proibindo ainda o corte não autorizado de sobreiros e azinheiras.
+
+
+Risco Contraordenacional no Fim de Semana: Muitos proprietários limpam o terreno ao sábado sem saber que, em dias de Perigo de Incêndio Rural (PIR) Muito Elevado ou Máximo decretado pelo IPMA, o uso de motorroçadoras com lâminas metálicas, discos de corte ou queimas de amontoados constitui infração grave (e causa frequente de ignições).
+
+
+O Problema do "Vizinho Incumpridor": Mesmo quem limpa o seu lote continua em risco (e com receio de recusa de cobertura do seguro Multirriscos) quando o terreno vizinho abandonado tem silvados e eucaliptos encostados ao seu muro.
+
+
+Ausência de Prova Auditável: Quando a Câmara ou a GNR/SEPNA fiscaliza meses depois (após rebentação de ervas), ou em caso de sinistro, o proprietário raramente guarda prova georreferenciada e datada da intervenção efetuada dentro do prazo anual (fixado por despacho governamental, ex: 31 de maio ou 30 de junho).
+
+
+2.2 Funcionalidades para Uso Contínuo (4 Motores de Utilidade)
+Para evitar ser uma aplicação aberta apenas uma vez por ano em maio, o FaixaSegura combina prevenção legal, operação semanal e vigilância contínua:
+
+Raio-X Geométrico da Parcela ("Onde e Como Limpar"):
+
+
+
+O utilizador toca no mapa sobre ortofoto aérea de 25–30 cm (ou importa o polígono BUPi / foto da Caderneta Predial).
+
+
+O motor PostGIS desenha a cores sobre o terreno: (a) Zona Vermelha de limpeza obrigatória (10m / 50m / 100m), (b) Zona Azul de responsabilidade de terceiros (ex: faixas sob linhas de Média/Alta Tensão da E-REDES ou berma rodoviária, poupando dinheiro ao proprietário!), e (c) Zona Verde isenta.
+
+
+Semáforo Diário de Maquinaria e Queimas ("Posso trabalhar hoje?"):
+
+
+
+Painel estilo Cockpit (inspirado no Comuta Viva) que cruza o índice rcm do IPMA a 3 dias com vento/humidade: indica se hoje é permitido usar motorroçadora metálica vs. fio de nylon, motosserra, grade de discos ou queima de sobrantes (com atalho pré-preenchido para comunicação no portal ICNF).
+
+
+Sentinela Satélite (NDVI) + Alerta de Proximidade ANEPC:
+
+
+
+Vigia quinzenal gratuita via satélite Sentinel-2 que mede o vigor vegetativo (NDVI) e stresse hídrico (NDMI) da parcela, notificando via Web Push ou Telegram Bot (@FaixaSeguraBot) quando o mato atinge densidade crítica ou quando há um fogo ativo num raio de 15 km (API Aberta / ANEPC).
+
+
+Auto Digital de Conformidade SHA-256 + "Alerta Vizinho":
+
+
+
+Gera um PDF A4 assinado criptograficamente (com fotos Antes/Depois validadas por coordenadas GPS e visão IA, fatura anexa opcional e QR Code público /v/[hash]) para arquivo perante GNR, Câmara e Seguradora.
+
+
+Inclui o módulo "Terreno Confinante em Risco": gera automaticamente o requerimento técnico fundamentado (com mapa ortofotográfico e coordenadas exatas da infração vizinha) pronto a submeter ao Gabinete Técnico Florestal da Câmara ou SEPNA.
+
+
+2.3 Modelo de Negócio e Tiers (B2C Freemium + Marketplace + Afiliados)
+Funcionalidade
+Tier Gratuito
+Plano "Guardião" (14,90 €/ano)
+Diagnóstico de Faixas (10m/50m/100m) no Mapa
+1 terreno até 5.000m2
+Até 10 terrenos (ideal para heranças/famílias)
+Semáforo Diário Maquinaria / Queimas (IPMA)
+Hoje
+Previsão 3 dias + Alertas Push/Telegram 6ª feira
+Radar de Incêndios Ativos Próximos (ANEPC)
+Raio básico na app
+Alertas proativos 24/7 via Telegram + Push (15 km)
+Monitorização Satélite de Mato (NDVI Sentinel-2)
+Resumo estático
+Histórico quinzenal + Alerta de crescimento rápido
+Auto PDF SHA-256 (Prova Legal Antes/Depois)
+Não
+Emissão ilimitada + Arquivo Cloud imutável
+
+
+Gerador de Requerimento "Vizinho Incumpridor"
+Pré-visualização
+PDF completo com ortofoto + minuta IA
+Pedir 3 Orçamentos de Limpeza Certificada
+Gratuito (Lead Gen)
+Gratuito com prioridade e medição de declive
+
+Motores de Receita Transacional & Afiliados:
+
+
+
+Marketplace de Limpeza Florestal/Jardinagem (Receita Principal): Botão "Pedir 3 Orçamentos para estes 1.420m2". Como a app já envia à empresa local a área exata da faixa em m2, o declive altimétrico (se exige trator de rastos ou roçadora manual) e o acesso viário, a lead vale 8 € a 20 € por pedido (ou 10%–12% de comissão sobre limpezas médias de 350 € a 1.500 €).
+
+
+Afiliados de Equipamento & Bricolage: No Semáforo Diário, quando o risco proíbe lâmina metálica mas permite cabeça de fio de nylon ou equipamento a bateria sem faísca, injeta links contextuais (Leroy Merlin, ManoMano, Amazon ES, Stihl/Husqvarna revendedores — comissão 5% a 9%).
+
+
+Afiliados Seguros Multirriscos Habitação (Interface Florestal): Utilizadores com moradias em zonas de perigosidade média/alta com Auto de Conformidade emitido são leads de excelência para mediação de seguros habitação (15 € a 35 €/lead).
+
+
+3. Catálogo Exato de APIs e Fontes de Dados (100% Abertos)
+Seguindo a regra de ouro aplicada no Comuta Viva e no Eco Escola & Família, o telemóvel nunca interroga serviços WFS/WMS lentos do Estado diretamente: as camadas estruturais são ingeridas para o PostGIS e os índices diários ficam em cache no Redis.
+
+Domínio
+Entidade Oficial
+Endpoint / Serviço Exato (Sem Custo)
+Sync / Polling
+Dados Extraídos e Papel no Motor
+1. Uso do Solo, Cadastro e Ortofotos 25–30 cm
+Direção-Geral do Território (DGT)
+[https://ogcapi.dgterritorio.gov.pt/collections/](https://ogcapi.dgterritorio.gov.pt/collections/)
+
+
+• cos (Carta Uso e Ocupação do Solo)
+
+
+• cadastro (Cadastro Predial)
+
+
+• caop (Limites Administrativos)
+
+
+• WMS Ortofotos 25cm / OrtoSat 30cm
+
+
+Semestral (PostGIS) + Tiles WMS em Proxy Cache
+• Distingue solo Florestal/Matos (exige faixa de 50m a edifícios) de solo Agrícola/Urbano (faixa de 10m)
+
+
+• Polígonos oficiais de prédios cadastrados
+
+
+• Imagem aérea nítida para desenhar muros e copas.
+
+
+2. Polígonos Rústicos BUPi (RGG)
+eBUPi / Dados.gov.pt
+Datasets abertos de Representações Gráficas Georreferenciadas (RGG) em dados.gov.pt e serviços GeoPortal eBUPi (bupi.gov.pt)
+Mensal (PostGIS)
+• Permite o "Snap-to-Parcel" em 1 toque: quando o utilizador toca no seu terreno num concelho com BUPi, seleciona logo o polígono existente sem ter de o desenhar à mão.
+3. Perigosidade e Redes FGC / Pontos de Água
+ICNF (GeoCatálogo)
+[https://geocatalogo.icnf.pt/catalogo_tema5.html](https://geocatalogo.icnf.pt/catalogo_tema5.html) (WFS / WMS / Shapefile / GeoTIFF):
+
+
+• Carta de Perigosidade Estrutural 2020–2030 (Art. 41.º DL 82/2021)
+
+
+• Rede Primária de FGC
+
+
+• Freguesias Prioritárias DFCI
+
+
+• Rede de Pontos de Água
+
+
+Anual (Fev/Março antes da época crítica)
+• Classe de perigosidade (Muito Baixa a Muito Alta)
+
+
+• Identifica se o terreno está numa Freguesia Prioritária (fiscalização prioritária GNR/Câmaras)
+
+
+• Localiza pontos de água próximos para autoproteção.
+
+
+4. Edificado e Altimetria / Declive
+GEO API PT + OpenStreetMap / DGT
+• GET [https://json.geoapi.pt/gps/](https://json.geoapi.pt/gps/){lat},{lon}
+
+
+• GET [https://json.geoapi.pt/cp/](https://json.geoapi.pt/cp/){cp7}
+
+
+• Pegadas de edifícios (building=* OSM + Cartografia Municipal Lisboa/Porto/Cascais) + Modelo Digital de Terreno (MDT DGT)
+
+
+Diário / Cache Redis 30d
+• Geometria de todas as casas/anexos num raio de 100 m em redor do terreno (são os edifícios vizinhos que projetam a obrigação de faixa de 50 m para dentro do lote do utilizador!)
+
+
+• Cálculo do declive (%) para orçamentação de limpeza.
+
+
+5. Linhas Elétricas Aéreas (Isenção de Custo)
+E-REDES Open Data
+[https://e-redes.opendatasoft.com/api/explore/v2.1/catalog/datasets/](https://e-redes.opendatasoft.com/api/explore/v2.1/catalog/datasets/)
+
+
+• Redes Aéreas de Média Tensão (MT) e Alta Tensão (AT) em GeoJSON
+
+
+Trimestral (PostGIS)
+• Interseta o terreno com linhas aéreas MT/AT (faixas de 7 m a 10 m para cada lado do eixo são responsabilidade legal da E-REDES e não do proprietário).
+6. Perigo Diário de Incêndio (PIR) & Meteo
+IPMA Open Data
+• GET [https://api.ipma.pt/open-data/forecast/meteorology/rcm/rcm-d](https://api.ipma.pt/open-data/forecast/meteorology/rcm/rcm-d){0,1,2}.json (por DICO 4 dígitos)
+
+
+• GET [https://api.ipma.pt/open-data/forecast/warnings/warnings_www.json](https://api.ipma.pt/open-data/forecast/warnings/warnings_www.json)
+
+
+• GET .../observation/meteorology/stations/obs-surface.geojson
+
+
+De hora a hora (Redis TTL 3600s)
+• Devolve o nível legal diário rcm (1: Reduzido a 5: Máximo) para hoje, amanhã e depois de amanhã em cada concelho
+
+
+• Alimenta o Semáforo Legal de Maquinaria e Queimas.
+
+
+7. Fogos Rurais Ativos em Tempo Real
+API Aberta / ANEPC
+• GET [https://api.apiaberta.pt/v1/anpc/incidents/active](https://api.apiaberta.pt/v1/anpc/incidents/active)
+
+
+• Fallback oficial: dados.gov.pt/pt/datasets/prociv-ocorrencias-em-aberto/
+
+
+A cada 3 min (Redis Geospatial)
+• Coordenadas de fogos ativos (Mato, Povoamento Florestal, Agrícola, Queima), estado (Em Curso, Em Resolução) e meios terrestres/aéreos mobilizados.
+8. Biomassa & Crescimento de Mato por Satélite
+Copernicus Data Space (ESA)
+[https://sh.dataspace.copernicus.eu/api/v1/process](https://sh.dataspace.copernicus.eu/api/v1/process) / STAC API (sentinel-2-l2a, gratuito até 30.000 unidades processamento/mês)
+A cada 5–10 dias (apenas lotes cloud_cover < 20%)
+• Extrai bandas B04 (Red), B08 (NIR) e B11 (SWIR) a 10m de resolução sobre os polígonos vigiados para calcular NDVI (biomassa verde) e NDMI (secura da vegetação).
+
+4. Integração Cirúrgica do ollama.innovaive.com (IA Privada)
+Aproveitando o teu servidor dedicado em [https://ollama.innovaive.com](https://ollama.innovaive.com) (com verificação automática GET /api/tags e auto-pull POST /api/pull no arranque para os modelos qwen3:4b e gemma3:4b, mais Circuit Breaker com fallback determinístico), o LLM nunca toca nos cálculos geométricos (que são 100% determinísticos em PostGIS), mas resolve 4 problemas de enorme valor prático:
+
+Extração Privada de Caderneta Predial Rústica/Urbana (gemma3:4b Visão / qwen3:4b Texto):
+
+
+
+Muitos herdeiros só têm um PDF antigo ou foto em papel da Caderneta Predial Rústica das Finanças (com Secção, Artigo Matricial, Nome do Prédio/Sítio, Confrontações Norte/Sul/Nascente/Poente e Área). Processar este documento no ollama.innovaive.com garante conformidade RGPD total e posiciona imediatamente o mapa na freguesia/lugar correto.
+
+
+Auditoria Visual Antes/Depois e Alerta de Espécies Protegidas (gemma3:4b Multimodal):
+
+
+
+Quando o proprietário tira as fotos para gerar o Auto PDF de Conformidade, o gemma3:4b analisa os pares de imagens: valida se há solo limpo de estrato arbustivo contínuo, estima visualmente se as copas inferiores foram desramadas e emite um aviso preventivo de proteção legal caso reconheça casca/copa típica de Sobreiro (Quercus suber) ou Azinheira (Quercus rotundifolia), lembrando que o seu abate ou poda abusiva carece de autorização prévia do ICNF.
+
+
+Gerador Jurídico de Notificação por "Vizinho Incumpridor" (gemma3:4b):
+
+
+
+Redige em Português Europeu formal o requerimento dirigido ao Presidente da Câmara Municipal (ao abrigo dos deveres de gestão de combustível e execução coerciva previstos no DL n.º 82/2021), preenchendo automaticamente o DICOFRE, coordenadas GPS do terreno confinante infrator, distância exata à habitação do queixoso (ex: "silvado contínuo a 6,4 metros da fachada poente") e classe de perigosidade ICNF.
+
+
+Assistente Rápido de Dúvidas Legais no Campo (qwen3:4b com RAG sobre o DL 82/2021):
+
+
+
+Responde a perguntas concretas do proprietário com citação do artigo legal (ex: "Tenho um limoeiro e duas figueiras a 8 metros da parede de casa, sou obrigado a cortá-los?"  "Não: árvores de fruto e espécies ornamentais isoladas não exigem abate desde que mantida a descontinuidade vertical e limpeza de ervas secas sob a copa").
+
+
+5. Arquitetura Espacial: Esquema PostGIS, Motor de Faixas e Redis
+Podes alojar o FaixaSegura na mesma instância PostgreSQL 16 + PostGIS dos projetos anteriores (num schema isolado faixasegura), partilhando a tabela administrativa CAOP e os conectores do IPMA.
+
+5.1 Esquema SQL (PostgreSQL 16 + PostGIS)
+SQL
+
+
+CREATE SCHEMA IF NOT EXISTS faixasegura;
+SET search_path TO faixasegura, public;
+
+-- 1. Camadas Oficiais Pré-carregadas (COS Uso do Solo, Perigosidade ICNF, Aglomerados)
+CREATE TABLE land_cover_zones (
+    id BIGSERIAL PRIMARY KEY,
+    cos_code VARCHAR(16) NOT NULL,
+    land_class VARCHAR(24) NOT NULL CHECK (land_class IN ('FOREST_SCRUB', 'AGRICULTURE', 'URBAN_BUILT', 'WATER_ROCK')),
+    geom GEOMETRY(MultiPolygon, 3763) NOT NULL -- EPSG:3763 (PT-TM06/ETRS89 em metros exatos!)
+);
+CREATE INDEX idx_cos_geom ON land_cover_zones USING GIST (geom);
+
+CREATE TABLE fire_hazard_zones (
+    id BIGSERIAL PRIMARY KEY,
+    hazard_level SMALLINT NOT NULL CHECK (hazard_level BETWEEN 1 AND 5), -- 4=Alta, 5=Muito Alta
+    is_priority_parish BOOLEAN DEFAULT FALSE,
+    is_apps_zone BOOLEAN DEFAULT FALSE, -- Áreas Prioritárias de Prevenção e Segurança
+    geom GEOMETRY(MultiPolygon, 3763) NOT NULL
+);
+CREATE INDEX idx_hazard_geom ON fire_hazard_zones USING GIST (geom);
+
+-- 2. Edifícios, Aglomerados Populacionais e Servidões de Terceiros (E-REDES / Rede Viária)
+CREATE TABLE external_receptors (
+    id BIGSERIAL PRIMARY KEY,
+    receptor_type VARCHAR(32) NOT NULL CHECK (
+        receptor_type IN ('ISOLATED_BUILDING', 'POPULATION_CLUSTER', 'ROAD_RAIL', 'EREDES_MV_LINE', 'EREDES_HV_LINE')
+    ),
+    required_buffer_m SMALLINT NOT NULL, -- 50m (Edifício em floresta), 100m (Aglomerado), 10m (Estrada/Agrícola), 7-10m (E-REDES)
+    responsibility VARCHAR(16) NOT NULL CHECK (responsibility IN ('LANDOWNER', 'UTILITY_OR_MUNICIPALITY')),
+    geom GEOMETRY(Geometry, 3763) NOT NULL
+);
+CREATE INDEX idx_receptors_geom ON external_receptors USING GIST (geom);
+
+-- 3. Propriedades / Terrenos Registados pelos Utilizadores
+CREATE TABLE user_parcels (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    user_id UUID,                             -- Null permitido em Modo Local Anónimo
+    label VARCHAR(100) NOT NULL,              -- Ex: 'Pinhal Avô Sintra' ou 'Moradia Valongo'
+    dico VARCHAR(4) NOT NULL,                 -- Código Concelho IPMA/CAOP (ex: '1111' Sintra, '1315' Valongo)
+    dicofre VARCHAR(6) NOT NULL,
+    matrix_article VARCHAR(40),               -- Artigo Matricial opcional
+    bupi_rgg_id VARCHAR(64),
+    total_area_m2 NUMERIC(10,2) NOT NULL,
+    avg_slope_pct NUMERIC(5,2) DEFAULT 0,
+    
+    -- Geometria guardada em PT-TM06 (EPSG:3763) para cálculos métricos rigorosos ao centímetro
+    geom_3763 GEOMETRY(Polygon, 3763) NOT NULL,
+    
+    -- Resultado pré-calculado do Motor de Faixas
+    mandatory_clean_area_m2 NUMERIC(10,2) DEFAULT 0,
+    third_party_clean_area_m2 NUMERIC(10,2) DEFAULT 0,
+    clean_zone_geom GEOMETRY(MultiPolygon, 3763),
+    third_party_zone_geom GEOMETRY(MultiPolygon, 3763),
+    max_hazard_level SMALLINT DEFAULT 1,
+    is_priority_parish BOOLEAN DEFAULT FALSE,
+    
+    -- Monitorização Satélite Sentinel-2
+    latest_ndvi NUMERIC(4,3),                 -- > 0.55 indica biomassa densa a crescer
+    latest_ndmi NUMERIC(4,3),                 -- Queda abrupta indica vegetação seca inflamável
+    last_satellite_date DATE,
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX idx_parcels_geom ON user_parcels USING GIST (geom_3763);
+
+-- 4. Autos de Conformidade Preventiva (Prova Legal SHA-256) e Pedidos de Orçamento
+CREATE TABLE compliance_certificates (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    short_code VARCHAR(16) UNIQUE NOT NULL,   -- Ex: 'FS-20260518-9A2C'
+    parcel_id UUID REFERENCES user_parcels(id) ON DELETE CASCADE,
+    cleaned_area_m2 NUMERIC(10,2) NOT NULL,
+    pir_level_at_work SMALLINT NOT NULL,
+    photos_metadata JSONB NOT NULL,           -- [{type:'BEFORE'|'AFTER', gps_lat, gps_lon, taken_at, ai_check_notes}]
+    contractor_nif VARCHAR(16),               -- Se limpo por empresa certificada do marketplace
+    sha256_hash CHAR(64) NOT NULL,
+    issued_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+Detalhe Técnico Crítico (EPSG:3763 vs EPSG:4326): Enquanto na web os mapas usam WGS84 (4326), todos os cálculos de faixas legais no PostGIS usam o sistema oficial português PT-TM06 / ETRS89 (EPSG:3763). Isto garante precisão métrica exata de 10,00 m, 50,00 m e 100,00 m sem distorções de projeção, essencial quando o proprietário discute limites com um fiscal municipal.
+
+5.2 Função PostGIS do Motor de Faixas (compute_parcel_fgc)
+Quando o utilizador desenha ou seleciona um lote, uma única query espacial executa em < 25 ms:
+
+Interseta o geom_3763 do lote com land_cover_zones (COS) para determinar que porções do lote são florestais/matos (FOREST_SCRUB) vs. agrícolas (AGRICULTURE).
+
+
+Gera buffers (ST_Buffer) sobre todos os edifícios vizinhos num raio de 100 m (external_receptors): aplica 50 m onde o solo intersetado é florestal/mato, 10 m onde é estritamente agrícola/estrema urbana e 100 m se intersetar um polígono de aglomerado populacional.
+
+
+Subtrai (ST_Difference) a área edificada própria e separa (ST_Intersection) os corredores sob linhas aéreas da E-REDES (third_party_zone_geom), devolvendo em GeoJSON pronto para o MapLibre GL exatamente os polígonos a limpar e quantos m2 têm.
+
+
+5.3 Chaves em Memória no Redis 7
+HSET fs:pir:{dico}  { today: 4, tomorrow: 5, day2: 3, updated_at: ... } (TTL 3600s — Índice RCM do IPMA para os 308 concelhos).
+
+
+GEOADD fs:active_fires <lon> <lat> "inc_2026_88412" + HSET fs:fire:inc_2026_88412 (TTL 600s — Ocorrências ativas da ANEPC via API Aberta; a cada 3 minutos faz GEOSEARCH num raio de 15 km dos terrenos vigiados para disparar alertas Telegram/Push imediatos).
+
+
+6. Matriz do "Semáforo Operacional Diário" (Lógica Determinística)
+Esta regra traduz o quadro legal do DL n.º 82/2021 e do ICNF num cartão visual claro no telemóvel (com Modo Claro Solar de alto contraste para leitura debaixo de sol no terreno):
+
+Índice IPMA (rcm)
+Motorroçadora c/ Fio Nylon
+Motorroçadora Lâmina Metálica / Motosserra / Grade Discos
+Queima de Amontoados (Sobrantes Cortados)
+1 — Reduzido
+
+
+2 — Moderado
+
+
+PERMITIDO (Sem restrições horárias especiais)
+PERMITIDO (Recomendado ter extintor / água no local)
+PERMITIDO c/ Comunicação Prévia obrigatória no ICNF (1 nov – 31 mai) ou Autorização Camarária (1 jun – 31 out).
+3 — Elevado
+PERMITIDO
+CONDICIONADO: Exige dispositivo de retenção de faúlhas e equipamento de primeira intervenção (extintor 2kg ou mochila de água/pá).
+PERMITIDO c/ Comunicação Prévia (fora de 1 jun – 31 out) desde que vento fraco; requer vigilância permanente e faixa limpa de 2m à volta.
+4 — Muito Elevado
+
+
+5 — Máximo
+
+
+CONDICIONADO / EVITAR nas horas de calor (proibido em APPS se alerta especial)
+PROIBIDO POR LEI usar maquinaria florestal/agrícola geradora de faísca em espaços rurais (exceções estritas apenas p/ atividades essenciais até às 11h00 ou após pôr-do-sol conforme despacho/alerta em vigor).
+ESTRITAMENTE PROIBIDO (Considerado uso de fogo em período/nível crítico — contraordenação muito grave / crime de incêndio florestal).
+
+7. Arquitetura de Vistas da PWA Mobile-First
+Seguindo o padrão validado de navegação móvel limpa com 4 separadores inferiores:
+
+Tab 1 — Hoje no Terreno (Cockpit Solar): Semáforo do Fim de Semana (Sábado e Domingo previstos pelo IPMA), contador regressivo para o prazo legal anual (ex: "Faltam 18 dias para 31 de maio"), estado de fogos ativos num raio de 15 km e estado da biomassa satélite (NDVI).
+
+
+Tab 2 — Mapa & Faixas (MapLibre GL + Ortofoto DGT 25 cm): Alternância entre Mapa Vetorial limpo (OpenFreeMap) e Fotografia Aérea Real da DGT; exibe o limite do lote, a mancha vermelha de 10m/50m/100m, a faixa azul da E-REDES e permite tocar num lote vizinho para ativar o diagnóstico "Vizinho em Risco".
+
+
+Tab 3 — Certificar & Orçamentos (Ação e Monetização):
+
+
+
+Fluxo guiado de 2 passos na câmara do telemóvel para tirar fotos Antes e Depois (gravando latitude, longitude e orientação da bússola)  validação gemma3:4b  emissão do Auto PDF SHA-256.
+
+
+Botão de destaque Terracota (#D97706): [ Pedir 3 Orçamentos Chave-na-Mão para 1.420 m² ].
+
+
+Tab 4 — Terrenos & Guardião (Conta e Alertas): Gestão dos lotes da família, configuração de alertas para vários membros da família no Telegram Bot (@FaixaSeguraBot) e arquivo dos certificados emitidos em anos anteriores.
+
+
+8. Roadmap de Implementação (5 Fases)
+Fase 1 (Semana 1) — Core PostGIS & Conectores IPMA/ANEPC: Criação do schema faixasegura, ingestão da CAOP, COS (DGT) e Perigosidade (ICNF) para os 35 municípios da AML e AMP, mais workers ligeiros para rcm-d0..2.json (IPMA) e incidentes ativos (API Aberta).
+
+
+Fase 2 (Semana 2) — Motor Geométrico 10m/50m/100m & Polígonos BUPi/E-REDES: Implementação de compute_parcel_fgc em EPSG:3763, ingestão de edifícios envolventes, linhas aéreas MT/AT da E-REDES e suporte a seleção rápida de parcelas RGG (BUPi) sobre ortofotos de 25 cm da DGT.
+
+
+Fase 3 (Semana 3) — PWA Mobile-First & Semáforo Diário: Construção das 4 vistas em React/TypeScript + MapLibre GL, modo de alto contraste solar para uso no campo, onboarding em 3 toques sem registo obrigatório e integração com Telegram Bot.
+
+
+Fase 4 (Semana 4) — Satélite Sentinel-2 (NDVI) & IA ollama.innovaive.com: Ligação gratuita à API Copernicus Data Space para cálculo quinzenal de NDVI dos lotes vigiados, mais integração do ollama.innovaive.com (qwen3:4b / gemma3:4b) para leitura de Cadernetas Prediais, auditoria visual Antes/Depois e gerador de minutas de vizinho incumpridor.
+
+
+Fase 5 (Semana 5) — Auto PDF SHA-256, SEO Programático & Marketplace: Geração vetorial leve (pdf-lib + ST_AsSVG()) do Auto de Conformidade com página pública /v/[hash], páginas públicas SEO por concelho/freguesia ("Prazo e Regras de Limpeza de Terrenos em Sintra / Valongo 2026") e formulário de captação de empresas locais de limpeza florestal.
+
+
+9. Perguntas de Alinhamento para Avançarmos
+Para afinarmos a implementação exata ao teu ecossistema atual, confirma-me a direção nestes 5 pontos:
+
+Base de Dados Unificada vs. Isolada: Preferes criar este projeto na mesma instância PostgreSQL/PostGIS e Redis do Eco Escola & Família (reutilizando já os polígonos administrativos das freguesias da AML/AMP, o proxy ollama.innovaive.com e a lógica de autenticação Firebase/Local), ou num contentor totalmente independente?
+
+
+Âmbito Geográfico Inicial: Mantemos o foco de lançamento nos 35 municípios da AML + AMP (onde a densidade de moradias em interface florestal como Sintra, Mafra, Cascais, Palmela, Valongo, Paredes e Gondomar gera maior volume B2C e empresas de limpeza locais), ou queres incluir logo distritos críticos do Centro (ex: Leiria, Coimbra, Aveiro, Santarém) onde o BUPi tem cobertura massiva?
+
+
+Fluxo do Marketplace de Orçamentos no MVP: No arranque, enquanto ainda não tens dezenas de empresas de limpeza registadas num painel B2B próprio, preferes que o botão "Pedir 3 Orçamentos" funcione num modelo Concierge / Lead Capture (guarda o pedido qualificado com mapa + m2 e encaminha automaticamente por email/WhatsApp para empresas parceiras locais selecionadas) ou queres já desenhar uma vista de registo para prestadores florestais?
+
+
+Prioridade da Feature "Vizinho Incumpridor": Achas estratégico destacarmos logo no MVP o gerador de requerimento formal para terrenos vizinhos abandonados (como íman viral gratuito em grupos de moradores de urbanizações periféricas)?
+
+
+Próximo Entregável Prático: Queres que avance já para a criação do protótipo funcional da aplicação (PoC completo com mapa ortofotográfico, desenho de lote, cálculo de faixas e Semáforo IPMA ao vivo), ou preferes primeiro o sistema de cores + template detalhado do Auto PDF de Conformidade e Requerimento Municipal?
+
+
+Para veres na prática como os proprietários já estão a delimitar os polígonos oficiais dos seus lotes (que o FaixaSegura pode importar diretamente para evitar desenho manual), espreita este guia curto sobre como identificar e georreferenciar terrenos com a app BUPi, uma vez que mostra exatamente o formato de registo geográfico que servirá de ponto de partida ao motor de cálculo das faixas de 10 e 50 metros.
+
+
+Com o isolamento num docker-compose.yml autónomo (faixasegura-db, faixasegura-redis e faixasegura-app, mantendo apenas a chamada remota ao ollama.innovaive.com via /api/tags e /api/pull) e o alargamento territorial imediato à AML, AMP e aos 7 distritos críticos do Centro/Norte (Leiria, Coimbra, Aveiro, Santarém, Viseu, Castelo Branco e Braga), a arquitetura visual e documental do FaixaSegura passa a refletir integralmente as novas normas técnicas do Despacho n.º 675/2026, de 21 de janeiro (que regulamenta o Decreto-Lei n.º 82/2021 e divide a envolvente dos edifícios em três zonas técnicas distintas).
+
+1. Sistema de Cores e Tokens Visuais — FaixaSegura
+Ao contrário de uma aplicação usada exclusivamente dentro de casa, o FaixaSegura tem de ser legível debaixo de sol direto no terreno sobre fotografia aérea real (Ortofotos DGT de 25 cm, que têm tons verdes e castanhos escuros). Por isso, o sistema separa três camadas cromáticas — superfícies de alto contraste solar/noturno, semáforo diário IPMA e geometria cartográfica translúcida com contornos néon sobre ortofoto:
+
+1.1 Identidade Base e Superfícies (Solar Field Light Mode por Omissão + Dark Mode)
+Token / Função
+Modo Claro Solar (Default Terreno)
+Modo Escuro (Casa / Noite)
+Lógica Funcional e Contraste
+Marca Primária (Pinheiro Profundo)
+#14532D
+#22C55E
+Autoridade florestal e proteção territorial (contraste AAA sobre branco).
+Conversão / CTA (Âmbar Cortiça / Resina)
+#D97706
+#F59E0B
+Reservado exclusivamente aos botões monetizáveis: Pedir 3 Orçamentos e Plano Guardião.
+Documento Oficial & Selo QR (Ardósia & Ciano)
+#0F172A / #0284C7
+#0F172A / #38BDF8
+Cabeçalhos institucionais dos PDFs e selo criptográfico SHA-256 verificável.
+
+
+Fundo Base (Canvas)
+#F8FAFC
+#0B0F17
+Cinza-gelo anti-reflexo ao sol; azul-ardósia escuro para poupança OLED à noite.
+
+
+Superfície de Cartões (Surface)
+#FFFFFF (borda #CBD5E1)
+#161E2E (borda #263248)
+Bordas reforçadas no modo solar para não desaparecerem sob luminosidade intensa.
+
+
+
+1.2 Camadas do Mapa sobre Ortofoto DGT (Norma Despacho n.º 675/2026)
+Sobre fotografia de satélite/aérea, nunca se usam verdes escuros (invisíveis sobre pinhal/eucaliptal). Cada zona legal usa preenchimento com 28% de opacidade e linha de limite de 2.5px com halo branco:
+
+Polígono / Camada Espacial PostGIS
+Cor Sólida / Linha (HEX)
+Fill RGBA (Ortofoto)
+Significado Legal (DL n.º 82/2021 + Despacho n.º 675/2026)
+Limite do Terreno do Utilizador (BUPi/Matriz)
+#FACC15 (Amarelo Laser)
+rgba(250, 204, 21, 0.08)
+Linha tracejada grossa (3px) de máxima visibilidade sobre copa de árvores e sombra.
+Zona 1: Interface Imediata (0 a 2 m da casa)
+#E11D48 (Carmesim Inerte)
+rgba(225, 29, 72, 0.40)
+Eliminação total de vegetação: faixa inerte (brita, pavimento ou solo mineral nu).
+Zona 2: Interface Próxima (2 a 10 m)
+#EA580C (Laranja Brasas)
+rgba(234, 88, 12, 0.30)
+Desbaste rigoroso; apenas árvores isoladas desramadas a 50% (Zero copas a <5m da parede).
+Zona 3: Interface Alargada (10 m até 50m/100m)
+#F59E0B (Âmbar Gestão)
+rgba(245, 158, 11, 0.22)
+Mato cortado (altura máx. Anexo I Despacho 675/2026) e copas afastadas 4m (10m pinheiro/eucalipto).
+Servidão de Terceiros (E-REDES MT/AT / Vias)
+#06B6D4 (Ciano Elétrico)
+rgba(6, 182, 212, 0.28)
+Faixa de 7m–10m cuja limpeza é obrigação legal da E-REDES / Município (isenta custo ao dono).
+Zona Livre / Isenta no Lote
+#4ADE80 (Verde Menta Claro)
+rgba(74, 222, 128, 0.14)
+Área interior fora de qualquer buffer legal de edifícios, aglomerados ou rede viária.
+Polígono "Vizinho Incumpridor" (Denúncia)
+#A855F7 (Violeta Alerta)
+rgba(168, 85, 247, 0.35)
+Destaca a parcela confinante em infração nos mapas do Requerimento Municipal.
+Fogo Ativo ANEPC (Tempo Real)
+#DC2626 (Vermelho Pulso)
+Halo pulsante 15 km
+Marcador circular com anel animado para ocorrências rurais em curso.
+
+1.3 Escala Oficial do Semáforo Diário PIR (IPMA rcm 1 a 5)
+Nível IPMA (rcm)
+Designação Oficial
+Cor Base (HEX)
+Fundo Badge (Light)
+Regra Imediata no Cartão "Posso Trabalhar Hoje?"
+Nível 1
+Reduzido
+#16A34A
+#DCFCE7
+Maquinaria metálica e trabalhos permitidos.
+Nível 2
+Moderado
+#65A30D
+#ECFCCB
+Maquinaria permitida (recomendado meio de 1.ª intervenção).
+Nível 3
+Elevado
+#EAB308
+#FEF9C3
+Condicionado: exige retenção de faúlhas e extintor/mochila de água.
+Nível 4
+Muito Elevado
+#EA580C
+#FFEDD5
+PROIBIDO lâmina metálica/discos, motosserra de risco e queimas.
+Nível 5
+Máximo
+#991B1B
+#FEE2E2
+INTERDIÇÃO TOTAL de maquinaria com faísca, queimas e acesso a APPS.
+
+1.4 Variáveis CSS Prontas para Produção (tokens.css)
+CSS
+
+
+:root {
+  /* === 1. SUPERFÍCIES SOLAR-FIRST (LIGHT DEFAULT P/ TERRENO) === */
+  --fs-bg-canvas: #F8FAFC;
+  --fs-bg-surface: #FFFFFF;
+  --fs-border-strong: #CBD5E1;
+  --fs-text-primary: #0F172A;
+  --fs-text-secondary: #475569;
+  --fs-brand-primary: #14532D;
+  --fs-cta-amber: #D97706;
+
+  /* === 2. GEOMETRIA DE FAIXAS SOBRE ORTOFOTO (DESPACHO 675/2026) === */
+  --fs-parcel-stroke: #FACC15;       /* Limite BUPi / Matriz */
+  --fs-zone-immediate: #E11D48;      /* 0-2m: Faixa Inerte */
+  --fs-zone-near: #EA580C;           /* 2-10m: Interface Próxima */
+  --fs-zone-extended: #F59E0B;       /* 10-50m/100m: Interface Alargada */
+  --fs-zone-thirdparty: #06B6D4;     /* Servidão E-REDES / Estradas */
+  --fs-zone-exempt: #4ADE80;         /* Área sem obrigação */
+  --fs-zone-neighbor-risk: #A855F7;  /* Lote vizinho em infração */
+
+  /* === 3. SEMÁFORO OFICIAL PIR / IPMA (RCM 1-5) === */
+  --fs-pir-1-low: #16A34A;
+  --fs-pir-2-mod: #65A30D;
+  --fs-pir-3-high: #EAB308;
+  --fs-pir-4-vhigh: #EA580C;
+  --fs-pir-5-max: #991B1B;
+
+  /* === 4. DOCUMENTOS LEGAIS & CERTIFICAÇÃO SHA-256 === */
+  --fs-doc-header: #0F172A;
+  --fs-doc-seal: #0284C7;
+}
+
+.dark {
+  --fs-bg-canvas: #0B0F17;
+  --fs-bg-surface: #161E2E;
+  --fs-border-strong: #263248;
+  --fs-text-primary: #F8FAFC;
+  --fs-text-secondary: #94A3B8;
+  --fs-brand-primary: #22C55E;
+}
+
+
+2. Vista de Registo e Operação para Prestadores Florestais (/prestadores)
+Como incluímos logo os distritos críticos (Leiria, Coimbra, Aveiro, Santarém, Viseu, Castelo Branco e Braga, além da AML e AMP), a procura por limpeza mecânica entre fevereiro e junho supera largamente a oferta organizada online. A vista /prestadores permite captar empresas locais, equipas de sapadores/associações florestais e prestadores agrícolas sem fricção burocrática, mas filtrando curiosos sem seguro ou equipamento legal.
+
+2.1 Fluxo de Registo B2B em 3 Passos (/prestadores/registo)
+Passo 1 — Identificação Empresarial & Idoneidade:
+
+
+
+Campos: NIF da Empresa/ENI, Nome Comercial, Telemóvel (WhatsApp/Telegram para receção instantânea de pedidos), Email e CAE Principal (pré-seleção rápida: 02400 — Atividades dos serviços relacionados com a silvicultura e exploração florestal ou 81300 — Atividades de plantação e manutenção de jardins).
+
+
+Credenciação Técnica (Badges de Confiança no Marketplace):
+
+
+
+[x] Seguro de Responsabilidade Civil de Exploração válido (obrigatório para listagem verificada).
+
+
+[ ] Equipamento homologado com retenção de faúlhas e kit de 1.ª intervenção.
+
+
+[ ] Autorização / Técnico habilitado para poda de quercíneas (Sobreiro/Azinheira) ou abate c/ Manifesto ICNF.
+
+
+Passo 2 — Capacidade Operacional & Maquinaria (Crucial para o Matching PostGIS):
+
+
+
+O motor PostGIS sabe a área em m2, o declive médio (%) (via Modelo Digital de Terreno da DGT) e se o terreno tem acesso rodoviário largo. O prestador assinala o que possui:
+
+
+
+[ ] Equipa Apeada (Motorroçadoras / Motosserras) — Ideal para lotes murados, quintais ou declives acentuados $>25\%$.
+
+
+[ ] Trator Florestal de Rodas c/ Capinadeira de Correntes ou Martelos — Lotes médios/grandes com declive $<20\%$.
+
+
+[ ] Máquina de Rastos / Giratória Florestal c/ Destroçador — Mato denso pesado e declives difíceis.
+
+
+[ ] Biotriturador / Recolha e Transporte de Sobrantes — Crítico nos meses em que é proibido queimar sobrantes!
+
+
+Passo 3 — Cobertura Geográfica por Concelho (DICO) e Modelo de Orçamentação:
+
+
+
+Mapa interativo onde o prestador seleciona os concelhos onde atua (ex: Pombal, Ansião, Figueiró dos Vinhos, Leiria ou Sintra, Mafra, Loures) e define a Área Mínima de Deslocação (ex: 500m2).
+
+
+Ligação direta em 1 clique ao @FaixaSeguraParceirosBot no Telegram para receber notificações de novos pedidos de orçamento no bolso enquanto está no mato.
+
+
+2.2 O Cartão de Lead que o Prestador Recebe (Porque Pagam pela Lead)
+Em vez de um contacto vago ("Preciso limpar um terreno em Sintra" — que obriga o empreiteiro a perder 2 horas e gasóleo numa visita cega), o prestador vê no seu painel /prestadores/pedidos:
+
+Ortofoto DGT com a mancha exata a limpar: Área obrigatória calculada: 1.840 m² (de um total de 4.200 m²).
+
+
+Perfil Físico Automático: Declive médio 14% | Uso do Solo COS: Mato e Pinheiro-bravo | Acesso viário pavimentado: Sim (frente de 28m para estrada municipal) | Índice Satélite NDVI: 0.68 (Biomassa Alta).
+
+
+Ação: Botão [ Desbloquear Contacto & Enviar Orçamento ] (Primeiros 3 pedidos gratuitos no lançamento para ganhar liquidez de rede nos distritos críticos; depois sistema de créditos pré-pagos de 5 € a 15 € por lead).
+
+
+Bónus de Fecho: Quando o prestador conclui o serviço, carrega as fotos Depois na sua vista e emite o Auto PDF de Conformidade co-assinado com o seu NIF empresarial diretamente para o cliente — fidelizando ambos à plataforma!
+
+
+3. Template #1: Auto Digital de Conformidade Preventiva (PDF A4 — 2 Páginas)
+Seguindo a mesma arquitetura ultra-leve de geração vetorial (pdf-lib + ST_AsSVG() sem Chromium) e validação pública via QR Code, este documento serve três propósitos para o proprietário: prova datada de cumprimento dentro do prazo legal perante fiscalização tardia da GNR/Câmara, comprovativo de diligência para a Seguradora do seguro Multirriscos, e recibo técnico entre um proprietário ausente (ex: a viver em Lisboa/Porto ou emigrado) e o prestador que limpou o terreno no interior.
+
+PÁGINA 1: Identificação Predial, Enquadramento Legal 2026 e Cartografia Vetorial
+Plaintext
+
+
+================================================================================
+FAIXASEGURA · REGISTO TÉCNICO AUDITÁVEL DE GESTÃO DE COMBUSTÍVEL RURAL E URBANO
+AUTO DIGITAL DE CONFORMIDADE PREVENTIVA (SGIFR)         CERT: #FS-20260524-7D9E
+================================================================================
+
+1. IDENTIFICAÇÃO DO PRÉDIO E ENQUADRAMENTO CADASTRAL
+   Designação / Local:      Quinta do Vale Escuro · Freguesia de Colares
+   Município / Distrito:    Sintra (DICO: 1111 | DICOFRE: 111105) · Lisboa
+   Artigo Matricial / Sec.: Rústico — Artigo 142, Secção G  |  ID BUPi: RGG-884120
+   Coordenadas Centroide:   38.798412° N, -9.462108° W  (ETRS89 / PT-TM06)
+   Titular / Detentor:      [Nome Preenchido Localmente]  |  NIF: [XXX XXX XXX]
+
+2. AUDITORIA GEOMÉTRICA DE FAIXAS (DL n.º 82/2021 + DESPACHO n.º 675/2026)
+   Área Total da Parcela:   4.250,00 m²   |   Perigosidade ICNF: Classe IV (Alta)
+   Freguesia Prioritária:   SIM           |   Prazo Legal 2026:  31 de maio 2026
+
+   +-----------------------------------------------+------------+--------------+
+   | ZONA DE INTERVENÇÃO LEGALMENTE EXIGÍVEL       | ÁREA (m²)  | ESTADO       |
+   +-----------------------------------------------+------------+--------------+
+   | • Zona Interface Imediata (0–2 m edifícios)   |   145,00   | EXECUTADA    |
+   | • Zona Interface Próxima (2–10 m edifícios)   |   490,00   | EXECUTADA    |
+   | • Zona Interface Alargada (10–50 m florestal) | 1.215,00   | EXECUTADA    |
+   | • Servidão Terceiros (Linha MT E-REDES 7m)    |   310,00   | EXCLUÍDA (*) |
+   | • Zona Interior Isenta de Obrigação Legal     | 2.090,00   | ISENTA       |
+   +-----------------------------------------------+------------+--------------+
+   (*) Nota: Área sob projeção de linha aérea MT da rede pública (Art. 49.º DL 82/2021).
+
+   [ MAPA VETORIAL SVG ESTÁTICO — ORTOFOTO / POLÍGONOS EPSG:3763 ]
+   +---------------------------------------------------------------------------+
+   |  Legenda: [---] Limite Prédio   [///] Z1 Inerte 0-2m   [xxx] Z2/Z3 2-50m  |
+   |           [===] Eixo E-REDES    (1) Pin GPS Foto 1     (2) Pin GPS Foto 2 |
+   |  Escala Gráfica: 0 ____ 25m ____ 50m                    Norte Geográfico ↑|
+   +---------------------------------------------------------------------------+
+
+3. CONDIÇÕES DE SEGURANÇA OPERACIONAL NA DATA DOS TRABALHOS
+   Data de Conclusão:       24 de maio de 2026 (Dentro do prazo Desp. 3440/2026)
+   Índice PIR / IPMA (rcm): Nível 2 — MODERADO (Concelho 1111 à hora do registo)
+   Conformidade Maquinaria: Operação permitida nos termos do Art. 68.º DL 82/2021
+   Execução dos Trabalhos:  [x] Prestador Florestal Registado  [ ] Meios Próprios
+   Entidade Executora:      SilviSintra Lda. · NIF 514XXXXXX · Fatura FT 2026/418
+================================================================================
+
+
+PÁGINA 2: Evidência Fotográfica Georreferenciada, Parecer Técnica IA e Selo SHA-256
+Plaintext
+
+
+================================================================================
+EVIDÊNCIA FOTOGRÁFICA GEORREFERENCIADA E VALIDAÇÃO CRIPTOGRÁFICA
+Certificado #FS-20260524-7D9E · Página 2 de 2
+================================================================================
+
+4. REGISTO FOTOGRÁFICO COMPARATIVO COM TELEMETRIA EXIF / GPS VALIDADA
+
+   +------------------------------------+ +------------------------------------+
+   | [ FOTO 1A — ANTES DA INTERVENÇÃO ] | | [ FOTO 1B — APÓS INTERVENÇÃO ]     |
+   | Data: 18/05/2026 09:14:22 WET      | | Data: 24/05/2026 16:42:10 WET      |
+   | GPS: 38.79850° N, -9.46221° W      | | GPS: 38.79849° N, -9.46220° W (±3m)|
+   | Azimute Bússola: 340° (Noroeste)   | | Azimute Bússola: 342° (Noroeste)   |
+   +------------------------------------+ +------------------------------------+
+   +------------------------------------+ +------------------------------------+
+   | [ FOTO 2A — ANTES (FAIXA 0-10m) ]  | | [ FOTO 2B — APÓS (FAIXA INERTE) ]  |
+   | Data: 18/05/2026 09:18:05 WET      | | Data: 24/05/2026 16:48:51 WET      |
+   | GPS: 38.79831° N, -9.46195° W      | | GPS: 38.79832° N, -9.46194° W (±2m)|
+   | Azimute Bússola: 085° (Este)       | | Azimute Bússola: 083° (Este)       |
+   +------------------------------------+ +------------------------------------+
+
+5. LISTA DE VERIFICAÇÃO TÉCNICA & ANÁLISE ASSISTIDA (Despacho n.º 675/2026)
+   [x] Faixa Inerte (0–2m): Solo mineral/pavimento livre de ervas e manta morta.
+   [x] Descontinuidade Horizontal: Estrato arbustivo cortado (< 20 cm altura).
+   [x] Descontinuidade Vertical: Desramação efetuada (50% altura / mín. 4m solo).
+   [x] Afastamento a Edifícios: Sem projeção de copas sobre telhados e > 5 metros.
+   [x] Proteção Quercíneas: 2 exemplares de Sobreiro (Quercus suber) preservados
+       sem mutilação (DL n.º 169/2001).
+   • Índice Satélite Sentinel-2 (Pré-limpeza 15/05/2026): NDVI 0.68 -> Pós-corte
+     aguarda próxima passagem sem nuvens para atualização automática no QR Code.
+
+--------------------------------------------------------------------------------
+CERTIFICAÇÃO PÚBLICA IMUTÁVEL (VERIFICAÇÃO PARA AUTORIDADES E SEGURADORAS)
+[ QR CODE ]  Valide as fotos originais, coordenadas e timestamp em:
+             https://faixasegura.pt/v/FS-20260524-7D9E
+             SHA-256 Canónico: 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd...
+
+NOTA JURÍDICA: Este relatório constitui prova documental e pericial privada de
+diligência preventiva com carimbo temporal e validação geodésica das fotografias
+captadas no interior do polígono predial identificado. Não substitui vistorias
+administrativas presenciais do Gabinete Técnico Florestal (GTF) municipal, ICNF
+ou GNR/SEPNA nos termos do Decreto-Lei n.º 82/2021, de 13 de outubro.
+================================================================================
+
+
+4. Template #2: Requerimento Formal "Vizinho Incumpridor" (PDF A4 — 2 Páginas)
+Esta funcionalidade tem potencial viral imediato em grupos de WhatsApp/Facebook de urbanizações e aldeias nos distritos de Leiria, Coimbra, Santarém, Aveiro, Viseu, Porto e Lisboa. Em vez de uma denúncia informal por telefone que fica esquecida, a aplicação usa o PostGIS + ollama.innovaive.com (gemma3:4b) para gerar uma Participação Técnica Fundamentada, instruída com ortofoto, medição métrica exata em EPSG:3763 e invocação direta dos prazos de vistoria e execução coerciva camarária:
+
+Estrutura Completa do Requerimento Municipal & Participação GNR/SEPNA
+Plaintext
+
+
+================================================================================
+REQUERIMENTO DE FISCALIZAÇÃO PRIORITÁRIA E EXECUÇÃO COERCIVA DE GESTÃO DE
+COMBUSTÍVEL EM PRÉDIO CONFINANTE (Artigos 49.º, 57.º e 58.º do DL n.º 82/2021)
+================================================================================
+
+Exmo.(a) Senhor(a) Presidente da Câmara Municipal de [Município — ex: Leiria]
+C/ Conhecimento:
+  • Gabinete Técnico Florestal (GTF) / Serviço Municipal de Proteção Civil (SMPC)
+  • Guarda Nacional Republicana — Destacamento Territorial / Núcleo SEPNA
+  • Linha SOS Ambiente e Território (808 200 520)
+
+--------------------------------------------------------------------------------
+1. IDENTIFICAÇÃO DO REQUERENTE (PROPRIETÁRIO / MORADOR LESADO PELO RISCO)
+--------------------------------------------------------------------------------
+Nome Completo: [Preenchido pelo Utilizador]        NIF: [XXX XXX XXX]
+Morada do Edifício em Risco: [Rua / Lugar, Código Postal, Freguesia]
+Contacto Telefónico: [9XX XXX XXX]                 Email: [email@dominio.pt]
+Qualidade: Proprietário de edificação habitacional confinante (Faixa própria já
+           executada e certificada sob ref.ª #FS-20260524-7D9E, se aplicável).
+
+--------------------------------------------------------------------------------
+2. IDENTIFICAÇÃO GEORREFERENCIADA DO PRÉDIO EM INCUMPRIMENTO (TERRENO VIZINHO)
+--------------------------------------------------------------------------------
+• Freguesia / Concelho:         [Nome da Freguesia] (DICOFRE: [XXXXXX])
+• Confrontação Relativa:        Estrema [Norte / Nascente] da habitação do requerente
+• Coordenadas Exatas da Mancha: [39.743810° N, -8.807125° W] (WGS84)
+                                [X: -54210.4 m, Y: 10842.8 m] (ETRS89 / PT-TM06)
+• Referência BUPi / Cadastro:   [RGG/Artigo se público na DGT, ou "Titular a apurar
+                                pela Câmara via base tributária AT/BUPi nos termos
+                                da lei para efeitos de notificação/edital"]
+
+--------------------------------------------------------------------------------
+3. LEVANTAMENTO TÉCNICO E CARTOGRÁFICO DO RISCO APURADO
+--------------------------------------------------------------------------------
++------------------------------------------------------------------------------+
+| [ ORTOFOTO DGT + CÁLCULO MÉTRICO POSTGIS (ESCALA 1:1.000) ]                  |
+| • Edifício Habitacional do Requerente assinalado a branco                    |
+| • Polígono Violeta: Parcela vizinha inserida nos 50 metros regulamentares    |
+| • Cota de Distância Mínima Medida: VEGETAÇÃO DENSA A 4,20 METROS DA FACHADA  |
++------------------------------------------------------------------------------+
+
+Factos Verificados no Local em [Data]:
+1. O prédio confinante supra identificado encontra-se inserido integralmente na
+   Faixa de Gestão de Combustível obrigatória de [50 metros / 100 metros / 10m]
+   medida a partir da alvenaria exterior da habitação do Requerente, em zona
+   classificada com Perigosidade de Incêndio Rural [Alta / Muito Alta (ICNF)].
+2. Verifica-se a presença contínua de estrato arbustivo/silvado seco com altura
+   estimada superior a [1,80 m] e exemplares de [eucalipto / pinheiro-bravo /
+   acácias] não desramados a apenas [4,20 metros] da habitação, violando de
+   forma manifesta os critérios técnicos de interface imediata (0–2 m), próxima
+   (2–10 m) e alargada fixados no Despacho n.º 675/2026, de 21 de janeiro.
+3. O índice multiespectral de satélite (Copernicus Sentinel-2 de [Data]) confirma
+   elevada acumulação de carga combustível contínua (NDVI: [0.74]) na parcela.
+
+[ FOTOGRAFIA GEORREFERENCIADA DA ESTREMA TIRADA A PARTIR DA PROPRIEDADE PRÓPRIA ]
+  Captada em: [DD/MM/2026 HH:MM] · GPS: [Lat, Lon] · Orientação: [Azimute °]
+
+--------------------------------------------------------------------------------
+4. ENQUADRAMENTO LEGAL E PEDIDO DE INTERVENÇÃO URGENTE
+--------------------------------------------------------------------------------
+Nos termos conjugados do Decreto-Lei n.º 82/2021, de 13 de outubro (SGIFR), do
+Despacho n.º 675/2026, de 21 de janeiro, e do Despacho de prazos em vigor para
+2026, encontrando-se decorrido o prazo legal (ou verificando-se perigo iminente
+de propagação a edifício habitado), requer-se a V. Exa. que determine com
+caráter de urgência:
+
+a) A realização de vistoria técnica ao local pelo Gabinete Técnico Florestal
+   (GTF) / Serviço Municipal de Proteção Civil ou patrulha GNR/SEPNA;
+b) A notificação imediata do(s) proprietário(s) ou cabeça-de-casal (com recurso
+   ao acesso legal da autarquia aos dados fiscais e BUPi, ou mediante edital de
+   5 dias caso o paradeiro seja incerto);
+c) Em caso de manutenção do incumprimento, o desencadeamento imediato da
+   EXECUÇÃO COERCIVA dos trabalhos de gestão de combustível pela Câmara
+   Municipal, a expensas do infrator, prevenindo danos patrimoniais e pessoais
+   irreversíveis na época crítica de incêndios;
+d) A comunicação ao Requerente, para o endereço eletrónico supra indicado, do
+   número de registo do processo administrativo e do resultado da vistoria.
+
+Pede deferimento,
+[Localidade], [Dia] de [Mês] de 2026
+
+Assinatura: ______________________________________________________
+
+--------------------------------------------------------------------------------
+[ QR CODE ] Dossiê Geográfico Digital (KML/GeoJSON p/ importação direta no SIG
+            Municipal do GTF): https://faixasegura.pt/gtf/REQ-20260602-3C1A
+================================================================================
+
+
+Detalhe Diferenciador para as Câmaras Municipais (O QR Code /gtf/... no rodapé): Quando o engenheiro florestal da Câmara Municipal (GTF) recebe este PDF por email e lê o QR Code, descarrega em 1 clique o ficheiro GeoJSON / KML da parcela denunciada pronto a abrir no QGIS/ArcGIS municipal! Isto poupa 30 minutos de trabalho ao técnico da autarquia e acelera drasticamente a fiscalização real do pedido do teu utilizador.
+
+5. Próximo Passo de Construção (Contentor Independente)
+Com a arquitetura independente, os distritos críticos, o portal /prestadores, o sistema de cores 2026 e os dois templates legais definidos, podemos avançar diretamente para o código do repositório isolado do FaixaSegura. Queres que construa já o PoC Interativo Completo (Docker + Backend Express/TypeScript c/ IPMA/ANEPC/ollama.innovaive.com + Frontend PWA Mobile-First com Mapa Ortofoto, Motor das 3 Zonas do Despacho 675/2026, Registo de Prestadores e Gerador PDF real dos 2 documentos)?
+
+Para visualizar de forma rápida as distâncias e regras práticas junto às casas que o nosso motor espacial calcula sobre os polígonos, vale a pena espreitar o guia oficial sobre gestão de combustível e limpeza à volta das edificações, que resume visualmente os critérios da campanha Portugal Chama aplicados no terreno.
+

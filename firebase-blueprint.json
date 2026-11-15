@@ -1,0 +1,312 @@
+{
+  "entities": {
+    "UserPublicProfile": {
+      "title": "UserPublicProfile",
+      "description": "Non-PII owner account anchor document for relational security gates.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "description": "Display name chosen by the property owner.",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "preferredDico": {
+          "type": "string",
+          "description": "4-digit municipal DICO code.",
+          "minLength": 4,
+          "maxLength": 4,
+          "pattern": "^[0-9]{4}$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["uid", "displayName", "preferredDico", "createdAt", "updatedAt"]
+    },
+    "UserPrivateInfo": {
+      "title": "UserPrivateInfo",
+      "description": "Isolated PII subcollection document storing email, optional NIF, and phone.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the account owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "email": {
+          "type": "string",
+          "format": "email",
+          "description": "Verified owner email address.",
+          "minLength": 3,
+          "maxLength": 160
+        },
+        "nif": {
+          "type": "string",
+          "description": "Optional 9-digit Portuguese tax number or empty string.",
+          "minLength": 0,
+          "maxLength": 9
+        },
+        "phone": {
+          "type": "string",
+          "description": "Optional phone contact for quote notifications.",
+          "minLength": 0,
+          "maxLength": 24
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": ["uid", "email", "nif", "phone", "createdAt", "updatedAt"]
+    },
+    "UserHistoryEntry": {
+      "title": "UserHistoryEntry",
+      "description": "Immutable or owner-managed consultable record of user parcel diagnostics, SHA-256 certificates, quote requests, neighbor complaints, and field interventions.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "category": {
+          "type": "string",
+          "description": "Type of historical event.",
+          "enum": ["PARCEL", "CERTIFICATE", "QUOTE", "NEIGHBOR", "INTERVENTION"],
+          "minLength": 5,
+          "maxLength": 20
+        },
+        "title": {
+          "type": "string",
+          "description": "Concise human-readable title of the recorded action.",
+          "minLength": 2,
+          "maxLength": 140
+        },
+        "parcelId": {
+          "type": "string",
+          "description": "Associated parcel identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "parcelLabel": {
+          "type": "string",
+          "description": "Parcel name at the time of recording.",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "municipality": {
+          "type": "string",
+          "description": "Portuguese municipality name.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "referenceCode": {
+          "type": "string",
+          "description": "SHA-256 shortCode, REQ code, RGG ID, or intervention code.",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "areaM2": {
+          "type": "number",
+          "description": "Mandatory or intervened fuel-management area in square meters."
+        },
+        "pirLevel": {
+          "type": "number",
+          "description": "PIR meteorological danger index (1 to 5) at the time of the record."
+        },
+        "soilMoisturePct": {
+          "type": "number",
+          "description": "Volumetric soil moisture percentage (0 to 100) at the time of the record."
+        },
+        "summary": {
+          "type": "string",
+          "description": "Detailed operational notes, SHA-256 hash excerpt, or machinery used.",
+          "minLength": 2,
+          "maxLength": 500
+        },
+        "status": {
+          "type": "string",
+          "description": "Lifecycle state of the history entry.",
+          "enum": ["ACTIVE", "ARCHIVED"],
+          "minLength": 6,
+          "maxLength": 12
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "category",
+        "title",
+        "parcelId",
+        "parcelLabel",
+        "municipality",
+        "referenceCode",
+        "areaM2",
+        "pirLevel",
+        "soilMoisturePct",
+        "summary",
+        "status",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "UserSavedParcel": {
+      "title": "UserSavedParcel",
+      "description": "Custom or BUPi parcel saved under a specific authenticated user account.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "description": "Firebase Auth UID of the parcel owner.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "parcelId": {
+          "type": "string",
+          "description": "Parcel identifier.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "label": {
+          "type": "string",
+          "description": "User-defined parcel designation.",
+          "minLength": 2,
+          "maxLength": 120
+        },
+        "municipality": {
+          "type": "string",
+          "description": "Municipality name.",
+          "minLength": 2,
+          "maxLength": 80
+        },
+        "dico": {
+          "type": "string",
+          "description": "4-digit municipal DICO code.",
+          "minLength": 4,
+          "maxLength": 4,
+          "pattern": "^[0-9]{4}$"
+        },
+        "matrixArticle": {
+          "type": "string",
+          "description": "Cadastral matrix article reference.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "bupiRggId": {
+          "type": "string",
+          "description": "BUPi RGG reference.",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "landClass": {
+          "type": "string",
+          "enum": ["FOREST_SCRUB", "AGRICULTURE", "URBAN_BUILT"],
+          "minLength": 10,
+          "maxLength": 20
+        },
+        "totalAreaM2": {
+          "type": "number",
+          "description": "Total area in square meters."
+        },
+        "mandatoryCleanAreaM2": {
+          "type": "number",
+          "description": "Mandatory fuel-break area in square meters."
+        },
+        "avgSlopePct": {
+          "type": "number",
+          "description": "Average terrain slope percentage."
+        },
+        "hasEredesLine": {
+          "type": "boolean",
+          "description": "Whether an E-REDES overhead line crosses the parcel."
+        },
+        "hasProtectedOaks": {
+          "type": "boolean",
+          "description": "Whether cork or holm oaks are flagged on the parcel."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server creation timestamp."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Server update timestamp."
+        }
+      },
+      "required": [
+        "uid",
+        "parcelId",
+        "label",
+        "municipality",
+        "dico",
+        "matrixArticle",
+        "bupiRggId",
+        "landClass",
+        "totalAreaM2",
+        "mandatoryCleanAreaM2",
+        "avgSlopePct",
+        "hasEredesLine",
+        "hasProtectedOaks",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": { "$ref": "#/entities/UserPublicProfile" },
+      "description": "Anchor public profile per authenticated user (non-PII)."
+    },
+    "/users/{userId}/private/{docId}": {
+      "schema": { "$ref": "#/entities/UserPrivateInfo" },
+      "description": "Strictly owner-isolated PII profile data (email, NIF, phone)."
+    },
+    "/users/{userId}/history/{entryId}": {
+      "schema": { "$ref": "#/entities/UserHistoryEntry" },
+      "description": "Per-user consultable timeline of parcels, certificates, quotes, neighbor petitions, and field interventions."
+    },
+    "/users/{userId}/parcels/{parcelId}": {
+      "schema": { "$ref": "#/entities/UserSavedParcel" },
+      "description": "Per-user saved custom and BUPi parcels."
+    }
+  }
+}

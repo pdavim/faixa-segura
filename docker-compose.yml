@@ -1,0 +1,60 @@
+services:
+  faixasegura-db:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: faixasegura-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: faixasegura
+      POSTGRES_USER: faixasegura
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-faixasegura_local_2026}
+    ports:
+      - "5439:5432"
+    volumes:
+      - faixasegura_pgdata:/var/lib/postgresql/data
+      - ./db/schema_postgis.sql:/docker-entrypoint-initdb.d/01_schema_postgis.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U faixasegura -d faixasegura"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  faixasegura-redis:
+    image: redis:7.2-alpine
+    container_name: faixasegura-redis
+    restart: unless-stopped
+    command: redis-server --save 60 1 --loglevel warning
+    ports:
+      - "6389:6379"
+    volumes:
+      - faixasegura_redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  faixasegura-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: faixasegura-app
+    restart: unless-stopped
+    depends_on:
+      faixasegura-db:
+        condition: service_healthy
+      faixasegura-redis:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DATABASE_URL: postgresql://faixasegura:${POSTGRES_PASSWORD:-faixasegura_local_2026}@faixasegura-db:5432/faixasegura
+      REDIS_URL: redis://faixasegura-redis:6379/0
+      OLLAMA_BASE_URL: https://ollama.innovaive.com
+      OLLAMA_VISION_MODEL: gemma3:4b
+      OLLAMA_TEXT_MODEL: qwen3:4b
+    ports:
+      - "3000:3000"
+
+volumes:
+  faixasegura_pgdata:
+  faixasegura_redisdata:

@@ -1,0 +1,6 @@
+{
+  "name": "FaixaSegura — Gestão de Combustível & Prova Legal SGIFR",
+  "description": "Aplicação web mobile e tablet-first de diagnóstico geométrico de faixas de gestão de combustível (DL n.º 82/2021 e Despacho n.º 675/2026), semáforo diário IPMA, monitorização satélite Sentinel-2, certificação SHA-256 e marketplace de prestadores florestais.",
+  "requestFramePermissions": ["geolocation", "camera"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

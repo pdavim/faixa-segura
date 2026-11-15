@@ -1,0 +1,31 @@
+{
+  "id": "/",
+  "name": "FaixaSegura — Gestão de Combustível & Prova Legal",
+  "short_name": "FaixaSegura",
+  "description": "Diagnóstico geométrico de faixas (DL 82/2021 e Despacho 675/2026), semáforo IPMA, satélite Sentinel-2 e Auto PDF SHA-256.",
+  "theme_color": "#14532D",
+  "background_color": "#F8FAFC",
+  "display": "standalone",
+  "start_url": "/",
+  "scope": "/",
+  "icons": [
+    {
+      "src": "/pwa-192x192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/pwa-maskable-512x512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    }
+  ]
+}

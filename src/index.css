@@ -1,0 +1,83 @@
+@import "tailwindcss";
+@import "leaflet/dist/leaflet.css";
+@custom-variant dark (&:is(.dark, .dark *));
+
+:root {
+  /* === 1. SUPERFÍCIES SOLAR-FIRST (LIGHT DEFAULT P/ TERRENO) === */
+  --fs-bg-canvas: #F8FAFC;
+  --fs-bg-surface: #FFFFFF;
+  --fs-border-strong: #CBD5E1;
+  --fs-text-primary: #0F172A;
+  --fs-text-secondary: #475569;
+  --fs-brand-primary: #14532D;
+  --fs-cta-amber: #D97706;
+
+  /* === 2. GEOMETRIA DE FAIXAS SOBRE ORTOFOTO (DESPACHO 675/2026) === */
+  --fs-parcel-stroke: #FACC15;       /* Limite BUPi / Matriz */
+  --fs-zone-immediate: #E11D48;      /* 0-2m: Faixa Inerte */
+  --fs-zone-near: #EA580C;           /* 2-10m: Interface Próxima */
+  --fs-zone-extended: #F59E0B;       /* 10-50m/100m: Interface Alargada */
+  --fs-zone-thirdparty: #06B6D4;     /* Servidão E-REDES / Estradas */
+  --fs-zone-exempt: #4ADE80;         /* Área sem obrigação */
+  --fs-zone-neighbor-risk: #A855F7;  /* Lote vizinho em infração */
+
+  /* === 3. SEMÁFORO OFICIAL PIR / IPMA (RCM 1-5) === */
+  --fs-pir-1-low: #16A34A;
+  --fs-pir-2-mod: #65A30D;
+  --fs-pir-3-high: #EAB308;
+  --fs-pir-4-vhigh: #EA580C;
+  --fs-pir-5-max: #991B1B;
+
+  /* === 4. DOCUMENTOS LEGAIS & CERTIFICAÇÃO SHA-256 === */
+  --fs-doc-header: #0F172A;
+  --fs-doc-seal: #0284C7;
+}
+
+.dark {
+  --fs-bg-canvas: #0B0F17;
+  --fs-bg-surface: #161E2E;
+  --fs-border-strong: #263248;
+  --fs-text-primary: #F8FAFC;
+  --fs-text-secondary: #94A3B8;
+  --fs-brand-primary: #22C55E;
+}
+
+@layer base {
+  html {
+    font-family: 'Public Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  h1, h2, h3, h4, .font-display {
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, sans-serif;
+  }
+
+  .font-mono, code, pre {
+    font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Resilient field orthophoto pattern under Leaflet tiles when offline or loading */
+.leaflet-container {
+  background-color: #1c2e22 !important;
+  background-image:
+    radial-gradient(rgba(74, 222, 128, 0.10) 1px, transparent 1px),
+    linear-gradient(to right, rgba(255, 255, 255, 0.04) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(255, 255, 255, 0.04) 1px, transparent 1px);
+  background-size: 20px 20px, 80px 80px, 80px 80px;
+  font-family: 'Public Sans', sans-serif;
+}
+
+.leaflet-control-attribution {
+  font-size: 10px !important;
+  background: rgba(15, 23, 42, 0.72) !important;
+  color: #cbd5e1 !important;
+}
+
+.leaflet-control-attribution a {
+  color: #93c5fd !important;
+}
