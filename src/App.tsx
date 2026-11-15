@@ -508,7 +508,10 @@ export default function App() {
         {activeTab === 'certify' && (
           <CertifyQuotesView
             activeParcel={activeParcel}
+            certificates={certificates}
             todayForecast={forecasts[0]}
+            defaultOwnerName={userProfile?.displayName}
+            defaultOwnerNif={userProfile?.nif}
             initialSubMode={certifySubMode}
             onCertificateIssued={(cert) => {
               setCertificates((prev) => [cert, ...prev]);

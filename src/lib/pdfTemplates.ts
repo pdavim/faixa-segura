@@ -4,7 +4,54 @@ import type {
   ComplianceCertificate,
   NeighborComplaintRecord,
 } from '../types/domain.ts';
-import { PIR_SCALE } from './pirRules.ts';
+import { buildCanonicalCertificatePayload, PIR_SCALE } from './pirRules.ts';
+
+export interface CertificateSealMetadata {
+  issuedAtUtcIso: string;
+  issuedAtLocalPt: string;
+  exportedAtUtcIso: string;
+  timestampSealId: string;
+  canonicalPayload: string;
+  sha256Hash: string;
+}
+
+export function buildCertificateSealMetadata(
+  cert: ComplianceCertificate,
+  exportedAtIso?: string
+): CertificateSealMetadata {
+  const issuedDate = new Date(cert.issuedAt);
+  const validIssued = Number.isNaN(issuedDate.getTime()) ? new Date() : issuedDate;
+  const issuedAtUtcIso = validIssued.toISOString();
+  const issuedAtLocalPt = validIssued.toLocaleString('pt-PT', {
+    timeZone: 'Europe/Lisbon',
+    dateStyle: 'short',
+    timeStyle: 'medium',
+  });
+
+  const exportDate = exportedAtIso ? new Date(exportedAtIso) : new Date();
+  const validExport = Number.isNaN(exportDate.getTime()) ? new Date() : exportDate;
+  const exportedAtUtcIso = validExport.toISOString();
+
+  const timestampSealId = `TS-UTC-${validIssued.getTime()}-${cert.shortCode.toUpperCase()}`;
+  const canonicalPayload = buildCanonicalCertificatePayload({
+    shortCode: cert.shortCode,
+    parcelId: cert.parcelId,
+    dico: cert.dico,
+    ownerNif: cert.ownerNif,
+    cleanedAreaM2: cert.cleanedAreaM2,
+    pirLevelAtWork: cert.pirLevelAtWork,
+    issuedAt: cert.issuedAt,
+  });
+
+  return {
+    issuedAtUtcIso,
+    issuedAtLocalPt,
+    exportedAtUtcIso,
+    timestampSealId,
+    canonicalPayload,
+    sha256Hash: cert.sha256Hash,
+  };
+}
 
 /**
  * Ensures text only contains characters supported by WinAnsiEncoding (StandardFonts.Helvetica),
@@ -48,13 +95,36 @@ function wrapTextLines(text: string, maxCharsPerLine: number): string[] {
 }
 
 /**
- * Template #1: Auto Digital de Conformidade Preventiva (PDF A4 — 2 Páginas Vetoriais)
+ * Template #1: Relatório Oficial de Conformidade Preventiva (PDF A4 — 2 Páginas Vetoriais c/ Selo Temporal & SHA-256)
  */
 export async function generateComplianceCertificatePdf(
   cert: ComplianceCertificate,
-  publicBaseUrl: string
+  publicBaseUrl: string,
+  options?: { exportedAtIso?: string }
 ): Promise<Uint8Array> {
+  const sealMeta = buildCertificateSealMetadata(cert, options?.exportedAtIso);
+
   const pdfDoc = await PDFDocument.create();
+  pdfDoc.setTitle(
+    sanitizeWinAnsi(`Relatório Oficial de Conformidade SGIFR #${cert.shortCode}`)
+  );
+  pdfDoc.setAuthor('FaixaSegura — Sistema Auditável SGIFR');
+  pdfDoc.setSubject(
+    sanitizeWinAnsi(
+      `Selo Temporal UTC: ${sealMeta.issuedAtUtcIso} | SHA-256: ${sealMeta.sha256Hash}`
+    )
+  );
+  pdfDoc.setKeywords([
+    'SGIFR',
+    'DL 82/2021',
+    'Despacho 675/2026',
+    cert.shortCode,
+    sealMeta.timestampSealId,
+    sealMeta.sha256Hash,
+  ]);
+  pdfDoc.setCreationDate(new Date(sealMeta.issuedAtUtcIso));
+  pdfDoc.setModificationDate(new Date(sealMeta.exportedAtUtcIso));
+
   const fontReg = await pdfDoc.embedFont(StandardFonts.Helvetica);
   const fontBold = await pdfDoc.embedFont(StandardFonts.HelveticaBold);
   const fontMono = await pdfDoc.embedFont(StandardFonts.Courier);
@@ -68,37 +138,52 @@ export async function generateComplianceCertificatePdf(
   const { width, height } = p1.getSize();
 
   // Institutional Slate Header (#0F172A)
-  p1.drawRectangle({ x: 0, y: height - 78, width, height: 78, color: rgb(0.06, 0.09, 0.16) });
-  p1.drawRectangle({ x: 0, y: height - 82, width, height: 4, color: rgb(0.08, 0.33, 0.18) }); // Pine accent
+  p1.drawRectangle({ x: 0, y: height - 82, width, height: 82, color: rgb(0.06, 0.09, 0.16) });
+  p1.drawRectangle({ x: 0, y: height - 86, width, height: 4, color: rgb(0.08, 0.33, 0.18) }); // Pine accent
 
-  p1.drawText(sanitizeWinAnsi('FAIXASEGURA | REGISTO TÉCNICO AUDITÁVEL DE GESTÃO DE COMBUSTÍVEL (SGIFR)'), {
+  p1.drawText(sanitizeWinAnsi('FAIXASEGURA | RELATÓRIO OFICIAL AUDITÁVEL DE GESTÃO DE COMBUSTÍVEL (SGIFR)'), {
     x: 36,
-    y: height - 30,
-    size: 9,
+    y: height - 26,
+    size: 8.8,
     font: fontBold,
     color: rgb(0.29, 0.87, 0.5),
   });
-  p1.drawText(sanitizeWinAnsi('AUTO DIGITAL DE CONFORMIDADE PREVENTIVA'), {
+  p1.drawText(sanitizeWinAnsi('RELATÓRIO OFICIAL DE CONFORMIDADE PREVENTIVA'), {
     x: 36,
-    y: height - 50,
-    size: 15,
+    y: height - 46,
+    size: 14.5,
     font: fontBold,
     color: rgb(1, 1, 1),
   });
-  p1.drawText(sanitizeWinAnsi(`CERT: #${cert.shortCode}`), {
-    x: width - 175,
-    y: height - 48,
-    size: 11,
+  p1.drawText(sanitizeWinAnsi(`DOC: #${cert.shortCode}`), {
+    x: width - 180,
+    y: height - 45,
+    size: 10.5,
     font: fontMono,
     color: rgb(0.98, 0.8, 0.08),
   });
-  p1.drawText(sanitizeWinAnsi('Decreto-Lei n.º 82/2021 + Despacho n.º 675/2026, de 21 de janeiro'), {
-    x: 36,
-    y: height - 66,
-    size: 8.5,
-    font: fontReg,
-    color: rgb(0.75, 0.82, 0.9),
-  });
+  p1.drawText(
+    sanitizeWinAnsi(
+      `DL n.º 82/2021 + Despacho n.º 675/2026 | Selo Temporal UTC: ${sealMeta.issuedAtUtcIso}`
+    ),
+    {
+      x: 36,
+      y: height - 63,
+      size: 8,
+      font: fontReg,
+      color: rgb(0.75, 0.82, 0.9),
+    }
+  );
+  p1.drawText(
+    sanitizeWinAnsi(`SHA-256: ${sealMeta.sha256Hash}`),
+    {
+      x: 36,
+      y: height - 75,
+      size: 7.4,
+      font: fontMono,
+      color: rgb(0.56, 0.82, 0.98),
+    }
+  );
 
   let y = height - 108;
 
@@ -366,52 +451,126 @@ export async function generateComplianceCertificatePdf(
     }
   }
 
-  // Seal Box with QR Code & SHA-256
-  const sealY = 92;
+  // Seal Box with Explicit Cryptographic Timestamp Seal, Canonical Payload & SHA-256
+  const sealY = 64;
+  const sealH = 148;
   p2.drawRectangle({
     x: 36,
     y: sealY,
     width: width - 72,
-    height: 112,
+    height: sealH,
     color: rgb(0.94, 0.97, 1.0),
     borderColor: rgb(0.01, 0.52, 0.78),
     borderWidth: 1.2,
   });
-  p2.drawImage(qrImage, { x: 48, y: sealY + 12, width: 88, height: 88 });
-
-  p2.drawText(sanitizeWinAnsi('CERTIFICAÇÃO PÚBLICA IMUTÁVEL (AUTORIDADES GNR/SEPNA, CÂMARA E SEGURADORAS)'), {
-    x: 148,
-    y: sealY + 88,
-    size: 8.8,
+  p2.drawImage(qrImage, { x: 48, y: sealY + 28, width: 92, height: 92 });
+  p2.drawText(sanitizeWinAnsi('SCAN P/ AUDITORIA'), {
+    x: 52,
+    y: sealY + 14,
+    size: 7,
     font: fontBold,
     color: rgb(0.01, 0.4, 0.63),
   });
+
+  p2.drawText(
+    sanitizeWinAnsi('6. SELO DE TEMPO CRIPTOGRÁFICO & HASH SHA-256 DA APLICAÇÃO'),
+    {
+      x: 152,
+      y: sealY + 128,
+      size: 9,
+      font: fontBold,
+      color: rgb(0.01, 0.4, 0.63),
+    }
+  );
+  p2.drawText(
+    sanitizeWinAnsi(
+      `Selo de Tempo (Emissão UTC): ${sealMeta.issuedAtUtcIso} (${sealMeta.issuedAtLocalPt} PT)`
+    ),
+    {
+      x: 152,
+      y: sealY + 111,
+      size: 7.8,
+      font: fontMono,
+      color: rgb(0.06, 0.09, 0.16),
+    }
+  );
+  p2.drawText(
+    sanitizeWinAnsi(
+      `ID do Selo Temporal: ${sealMeta.timestampSealId}`
+    ),
+    {
+      x: 152,
+      y: sealY + 97,
+      size: 7.8,
+      font: fontMono,
+      color: rgb(0.08, 0.33, 0.18),
+    }
+  );
+  p2.drawText(
+    sanitizeWinAnsi(
+      `Relatório PDF Gerado em (UTC): ${sealMeta.exportedAtUtcIso}`
+    ),
+    {
+      x: 152,
+      y: sealY + 83,
+      size: 7.6,
+      font: fontMono,
+      color: rgb(0.25, 0.3, 0.38),
+    }
+  );
   p2.drawText(sanitizeWinAnsi(`URL de Verificação: ${verifyUrl}`), {
-    x: 148,
-    y: sealY + 70,
-    size: 8,
+    x: 152,
+    y: sealY + 69,
+    size: 7.6,
     font: fontMono,
     color: rgb(0.06, 0.09, 0.16),
   });
-  p2.drawText(sanitizeWinAnsi('Assinatura Canónica SHA-256:'), {
-    x: 148,
-    y: sealY + 52,
+  p2.drawText(sanitizeWinAnsi('Hash Criptográfico SHA-256 (64 hex):'), {
+    x: 152,
+    y: sealY + 53,
     size: 8,
     font: fontBold,
-    color: rgb(0.25, 0.3, 0.38),
+    color: rgb(0.06, 0.09, 0.16),
   });
-  p2.drawText(sanitizeWinAnsi(cert.sha256Hash), {
-    x: 148,
-    y: sealY + 38,
+  p2.drawText(sanitizeWinAnsi(sealMeta.sha256Hash), {
+    x: 152,
+    y: sealY + 39,
     size: 7.5,
     font: fontMono,
-    color: rgb(0.06, 0.09, 0.16),
+    color: rgb(0.01, 0.35, 0.58),
   });
   p2.drawText(
     sanitizeWinAnsi(
-      'Nota Jurídica: Prova documental privada de diligência preventiva georreferenciada. Não substitui vistoria oficial GTF/SEPNA.'
+      `Trama Canónica: ${sealMeta.canonicalPayload.slice(0, 74)}${
+        sealMeta.canonicalPayload.length > 74 ? '...' : ''
+      }`
     ),
-    { x: 148, y: sealY + 18, size: 7.2, font: fontReg, color: rgb(0.35, 0.4, 0.48) }
+    {
+      x: 152,
+      y: sealY + 25,
+      size: 6.9,
+      font: fontMono,
+      color: rgb(0.32, 0.37, 0.45),
+    }
+  );
+  p2.drawText(
+    sanitizeWinAnsi(
+      'Nota Jurídica: Relatório oficial privado de diligência preventiva georreferenciada (GNR/SEPNA, Câmara e Seguradora).'
+    ),
+    { x: 152, y: sealY + 11, size: 7, font: fontReg, color: rgb(0.35, 0.4, 0.48) }
+  );
+
+  p2.drawText(
+    sanitizeWinAnsi(
+      `Página 2 de 2 | Selo UTC: ${sealMeta.issuedAtUtcIso} | SHA-256: ${sealMeta.sha256Hash.slice(0, 24)}...`
+    ),
+    {
+      x: 36,
+      y: 26,
+      size: 7.8,
+      font: fontMono,
+      color: rgb(0.45, 0.5, 0.58),
+    }
   );
 
   return pdfDoc.save();

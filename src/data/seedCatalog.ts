@@ -367,7 +367,7 @@ export const INITIAL_CERTIFICATES: ComplianceCertificate[] = [
       },
     ],
     protectedSpeciesCheck: '2 exemplares de Sobreiro (Quercus suber) preservados sem mutilação (DL n.º 169/2001).',
-    sha256Hash: '9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08',
+    sha256Hash: '1e446e6c251fb1ead92cd113d1df7235d428d600690d5d1b7429261c375b92bb',
     issuedAt: '2026-05-24T17:05:00Z',
     spatialSnapshot: INITIAL_PARCELS[0].spatial,
   },

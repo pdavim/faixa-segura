@@ -137,17 +137,38 @@ test('Legal RAG assistant cites DL 169/2001 on cork oaks and Haversine computes 
   assert.ok(distSintraMafra > 18 && distSintraMafra < 25);
 });
 
-test('2-page A4 PDF generators produce valid PDF binaries with WinAnsi Portuguese accents', async () => {
+test('2-page A4 PDF generators produce valid PDF binaries with WinAnsi Portuguese accents, UTC timestamp seal, and SHA-256 hash', async () => {
+  const { PDFDocument } = await import('pdf-lib');
   const { INITIAL_CERTIFICATES, INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
-  const { generateComplianceCertificatePdf, generateNeighborComplaintPdf } = await import('./pdfTemplates.ts');
+  const {
+    buildCertificateSealMetadata,
+    generateComplianceCertificatePdf,
+    generateNeighborComplaintPdf,
+  } = await import('./pdfTemplates.ts');
 
-  const certBytes = await generateComplianceCertificatePdf(
-    INITIAL_CERTIFICATES[0],
-    'https://faixasegura.pt'
-  );
+  const seedCert = INITIAL_CERTIFICATES[0];
+  const exportIso = '2026-11-15T14:55:00.000Z';
+  const sealMeta = buildCertificateSealMetadata(seedCert, exportIso);
+  assert.ok(sealMeta.timestampSealId.startsWith('TS-UTC-'));
+  assert.equal(sealMeta.exportedAtUtcIso, exportIso);
+  assert.equal(sealMeta.sha256Hash.length, 64);
+
+  // Verify seedCert SHA-256 matches canonical payload
+  const expectedSeedHash = await computeSha256Hex(sealMeta.canonicalPayload);
+  assert.equal(seedCert.sha256Hash, expectedSeedHash);
+
+  const certBytes = await generateComplianceCertificatePdf(seedCert, 'https://faixasegura.pt', {
+    exportedAtIso: exportIso,
+  });
   assert.ok(certBytes.byteLength > 2500);
   const header = Buffer.from(certBytes.slice(0, 5)).toString('ascii');
   assert.equal(header, '%PDF-');
+
+  const parsedPdf = await PDFDocument.load(certBytes);
+  assert.equal(parsedPdf.getPageCount(), 2);
+  assert.ok(parsedPdf.getSubject()?.includes(seedCert.sha256Hash));
+  assert.ok(parsedPdf.getSubject()?.includes(sealMeta.issuedAtUtcIso));
+  assert.ok(parsedPdf.getKeywords()?.includes(sealMeta.timestampSealId));
 
   const parcel = INITIAL_PARCELS[0];
   const reqBytes = await generateNeighborComplaintPdf(
