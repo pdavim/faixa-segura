@@ -26,7 +26,6 @@ import {
   writeBatch,
   type Unsubscribe,
 } from 'firebase/firestore';
-import firebaseConfig from '../../firebase-applet-config.json';
 import type {
   ParcelRecord,
   PirLevel,
@@ -35,9 +34,46 @@ import type {
   UserHistoryRecord,
 } from '../types/domain.ts';
 
-const app = initializeApp(firebaseConfig);
-export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
-export const auth = getAuth(app);
+interface FirebaseAppletConfig {
+  projectId: string;
+  appId: string;
+  apiKey: string;
+  authDomain: string;
+  firestoreDatabaseId: string;
+  storageBucket?: string;
+  messagingSenderId?: string;
+  measurementId?: string;
+  oAuthClientId?: string;
+  recaptchaSiteKey?: string;
+}
+
+const bundledConfigs = import.meta.glob('../../firebase-applet-config.json', {
+  eager: true,
+  import: 'default',
+}) as Record<string, Partial<FirebaseAppletConfig>>;
+
+const fileConfig: Partial<FirebaseAppletConfig> = Object.values(bundledConfigs)[0] ?? {};
+const env = (import.meta.env ?? {}) as Record<string, string | undefined>;
+
+const firebaseConfig: FirebaseAppletConfig = {
+  projectId: env.VITE_FIREBASE_PROJECT_ID || fileConfig.projectId || 'demo-faixasegura',
+  appId: env.VITE_FIREBASE_APP_ID || fileConfig.appId || '1:000000000000:web:000000000000',
+  apiKey: env.VITE_FIREBASE_API_KEY || fileConfig.apiKey || '',
+  authDomain: env.VITE_FIREBASE_AUTH_DOMAIN || fileConfig.authDomain || 'localhost',
+  firestoreDatabaseId: env.VITE_FIREBASE_DATABASE_ID || fileConfig.firestoreDatabaseId || '(default)',
+  storageBucket: env.VITE_FIREBASE_STORAGE_BUCKET || fileConfig.storageBucket || '',
+  messagingSenderId: env.VITE_FIREBASE_MESSAGING_SENDER_ID || fileConfig.messagingSenderId || '',
+};
+
+export const isFirebaseConfigured = Boolean(firebaseConfig.apiKey);
+
+const app = isFirebaseConfigured ? initializeApp(firebaseConfig) : null;
+export const db = app
+  ? getFirestore(app, firebaseConfig.firestoreDatabaseId)
+  : (null as unknown as ReturnType<typeof getFirestore>);
+export const auth = app
+  ? getAuth(app)
+  : (null as unknown as ReturnType<typeof getAuth>);
 
 const googleProvider = new GoogleAuthProvider();
 googleProvider.setCustomParameters({ prompt: 'select_account' });
@@ -96,6 +132,7 @@ export function handleFirestoreError(
 
 // Validate connection to Firestore on boot per Firebase Integration specification
 async function testConnection(): Promise<void> {
+  if (!isFirebaseConfigured || !db) return;
   try {
     await getDocFromServer(doc(db, 'test', 'connection'));
   } catch (error) {
@@ -128,14 +165,29 @@ function sanitizeDico(raw: string | undefined): string {
   return digits.length === 4 ? digits : '1111';
 }
 
-export { onAuthStateChanged, type User };
+export function subscribeAuthState(
+  authInstance: typeof auth,
+  callback: (user: User | null) => void
+): Unsubscribe {
+  if (!isFirebaseConfigured || !authInstance) {
+    queueMicrotask(() => callback(null));
+    return () => {};
+  }
+  return onAuthStateChanged(authInstance, callback);
+}
+
+export { subscribeAuthState as onAuthStateChanged, type User };
 
 export async function signInWithGooglePopup(): Promise<User> {
+  if (!isFirebaseConfigured || !auth) {
+    throw new Error('Autenticação Google não configurada nesta instância Docker (defina VITE_FIREBASE_API_KEY).');
+  }
   const cred = await signInWithPopup(auth, googleProvider);
   return cred.user;
 }
 
 export async function signOutCurrentUser(): Promise<void> {
+  if (!isFirebaseConfigured || !auth) return;
   await signOut(auth);
 }
 
@@ -325,20 +377,105 @@ export async function recordUserHistoryEntry(input: CreateHistoryEntryInput): Pr
   }
 }
 
+export async function syncHistoryEntryToCloud(
+  uidRaw: string,
+  entry: UserHistoryRecord
+): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    throw new Error('Ligação Firestore indisponível (offline ou configuração ausente).');
+  }
+
+  const uid = sanitizeSafeId(uidRaw, 'usr');
+  const entryId = sanitizeSafeId(entry.id, 'hist');
+  const path = `users/${uid}/history/${entryId}`;
+  const entryRef = doc(db, 'users', uid, 'history', entryId);
+
+  let existingSnap;
+  try {
+    existingSnap = await getDoc(entryRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  if (existingSnap.exists()) {
+    return;
+  }
+
+  const payload = {
+    uid,
+    category: entry.category,
+    title: clampString(entry.title, 2, 140, 'Registo Operacional FaixaSegura'),
+    parcelId: sanitizeSafeId(entry.parcelId, 'parcel'),
+    parcelLabel: clampString(entry.parcelLabel, 1, 120, 'Terreno Registado'),
+    municipality: clampString(entry.municipality, 2, 80, 'Sintra'),
+    referenceCode: clampString(entry.referenceCode, 1, 64, entryId.slice(0, 16).toUpperCase()),
+    areaM2: Math.max(0, Math.min(100_000_000, Number(entry.areaM2) || 0)),
+    pirLevel: Math.max(1, Math.min(5, Math.round(Number(entry.pirLevel) || 2))),
+    soilMoisturePct: Math.max(
+      0,
+      Math.min(100, Number(Number(entry.soilMoisturePct || 22).toFixed(1)))
+    ),
+    summary: clampString(entry.summary, 2, 500, 'Registo guardado no histórico pessoal.'),
+    status: 'ACTIVE' as const,
+    createdAt: serverTimestamp(),
+    updatedAt: serverTimestamp(),
+  };
+
+  try {
+    await setDoc(entryRef, payload);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.CREATE, path);
+  }
+}
+
 export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    throw new Error('Ligação Firestore indisponível (offline ou configuração ausente).');
+  }
+
   const uid = sanitizeSafeId(uidRaw, 'usr');
   const parcelId = sanitizeSafeId(parcel.id, 'parcel');
   const path = `users/${uid}/parcels/${parcelId}`;
+  const parcelRef = doc(db, 'users', uid, 'parcels', parcelId);
+
+  let existingSnap;
+  try {
+    existingSnap = await getDoc(parcelRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  const label = clampString(parcel.label, 2, 120, 'Parcela BUPi');
+  const matrixArticle = clampString(parcel.matrixArticle, 1, 80, 'Rústico');
+  const bupiRggId = clampString(parcel.bupiRggId, 1, 40, 'RGG-LOCAL');
+  const hasEredesLine = Boolean(parcel.hasEredesLine);
+  const hasProtectedOaks = Boolean(parcel.hasProtectedOaks);
+
+  if (existingSnap.exists()) {
+    try {
+      await updateDoc(parcelRef, {
+        label,
+        matrixArticle,
+        bupiRggId,
+        hasEredesLine,
+        hasProtectedOaks,
+        updatedAt: serverTimestamp(),
+      });
+      return;
+    } catch (error) {
+      handleFirestoreError(error, OperationType.UPDATE, path);
+    }
+  }
 
   try {
-    await setDoc(doc(db, 'users', uid, 'parcels', parcelId), {
+    await setDoc(parcelRef, {
       uid,
       parcelId,
-      label: clampString(parcel.label, 2, 120, 'Parcela BUPi'),
+      label,
       municipality: clampString(parcel.municipality, 2, 80, 'Sintra'),
       dico: sanitizeDico(parcel.dico),
-      matrixArticle: clampString(parcel.matrixArticle, 1, 80, 'Rústico'),
-      bupiRggId: clampString(parcel.bupiRggId, 1, 40, 'RGG-LOCAL'),
+      matrixArticle,
+      bupiRggId,
       landClass: parcel.landClass,
       totalAreaM2: Math.max(1, Math.min(100_000_000, Number(parcel.spatial.totalAreaM2) || 1000)),
       mandatoryCleanAreaM2: Math.max(
@@ -346,8 +483,8 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
         Math.min(100_000_000, Number(parcel.spatial.mandatoryCleanAreaM2) || 0)
       ),
       avgSlopePct: Math.max(0, Math.min(100, Number(parcel.avgSlopePct) || 0)),
-      hasEredesLine: Boolean(parcel.hasEredesLine),
-      hasProtectedOaks: Boolean(parcel.hasProtectedOaks),
+      hasEredesLine,
+      hasProtectedOaks,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });
@@ -357,12 +494,28 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
 }
 
 export async function archiveUserHistoryEntry(uidRaw: string, entryIdRaw: string): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    throw new Error('Ligação Firestore indisponível (offline ou configuração ausente).');
+  }
+
   const uid = sanitizeSafeId(uidRaw, 'usr');
   const entryId = sanitizeSafeId(entryIdRaw, 'hist');
   const path = `users/${uid}/history/${entryId}`;
+  const entryRef = doc(db, 'users', uid, 'history', entryId);
+
+  let existingSnap;
+  try {
+    existingSnap = await getDoc(entryRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  if (!existingSnap.exists() || existingSnap.data()?.status === 'ARCHIVED') {
+    return;
+  }
 
   try {
-    await updateDoc(doc(db, 'users', uid, 'history', entryId), {
+    await updateDoc(entryRef, {
       status: 'ARCHIVED',
       updatedAt: serverTimestamp(),
     });
@@ -372,12 +525,28 @@ export async function archiveUserHistoryEntry(uidRaw: string, entryIdRaw: string
 }
 
 export async function deleteUserHistoryEntry(uidRaw: string, entryIdRaw: string): Promise<void> {
+  if (!isFirebaseConfigured || !db) {
+    throw new Error('Ligação Firestore indisponível (offline ou configuração ausente).');
+  }
+
   const uid = sanitizeSafeId(uidRaw, 'usr');
   const entryId = sanitizeSafeId(entryIdRaw, 'hist');
   const path = `users/${uid}/history/${entryId}`;
+  const entryRef = doc(db, 'users', uid, 'history', entryId);
+
+  let existingSnap;
+  try {
+    existingSnap = await getDoc(entryRef);
+  } catch (error) {
+    handleFirestoreError(error, OperationType.GET, path);
+  }
+
+  if (!existingSnap.exists()) {
+    return;
+  }
 
   try {
-    await deleteDoc(doc(db, 'users', uid, 'history', entryId));
+    await deleteDoc(entryRef);
   } catch (error) {
     handleFirestoreError(error, OperationType.DELETE, path);
   }

@@ -3,7 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-import React, { useEffect, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BookOpen,
   Download,
@@ -27,6 +27,7 @@ import type {
   PirLevel,
   QuoteLead,
   UserAccountProfile,
+  UserHistoryCategory,
   UserHistoryRecord,
 } from './types/domain.ts';
 import {
@@ -46,13 +47,22 @@ import {
   deleteUserHistoryEntry,
   ensureUserAnchorAndProfile,
   onAuthStateChanged,
-  recordUserHistoryEntry,
   saveUserParcelToCloud,
   signInWithGooglePopup,
   signOutCurrentUser,
   subscribeToUserHistory,
+  syncHistoryEntryToCloud,
   updateUserContactProfile,
 } from './lib/firebase.ts';
+import {
+  OFFLINE_LOCAL_UID,
+  OfflineSyncCoordinator,
+  buildLocalHistoryEntry,
+  createBrowserOfflineStorageAdapter,
+  mergeHistoryWithOffline,
+  mergeParcelsWithOffline,
+  type OfflineSyncOperation,
+} from './lib/offlineStorage.ts';
 import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall.ts';
 import { TodayCockpitView } from './components/TodayCockpitView.tsx';
 import { MapZonesView } from './components/MapZonesView.tsx';
@@ -126,17 +136,178 @@ export default function App() {
   const [verifyingCert, setVerifyingCert] = useState<ComplianceCertificate | null>(null);
   const [showIosInstallGuide, setShowIosInstallGuide] = useState(false);
 
-  // Firebase Auth + Consultable Personal History State
+  // Firebase Auth + Offline-Resilient History & Parcel Sync State
   const [authReady, setAuthReady] = useState<boolean>(false);
   const [userProfile, setUserProfile] = useState<UserAccountProfile | null>(null);
-  const [userHistory, setUserHistory] = useState<UserHistoryRecord[]>([]);
+  const [remoteHistory, setRemoteHistory] = useState<UserHistoryRecord[]>([]);
+  const [localHistory, setLocalHistory] = useState<UserHistoryRecord[]>([]);
+  const [outboxOps, setOutboxOps] = useState<OfflineSyncOperation[]>([]);
+  const [offlineParcelsCount, setOfflineParcelsCount] = useState<number>(0);
+  const [isSyncing, setIsSyncing] = useState<boolean>(false);
+  const [lastSyncedAtIso, setLastSyncedAtIso] = useState<string | null>(null);
+  const [storageBackend, setStorageBackend] = useState<'indexeddb' | 'localstorage' | 'memory'>('indexeddb');
   const [historySyncError, setHistorySyncError] = useState<string | null>(null);
   const [showHistoryModal, setShowHistoryModal] = useState<boolean>(false);
 
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
   const isOnline = useOnlineStatus();
 
+  const userUidRef = useRef<string | null>(null);
+  userUidRef.current = userProfile?.uid ?? null;
+
+  const syncCoordinator = useMemo(() => {
+    const storage = createBrowserOfflineStorageAdapter();
+    return new OfflineSyncCoordinator({
+      storage,
+      transport: {
+        saveParcel: saveUserParcelToCloud,
+        createHistory: syncHistoryEntryToCloud,
+        archiveHistory: archiveUserHistoryEntry,
+        deleteHistory: deleteUserHistoryEntry,
+        syncParcelToBackend: async (parcel) => {
+          await fetch('/api/parcels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              label: parcel.label,
+              dico: parcel.dico,
+              matrixArticle: parcel.matrixArticle,
+              hasProtectedOaks: parcel.hasProtectedOaks,
+              vertices: parcel.vertices,
+              landClass: parcel.landClass,
+              hasEredesLine: parcel.hasEredesLine,
+            }),
+          });
+        },
+      },
+    });
+  }, []);
+
+  const refreshOfflineMirror = useCallback(async () => {
+    const hydrated = await syncCoordinator.hydrateState();
+    setLocalHistory(hydrated.history);
+    setOutboxOps(hydrated.outbox);
+    setOfflineParcelsCount(hydrated.parcels.length);
+    setStorageBackend(syncCoordinator.getStorageBackend());
+    if (hydrated.parcels.length > 0) {
+      setParcels((prev) => mergeParcelsWithOffline(prev, hydrated.parcels));
+    }
+    return hydrated;
+  }, [syncCoordinator]);
+
+  const flushPendingToFirestore = useCallback(
+    async (explicitUid?: string | null) => {
+      const targetUid = explicitUid !== undefined ? explicitUid : userUidRef.current;
+      setIsSyncing(true);
+      try {
+        const res = await syncCoordinator.flushOutbox(targetUid);
+        if (res.lastSyncedAtIso) {
+          setLastSyncedAtIso(res.lastSyncedAtIso);
+        }
+        if (res.errorMessage) {
+          setHistorySyncError(res.errorMessage);
+        } else if (!res.offlineSkipped) {
+          setHistorySyncError(null);
+        }
+        await refreshOfflineMirror();
+      } finally {
+        setIsSyncing(false);
+      }
+    },
+    [syncCoordinator, refreshOfflineMirror]
+  );
+
+  const recordParcelOfflineFirst = useCallback(
+    async (created: ParcelRecord) => {
+      setParcels((prev) => mergeParcelsWithOffline(prev, [created]));
+      setActiveParcelId(created.id);
+      setIsSyncing(true);
+      try {
+        const { syncResult } = await syncCoordinator.recordParcel(created, userUidRef.current);
+        if (syncResult.lastSyncedAtIso) {
+          setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+        }
+        await refreshOfflineMirror();
+      } finally {
+        setIsSyncing(false);
+      }
+    },
+    [syncCoordinator, refreshOfflineMirror]
+  );
+
+  const recordHistoryOfflineFirst = useCallback(
+    async (params: {
+      category: UserHistoryCategory;
+      title: string;
+      parcelId: string;
+      parcelLabel: string;
+      municipality: string;
+      referenceCode: string;
+      areaM2: number;
+      pirLevel: PirLevel;
+      soilMoisturePct: number;
+      summary: string;
+    }) => {
+      const entry = buildLocalHistoryEntry({
+        ...params,
+        uid: userUidRef.current || OFFLINE_LOCAL_UID,
+      });
+      setIsSyncing(true);
+      try {
+        const { syncResult } = await syncCoordinator.recordHistoryCreation(
+          entry,
+          userUidRef.current
+        );
+        if (syncResult.lastSyncedAtIso) {
+          setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+        }
+        await refreshOfflineMirror();
+      } finally {
+        setIsSyncing(false);
+      }
+    },
+    [syncCoordinator, refreshOfflineMirror]
+  );
+
+  const displayedHistory = useMemo(
+    () =>
+      mergeHistoryWithOffline({
+        remoteItems: remoteHistory,
+        localItems: localHistory,
+        outbox: outboxOps,
+        activeUid: userProfile?.uid,
+      }),
+    [remoteHistory, localHistory, outboxOps, userProfile?.uid]
+  );
+
+  const activeHistoryCount = useMemo(
+    () => displayedHistory.filter((h) => h.status === 'ACTIVE').length,
+    [displayedHistory]
+  );
+
   const currentSoilMoisturePct = buildSevenDayPirSoilSeries(activeParcel, forecasts[0]).currentSoilMoisturePct;
+
+  // Hydrate offline IndexedDB / localStorage parcels, history, and outbox immediately on boot
+  useEffect(() => {
+    void refreshOfflineMirror();
+  }, [refreshOfflineMirror]);
+
+  // Automatically resume Firestore synchronization whenever connection returns or tab regains focus
+  useEffect(() => {
+    if (isOnline) {
+      void flushPendingToFirestore(userProfile?.uid ?? null);
+    }
+  }, [isOnline, userProfile?.uid, flushPendingToFirestore]);
+
+  useEffect(() => {
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine !== false) {
+        void flushPendingToFirestore(userUidRef.current);
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    return () => document.removeEventListener('visibilitychange', handleVisibility);
+  }, [flushPendingToFirestore]);
 
   // Listen to Firebase Auth state and attach real-time Firestore listener only when authenticated
   useEffect(() => {
@@ -150,7 +321,7 @@ export default function App() {
 
       if (!fbUser) {
         setUserProfile(null);
-        setUserHistory([]);
+        setRemoteHistory([]);
         setHistorySyncError(null);
         setAuthReady(true);
         return;
@@ -160,12 +331,16 @@ export default function App() {
         const hydrated = await ensureUserAnchorAndProfile(fbUser, activeParcel.dico);
         setUserProfile(hydrated);
         setAuthReady(true);
+        void flushPendingToFirestore(hydrated.uid);
 
         unsubscribeHistory = subscribeToUserHistory(
           hydrated.uid,
           (items) => {
-            setUserHistory(items);
+            setRemoteHistory(items);
             setHistorySyncError(null);
+            void syncCoordinator
+              .cacheRemoteHistorySnapshot(items)
+              .then(() => refreshOfflineMirror());
           },
           (errMsg) => setHistorySyncError(errMsg)
         );
@@ -178,7 +353,7 @@ export default function App() {
       unsubscribeAuth();
       if (unsubscribeHistory) unsubscribeHistory();
     };
-  }, []);
+  }, [syncCoordinator, refreshOfflineMirror, flushPendingToFirestore]);
 
   // Sync dark mode class on <html>
   useEffect(() => {
@@ -190,14 +365,17 @@ export default function App() {
     }
   }, [darkMode]);
 
-  // Hydrate live backend state and check ?verify= query param
+  // Hydrate live backend state and check ?verify= query param while preserving offline-created parcels
   useEffect(() => {
     fetch('/api/state')
       .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
+      .then(async (data) => {
         if (!data) return;
+        const offlineState = await syncCoordinator.hydrateState();
         if (Array.isArray(data.municipalities)) setMunicipalities(data.municipalities);
-        if (Array.isArray(data.parcels) && data.parcels.length > 0) setParcels(data.parcels);
+        if (Array.isArray(data.parcels) && data.parcels.length > 0) {
+          setParcels(mergeParcelsWithOffline(data.parcels, offlineState.parcels));
+        }
         if (Array.isArray(data.certificates)) setCertificates(data.certificates);
         if (Array.isArray(data.providers)) setProviders(data.providers);
         if (Array.isArray(data.quotes)) setQuotes(data.quotes);
@@ -212,11 +390,22 @@ export default function App() {
         }
       })
       .catch(() => {});
-  }, []);
+  }, [syncCoordinator]);
 
-  // Fetch PIR 3-day semaphore and Active Fires whenever activeParcel changes
+  // Fetch PIR 3-day semaphore and Active Fires whenever activeParcel changes or connection returns
   useEffect(() => {
     setForecasts(buildInitialForecasts(activeParcel.dico));
+    const c = activeParcel.spatial.centroidWgs84;
+
+    if (!isOnline) {
+      const localFires = FALLBACK_ACTIVE_FIRES.map((f) => ({
+        ...f,
+        distanceKm: haversineDistanceKm(c, { lat: f.lat, lon: f.lon }),
+      }));
+      setFires(localFires);
+      setWithin15KmCount(localFires.filter((f) => f.distanceKm <= 15).length);
+      return;
+    }
 
     fetch(`/api/pir/${encodeURIComponent(activeParcel.dico)}`)
       .then((r) => (r.ok ? r.json() : null))
@@ -228,7 +417,6 @@ export default function App() {
       })
       .catch(() => {});
 
-    const c = activeParcel.spatial.centroidWgs84;
     fetch(`/api/fires/active?lat=${c.lat}&lon=${c.lon}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
@@ -238,7 +426,7 @@ export default function App() {
         }
       })
       .catch(() => {});
-  }, [activeParcel.id, activeParcel.dico]);
+  }, [activeParcel.id, activeParcel.dico, isOnline]);
 
   const handleNavigate = (tab: NavTab, subMode?: string) => {
     setActiveTab(tab);
@@ -379,7 +567,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowHistoryModal(true)}
-                className={`min-h-[42px] px-3 py-1.5 rounded-xl border text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap ${
+                className={`min-h-[42px] px-3 py-1.5 rounded-xl border text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap tabular-nums ${
                   userProfile
                     ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D]/10 dark:bg-[#22C55E]/15 text-[#14532D] dark:text-[#22C55E]'
                     : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
@@ -387,7 +575,11 @@ export default function App() {
               >
                 <History className="w-3.5 h-3.5" aria-hidden="true" />
                 {userProfile
-                  ? `Histórico (${userHistory.filter((h) => h.status === 'ACTIVE').length}) · ${userProfile.displayName.split(' ')[0]}`
+                  ? `Histórico (${activeHistoryCount}) · ${userProfile.displayName.split(' ')[0]}${
+                      outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''
+                    }`
+                  : activeHistoryCount > 0 || outboxOps.length > 0
+                  ? `Histórico (${activeHistoryCount})${outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''}`
                   : 'Entrar / Histórico'}
               </button>
 
@@ -435,11 +627,17 @@ export default function App() {
         </div>
       </div>
 
-      {/* Offline Mode Indicator */}
+      {/* Offline Mode Indicator with IndexedDB / Outbox Telemetry */}
       {!isOnline && (
-        <div className="bg-amber-500 text-slate-950 text-xs font-semibold px-4 py-2 text-center flex items-center justify-center gap-2">
-          <WifiOff className="w-4 h-4" aria-hidden="true" />
-          Modo Offline no Terreno — A utilizar polígonos e matriz legal em cache local.
+        <div
+          role="status"
+          data-testid="offline-banner"
+          className="bg-amber-500 text-slate-950 text-xs font-semibold px-4 py-2 text-center flex flex-wrap items-center justify-center gap-x-2 gap-y-1 tabular-nums"
+        >
+          <WifiOff className="w-4 h-4 shrink-0" aria-hidden="true" />
+          <span>
+            Modo Offline no Terreno ({storageBackend === 'indexeddb' ? 'IndexedDB' : 'localStorage'}) — {parcels.length} terrenos ({offlineParcelsCount} personalizados) · {outboxOps.length} operação(ões) em fila para sincronização automática com Firestore.
+          </span>
         </div>
       )}
 
@@ -455,9 +653,7 @@ export default function App() {
             isAuthenticated={Boolean(userProfile)}
             onOpenHistoryModal={() => setShowHistoryModal(true)}
             onLogDecisionToHistory={async ({ pirLevel, soilMoisturePct, verdictLabel, detail }) => {
-              if (!userProfile) return;
-              await recordUserHistoryEntry({
-                uid: userProfile.uid,
+              await recordHistoryOfflineFirst({
                 category: 'INTERVENTION',
                 title: verdictLabel,
                 parcelId: activeParcel.id,
@@ -482,24 +678,19 @@ export default function App() {
             fires={fires}
             onSelectParcel={(id) => setActiveParcelId(id)}
             onCreateParcel={(created) => {
-              setParcels((prev) => [created, ...prev]);
-              setActiveParcelId(created.id);
-              if (userProfile) {
-                void saveUserParcelToCloud(userProfile.uid, created).catch(() => {});
-                void recordUserHistoryEntry({
-                  uid: userProfile.uid,
-                  category: 'PARCEL',
-                  title: `Terreno registado: ${created.label}`,
-                  parcelId: created.id,
-                  parcelLabel: created.label,
-                  municipality: created.municipality,
-                  referenceCode: created.bupiRggId,
-                  areaM2: created.spatial.mandatoryCleanAreaM2,
-                  pirLevel: forecasts[0]?.pirLevel ?? 2,
-                  soilMoisturePct: currentSoilMoisturePct,
-                  summary: `Área total ${created.spatial.totalAreaM2.toFixed(0)} m² · Limpeza exigível ${created.spatial.mandatoryCleanAreaM2.toFixed(0)} m² (${created.matrixArticle}).`,
-                }).catch(() => {});
-              }
+              void recordParcelOfflineFirst(created);
+              void recordHistoryOfflineFirst({
+                category: 'PARCEL',
+                title: `Terreno registado: ${created.label}`,
+                parcelId: created.id,
+                parcelLabel: created.label,
+                municipality: created.municipality,
+                referenceCode: created.bupiRggId,
+                areaM2: created.spatial.mandatoryCleanAreaM2,
+                pirLevel: forecasts[0]?.pirLevel ?? 2,
+                soilMoisturePct: currentSoilMoisturePct,
+                summary: `Área total ${created.spatial.totalAreaM2.toFixed(0)} m² · Limpeza exigível ${created.spatial.mandatoryCleanAreaM2.toFixed(0)} m² (${created.matrixArticle}).`,
+              });
             }}
             onNavigateTab={handleNavigate}
           />
@@ -515,56 +706,47 @@ export default function App() {
             initialSubMode={certifySubMode}
             onCertificateIssued={(cert) => {
               setCertificates((prev) => [cert, ...prev]);
-              if (userProfile) {
-                void recordUserHistoryEntry({
-                  uid: userProfile.uid,
-                  category: 'CERTIFICATE',
-                  title: `Auto SHA-256 Emitido (${cert.shortCode})`,
-                  parcelId: cert.parcelId,
-                  parcelLabel: cert.parcelLabel,
-                  municipality: cert.municipality,
-                  referenceCode: cert.shortCode,
-                  areaM2: cert.cleanedAreaM2,
-                  pirLevel: cert.pirLevelAtWork,
-                  soilMoisturePct: currentSoilMoisturePct,
-                  summary: `Certificado criptográfico SHA-256 (${cert.sha256Hash.slice(0, 16)}...) para ${cert.ownerName}.`,
-                }).catch(() => {});
-              }
+              void recordHistoryOfflineFirst({
+                category: 'CERTIFICATE',
+                title: `Auto SHA-256 Emitido (${cert.shortCode})`,
+                parcelId: cert.parcelId,
+                parcelLabel: cert.parcelLabel,
+                municipality: cert.municipality,
+                referenceCode: cert.shortCode,
+                areaM2: cert.cleanedAreaM2,
+                pirLevel: cert.pirLevelAtWork,
+                soilMoisturePct: currentSoilMoisturePct,
+                summary: `Certificado criptográfico SHA-256 (${cert.sha256Hash.slice(0, 16)}...) para ${cert.ownerName}.`,
+              });
             }}
             onQuoteCreated={(lead) => {
               setQuotes((prev) => [lead, ...prev]);
-              if (userProfile) {
-                void recordUserHistoryEntry({
-                  uid: userProfile.uid,
-                  category: 'QUOTE',
-                  title: `Pedido de 3 Orçamentos (${lead.estimatedBudgetRange})`,
-                  parcelId: lead.parcelId,
-                  parcelLabel: lead.parcelLabel,
-                  municipality: lead.municipality,
-                  referenceCode: lead.id.toUpperCase().slice(0, 18),
-                  areaM2: lead.mandatoryCleanAreaM2,
-                  pirLevel: forecasts[0]?.pirLevel ?? 2,
-                  soilMoisturePct: currentSoilMoisturePct,
-                  summary: `Janela preferencial: ${lead.preferredWindow} · Declive ${lead.avgSlopePct}% · ${lead.matchedProvidersCount} empresas notificadas.`,
-                }).catch(() => {});
-              }
+              void recordHistoryOfflineFirst({
+                category: 'QUOTE',
+                title: `Pedido de 3 Orçamentos (${lead.estimatedBudgetRange})`,
+                parcelId: lead.parcelId,
+                parcelLabel: lead.parcelLabel,
+                municipality: lead.municipality,
+                referenceCode: lead.id.toUpperCase().slice(0, 18),
+                areaM2: lead.mandatoryCleanAreaM2,
+                pirLevel: forecasts[0]?.pirLevel ?? 2,
+                soilMoisturePct: currentSoilMoisturePct,
+                summary: `Janela preferencial: ${lead.preferredWindow} · Declive ${lead.avgSlopePct}% · ${lead.matchedProvidersCount} empresas notificadas.`,
+              });
             }}
             onNeighborComplaintCreated={(rec: NeighborComplaintRecord) => {
-              if (userProfile) {
-                void recordUserHistoryEntry({
-                  uid: userProfile.uid,
-                  category: 'NEIGHBOR',
-                  title: `Dossiê Vizinho Incumpridor (${rec.reqCode})`,
-                  parcelId: rec.parcelId,
-                  parcelLabel: activeParcel.label,
-                  municipality: rec.municipality,
-                  referenceCode: rec.reqCode,
-                  areaM2: activeParcel.spatial.mandatoryCleanAreaM2,
-                  pirLevel: forecasts[0]?.pirLevel ?? 3,
-                  soilMoisturePct: currentSoilMoisturePct,
-                  summary: `Confrontação ${rec.confrontationSide} a ${rec.minDistanceFacadeM.toFixed(1)} m da fachada · NDVI ${rec.neighborNdvi.toFixed(2)}.`,
-                }).catch(() => {});
-              }
+              void recordHistoryOfflineFirst({
+                category: 'NEIGHBOR',
+                title: `Dossiê Vizinho Incumpridor (${rec.reqCode})`,
+                parcelId: rec.parcelId,
+                parcelLabel: activeParcel.label,
+                municipality: rec.municipality,
+                referenceCode: rec.reqCode,
+                areaM2: activeParcel.spatial.mandatoryCleanAreaM2,
+                pirLevel: forecasts[0]?.pirLevel ?? 3,
+                soilMoisturePct: currentSoilMoisturePct,
+                summary: `Confrontação ${rec.confrontationSide} a ${rec.minDistanceFacadeM.toFixed(1)} m da fachada · NDVI ${rec.neighborNdvi.toFixed(2)}.`,
+              });
             }}
             onInspectCertificate={(cert) => setVerifyingCert(cert)}
           />
@@ -670,11 +852,19 @@ export default function App() {
         onClose={() => setShowHistoryModal(false)}
         authReady={authReady}
         profile={userProfile}
-        historyItems={userHistory}
+        historyItems={displayedHistory}
         activeParcel={activeParcel}
         todayForecast={forecasts[0]}
         currentSoilMoisturePct={currentSoilMoisturePct}
         syncError={historySyncError}
+        isOnline={isOnline}
+        pendingSyncCount={outboxOps.length}
+        isSyncing={isSyncing}
+        lastSyncedAtIso={lastSyncedAtIso}
+        storageBackend={storageBackend}
+        onManualSync={async () => {
+          await flushPendingToFirestore(userProfile?.uid ?? null);
+        }}
         onSignInGoogle={async () => {
           await signInWithGooglePopup();
         }}
@@ -696,9 +886,7 @@ export default function App() {
           );
         }}
         onCreateIntervention={async ({ title, summary, pirLevel, soilMoisturePct }: { title: string; summary: string; pirLevel: PirLevel; soilMoisturePct: number }) => {
-          if (!userProfile) return;
-          await recordUserHistoryEntry({
-            uid: userProfile.uid,
+          await recordHistoryOfflineFirst({
             category: 'INTERVENTION',
             title,
             parcelId: activeParcel.id,
@@ -712,12 +900,34 @@ export default function App() {
           });
         }}
         onArchiveEntry={async (entryId) => {
-          if (!userProfile) return;
-          await archiveUserHistoryEntry(userProfile.uid, entryId);
+          setIsSyncing(true);
+          try {
+            const { syncResult } = await syncCoordinator.recordHistoryArchive(
+              entryId,
+              userProfile?.uid ?? null
+            );
+            if (syncResult.lastSyncedAtIso) {
+              setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+            }
+            await refreshOfflineMirror();
+          } finally {
+            setIsSyncing(false);
+          }
         }}
         onDeleteEntry={async (entryId) => {
-          if (!userProfile) return;
-          await deleteUserHistoryEntry(userProfile.uid, entryId);
+          setIsSyncing(true);
+          try {
+            const { syncResult } = await syncCoordinator.recordHistoryDelete(
+              entryId,
+              userProfile?.uid ?? null
+            );
+            if (syncResult.lastSyncedAtIso) {
+              setLastSyncedAtIso(syncResult.lastSyncedAtIso);
+            }
+            await refreshOfflineMirror();
+          } finally {
+            setIsSyncing(false);
+          }
         }}
       />
 

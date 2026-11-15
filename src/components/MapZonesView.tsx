@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
 import L from 'leaflet';
 import {
+  Check,
+  Download,
   FileText,
   Layers,
   MapPin,
@@ -17,7 +19,15 @@ import type {
   MunicipalityInfo,
   ParcelRecord,
 } from '../types/domain.ts';
-import { computePolygonMetrics3763 } from '../lib/spatialEngine.ts';
+import {
+  buildParcelGeoJsonFilename,
+  buildParcelVerticesGeoJson,
+  computePolygonMetrics3763,
+} from '../lib/spatialEngine.ts';
+import {
+  buildLocalParcelRecord,
+  extractCadernetaOffline,
+} from '../lib/offlineParcelBuilder.ts';
 
 interface MapZonesViewProps {
   parcels: ParcelRecord[];
@@ -61,10 +71,16 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   const [savingParcel, setSavingParcel] = useState(false);
   const [drawError, setDrawError] = useState<string | null>(null);
 
-  // Caderneta Predial extraction state
+  // Caderneta Predial extraction & GIS export state
   const [cadernetaText, setCadernetaText] = useState('');
   const [extractingCaderneta, setExtractingCaderneta] = useState(false);
   const [selectedZoneCallout, setSelectedZoneCallout] = useState<string | null>(null);
+  const [exportedGeoJsonNotice, setExportedGeoJsonNotice] = useState<{
+    parcelId: string;
+    filename: string;
+    vertexCount: number;
+    exportedAtTime: string;
+  } | null>(null);
 
   const mapToolModeRef = useRef(mapToolMode);
   mapToolModeRef.current = mapToolMode;
@@ -324,26 +340,48 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
 
     setSavingParcel(true);
     try {
-      const res = await fetch('/api/parcels', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
+      let createdParcel: ParcelRecord | null = null;
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+
+      if (isBrowserOnline) {
+        try {
+          const res = await fetch('/api/parcels', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              label: newParcelLabel.trim(),
+              dico: newParcelDico,
+              vertices: drawnVertices,
+              landClass: newParcelLandClass,
+              hasEredesLine: newParcelEredes,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            setDrawError(data.error || 'Erro ao guardar terreno.');
+            return;
+          }
+          createdParcel = data as ParcelRecord;
+        } catch {
+          // Network unreachable — fall back to deterministic client-side EPSG:3763 engine
+        }
+      }
+
+      if (!createdParcel) {
+        createdParcel = buildLocalParcelRecord({
           label: newParcelLabel.trim(),
           dico: newParcelDico,
           vertices: drawnVertices,
           landClass: newParcelLandClass,
           hasEredesLine: newParcelEredes,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setDrawError(data.error || 'Erro ao guardar terreno.');
-      } else {
-        onCreateParcel(data);
-        setDrawnVertices([]);
-        setNewParcelLabel('');
-        setMapToolMode('INSPECT');
+          municipalities,
+        });
       }
+
+      onCreateParcel(createdParcel);
+      setDrawnVertices([]);
+      setNewParcelLabel('');
+      setMapToolMode('INSPECT');
     } finally {
       setSavingParcel(false);
     }
@@ -358,36 +396,90 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     setDrawError(null);
     setExtractingCaderneta(true);
     try {
-      const res = await fetch('/api/ai/caderneta', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rawText }),
-      });
-      const extracted = await res.json();
-      if (res.ok) {
-        const createRes = await fetch('/api/parcels', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            label: extracted.suggestedLabel,
-            dico: extracted.dico,
-            matrixArticle: extracted.matrixArticle,
-            hasProtectedOaks: extracted.hasProtectedOaks,
-            vertices: extracted.vertices,
-            landClass: 'FOREST_SCRUB',
-            hasEredesLine: true,
-          }),
-        });
-        if (createRes.ok) {
-          const created = await createRes.json();
-          onCreateParcel(created);
-          setCadernetaText('');
-          setMapToolMode('INSPECT');
+      let createdParcel: ParcelRecord | null = null;
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+
+      if (isBrowserOnline) {
+        try {
+          const res = await fetch('/api/ai/caderneta', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ rawText }),
+          });
+          if (res.ok) {
+            const extracted = await res.json();
+            const createRes = await fetch('/api/parcels', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                label: extracted.suggestedLabel,
+                dico: extracted.dico,
+                matrixArticle: extracted.matrixArticle,
+                hasProtectedOaks: extracted.hasProtectedOaks,
+                vertices: extracted.vertices,
+                landClass: 'FOREST_SCRUB',
+                hasEredesLine: true,
+              }),
+            });
+            if (createRes.ok) {
+              createdParcel = (await createRes.json()) as ParcelRecord;
+            }
+          }
+        } catch {
+          // Network unreachable — fall back to offline Caderneta parser + EPSG:3763 engine
         }
       }
+
+      if (!createdParcel) {
+        const offlineExtracted = extractCadernetaOffline(rawText, municipalities);
+        createdParcel = buildLocalParcelRecord({
+          label: offlineExtracted.suggestedLabel,
+          dico: offlineExtracted.dico,
+          matrixArticle: offlineExtracted.matrixArticle,
+          hasProtectedOaks: offlineExtracted.hasProtectedOaks,
+          vertices: offlineExtracted.vertices,
+          landClass: 'FOREST_SCRUB',
+          hasEredesLine: true,
+          municipalities,
+        });
+      }
+
+      onCreateParcel(createdParcel);
+      setCadernetaText('');
+      setMapToolMode('INSPECT');
     } finally {
       setExtractingCaderneta(false);
     }
+  };
+
+  const activeVertexCount =
+    activeParcel.vertices.length >= 3
+      ? activeParcel.vertices.length
+      : activeParcel.spatial.polygons.parcel.length;
+
+  const handleExportParcelGeoJson = () => {
+    const exportedAtIso = new Date().toISOString();
+    const geoJsonContent = buildParcelVerticesGeoJson(activeParcel, exportedAtIso);
+    const filename = buildParcelGeoJsonFilename(activeParcel);
+
+    const blob = new Blob([geoJsonContent], {
+      type: 'application/geo+json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+
+    setExportedGeoJsonNotice({
+      parcelId: activeParcel.id,
+      filename,
+      vertexCount: activeVertexCount,
+      exportedAtTime: exportedAtIso.slice(11, 19) + ' UTC',
+    });
   };
 
   return (
@@ -717,6 +809,13 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   </option>
                 ))}
               </select>
+              <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                <span>{activeVertexCount} vértices WGS84</span>
+                <span aria-hidden="true"> · </span>
+                <span>Perímetro {activeParcel.spatial.perimeterM.toFixed(1)} m</span>
+                <span aria-hidden="true"> · </span>
+                <span>Área total {activeParcel.spatial.totalAreaM2.toFixed(0)} m²</span>
+              </p>
             </div>
 
             <div className="divide-y divide-slate-200 dark:divide-[#263248] text-xs">
@@ -814,18 +913,59 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
               </div>
             )}
 
+            <div className="pt-3 border-t border-slate-200 dark:border-[#263248] space-y-2.5">
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    Interoperabilidade SIG / BUPi
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
+                    <span>{activeVertexCount} vértices + polígono RFC 7946</span>
+                    <span aria-hidden="true"> · </span>
+                    <span>QGIS / ArcGIS / PostGIS</span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleExportParcelGeoJson}
+                  className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-slate-50 hover:bg-slate-100 dark:bg-[#0B0F17] dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
+                >
+                  <Download
+                    className="w-4 h-4 text-[#14532D] dark:text-[#22C55E] shrink-0"
+                    aria-hidden="true"
+                  />
+                  Export GeoJSON
+                </button>
+              </div>
+
+              {exportedGeoJsonNotice?.parcelId === activeParcel.id && (
+                <p
+                  role="status"
+                  aria-live="polite"
+                  className="text-xs text-[#14532D] dark:text-[#4ADE80] flex items-center gap-1.5 tabular-nums"
+                >
+                  <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span className="truncate">
+                    Transferido: <span className="font-mono">{exportedGeoJsonNotice.filename}</span>
+                    {' · '}
+                    {exportedGeoJsonNotice.vertexCount} vértices ({exportedGeoJsonNotice.exportedAtTime})
+                  </span>
+                </p>
+              )}
+            </div>
+
             <div className="pt-2 grid grid-cols-1 sm:grid-cols-2 gap-2.5">
               <button
                 type="button"
                 onClick={() => onNavigateTab('certify', 'certificate')}
-                className="min-h-[44px] px-3.5 py-2 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:text-slate-950 text-white text-xs font-semibold transition-colors"
+                className="min-h-[44px] px-3.5 py-2 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:text-slate-950 text-white text-xs font-semibold transition-colors whitespace-nowrap"
               >
                 Certificar Limpeza SHA-256
               </button>
               <button
                 type="button"
                 onClick={() => onNavigateTab('certify', 'quotes')}
-                className="min-h-[44px] px-3.5 py-2 rounded-xl bg-[#D97706] hover:bg-[#B45309] text-white text-xs font-semibold transition-colors"
+                className="min-h-[44px] px-3.5 py-2 rounded-xl bg-[#D97706] hover:bg-[#B45309] text-white text-xs font-semibold transition-colors whitespace-nowrap"
               >
                 Pedir 3 Orçamentos ({activeParcel.spatial.mandatoryCleanAreaM2.toFixed(0)} m²)
               </button>

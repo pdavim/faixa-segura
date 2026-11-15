@@ -32,6 +32,10 @@ import {
   computeSha256Hex,
 } from '../lib/pirRules.ts';
 import { azimuthCardinalLabel } from '../lib/spatialEngine.ts';
+import {
+  buildLocalNeighborComplaint,
+  buildLocalQuoteLead,
+} from '../lib/offlineParcelBuilder.ts';
 
 interface CertifyQuotesViewProps {
   activeParcel: ParcelRecord;
@@ -283,7 +287,11 @@ export const CertifyQuotesView: React.FC<CertifyQuotesViewProps> = ({
       ];
 
       let issuedCert: ComplianceCertificate | null = null;
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
       try {
+        if (!isBrowserOnline) {
+          throw new Error('offline');
+        }
         const res = await fetch('/api/certificates', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -371,24 +379,45 @@ export const CertifyQuotesView: React.FC<CertifyQuotesViewProps> = ({
 
     setSubmittingQuote(true);
     try {
-      const res = await fetch('/api/quotes', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parcelId: activeParcel.id,
+      let lead: QuoteLead | null = null;
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+
+      if (isBrowserOnline) {
+        try {
+          const res = await fetch('/api/quotes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              parcelId: activeParcel.id,
+              ownerName: quoteName.trim(),
+              ownerPhone: quotePhone.trim(),
+              preferredWindow: quoteWindow,
+              includeDebrisRemoval: includeDebris,
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            setQuoteError(data.error || 'Erro ao submeter pedido de orçamento.');
+            return;
+          }
+          lead = data as QuoteLead;
+        } catch {
+          // Offline fallback
+        }
+      }
+
+      if (!lead) {
+        lead = buildLocalQuoteLead({
+          parcel: activeParcel,
           ownerName: quoteName.trim(),
           ownerPhone: quotePhone.trim(),
           preferredWindow: quoteWindow,
           includeDebrisRemoval: includeDebris,
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setQuoteError(data.error || 'Erro ao submeter pedido de orçamento.');
-      } else {
-        setCreatedQuote(data);
-        onQuoteCreated(data);
+        });
       }
+
+      setCreatedQuote(lead);
+      onQuoteCreated(lead);
     } finally {
       setSubmittingQuote(false);
     }
@@ -404,25 +433,48 @@ export const CertifyQuotesView: React.FC<CertifyQuotesViewProps> = ({
 
     setGeneratingPetition(true);
     try {
-      const res = await fetch('/api/neighbor-complaints', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          parcelId: activeParcel.id,
+      let record: NeighborComplaintRecord | null = null;
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+
+      if (isBrowserOnline) {
+        try {
+          const res = await fetch('/api/neighbor-complaints', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              parcelId: activeParcel.id,
+              complainantName: compName.trim(),
+              complainantNif: compNif.trim(),
+              complainantAddress: compAddress.trim() || `${activeParcel.parish}, ${activeParcel.municipality}`,
+              complainantPhone: compPhone.trim() || '912 345 678',
+              complainantEmail: compEmail.trim() || 'requerente@faixasegura.pt',
+            }),
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            setCompError(data.error || 'Erro ao gerar requerimento municipal.');
+            return;
+          }
+          record = data.record as NeighborComplaintRecord;
+        } catch {
+          // Offline fallback
+        }
+      }
+
+      if (!record) {
+        record = buildLocalNeighborComplaint({
+          parcel: activeParcel,
           complainantName: compName.trim(),
           complainantNif: compNif.trim(),
           complainantAddress: compAddress.trim() || `${activeParcel.parish}, ${activeParcel.municipality}`,
           complainantPhone: compPhone.trim() || '912 345 678',
           complainantEmail: compEmail.trim() || 'requerente@faixasegura.pt',
-        }),
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setCompError(data.error || 'Erro ao gerar requerimento municipal.');
-      } else {
-        setCreatedPetition(data.record);
-        onNeighborComplaintCreated?.(data.record);
+          ownCertRef: latestIssuedCert?.shortCode,
+        });
       }
+
+      setCreatedPetition(record);
+      onNeighborComplaintCreated?.(record);
     } finally {
       setGeneratingPetition(false);
     }

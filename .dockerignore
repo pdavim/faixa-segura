@@ -1,0 +1,12 @@
+node_modules
+dist
+dev-dist
+coverage
+.git
+.gitignore
+.playwright-cli
+.aistudio
+*.log
+.env
+.env.*
+!.env.example

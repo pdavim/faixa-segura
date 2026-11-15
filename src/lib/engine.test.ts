@@ -290,5 +290,294 @@ test('buildRegionalThirtyDayIncidents builds 6 regional municipalities, conserve
   assert.ok(leiriaSummary.points.some((p) => p.municipality === 'Pombal'));
 });
 
+test('Docker & Dokploy deployment manifests include valid package-lock.json, resilient Dockerfile npm install fallback, and multi-arch compose setup', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const rootDir = process.cwd();
 
+  const pkg = JSON.parse(fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8')) as {
+    dependencies: Record<string, string>;
+    devDependencies: Record<string, string>;
+  };
+  const lock = JSON.parse(fs.readFileSync(path.join(rootDir, 'package-lock.json'), 'utf8')) as {
+    lockfileVersion: number;
+    packages?: Record<string, { dependencies?: Record<string, string>; devDependencies?: Record<string, string> }>;
+  };
+
+  assert.ok(lock.lockfileVersion >= 2, 'Expected lockfileVersion >= 2 for npm ci');
+  const rootLockEntry = lock.packages?.[''];
+  assert.ok(rootLockEntry, 'Expected root package entry in package-lock.json');
+  assert.deepEqual(rootLockEntry.dependencies, pkg.dependencies);
+  assert.deepEqual(rootLockEntry.devDependencies, pkg.devDependencies);
+
+  const dockerfile = fs.readFileSync(path.join(rootDir, 'Dockerfile'), 'utf8');
+  assert.ok(dockerfile.includes('NPM_CONFIG_LEGACY_PEER_DEPS=true'), 'Dockerfile should enforce legacy-peer-deps without requiring .npmrc');
+  assert.ok(dockerfile.includes('if [ -f package-lock.json ]'), 'Dockerfile should guard missing package-lock.json');
+  assert.ok(dockerfile.includes('npm ci --include=dev'), 'Dockerfile should include devDependencies for vite build');
+  assert.ok(dockerfile.includes('npm install --include=dev'), 'Dockerfile should fallback to npm install if lockfile is absent');
+  assert.ok(dockerfile.includes('ARG VITE_FIREBASE_API_KEY'), 'Dockerfile should accept Vite Firebase build args from Dokploy .env');
+  assert.ok(dockerfile.includes('./node_modules/.bin/tsx'), 'Dockerfile CMD should run server.ts via tsx');
+
+  const dockerignore = fs.readFileSync(path.join(rootDir, '.dockerignore'), 'utf8');
+  assert.ok(dockerignore.includes('node_modules'));
+  assert.ok(dockerignore.includes('dist'));
+
+  const compose = fs.readFileSync(path.join(rootDir, 'docker-compose.yml'), 'utf8');
+  assert.ok(!compose.includes('container_name:'), 'Dokploy compose should avoid hardcoded container_name collisions');
+  assert.ok(compose.includes('imresamu/postgis:16-3.4-alpine'), 'Compose should default to multi-arch PostGIS image');
+  assert.ok(compose.includes('VITE_FIREBASE_API_KEY: ${VITE_FIREBASE_API_KEY:-}'), 'Compose should forward VITE_FIREBASE_API_KEY build arg');
+});
+
+test('OfflineSyncCoordinator queues parcels and history offline, coalesces operations, survives mid-sync drops, and auto-syncs to Firestore on reconnect', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const { buildLocalParcelRecord, extractCadernetaOffline } = await import('./offlineParcelBuilder.ts');
+  const {
+    OFFLINE_LOCAL_UID,
+    OfflineSyncCoordinator,
+    buildLocalHistoryEntry,
+    coalesceOutboxOperations,
+    createMemoryOfflineStorageAdapter,
+    mergeHistoryWithOffline,
+    mergeParcelsWithOffline,
+  } = await import('./offlineStorage.ts');
+
+  let online = false;
+  let failAfterOps: number | null = null;
+  const firestoreCalls: Array<{ op: string; uid: string; id: string; status?: string }> = [];
+  let backendParcelSyncCount = 0;
+
+  const storage = createMemoryOfflineStorageAdapter();
+  const coordinator = new OfflineSyncCoordinator({
+    storage,
+    isOnline: () => online,
+    transport: {
+      syncParcelToBackend: async () => {
+        backendParcelSyncCount += 1;
+      },
+      saveParcel: async (uid, parcel) => {
+        if (failAfterOps !== null && firestoreCalls.length >= failAfterOps) {
+          throw new Error('FirebaseError: Failed to fetch (client is offline)');
+        }
+        firestoreCalls.push({ op: 'SAVE_PARCEL', uid, id: parcel.id });
+      },
+      createHistory: async (uid, entry) => {
+        if (failAfterOps !== null && firestoreCalls.length >= failAfterOps) {
+          throw new Error('FirebaseError: unavailable network timeout');
+        }
+        firestoreCalls.push({ op: 'CREATE_HISTORY', uid, id: entry.id, status: entry.status });
+      },
+      archiveHistory: async (uid, entryId) => {
+        if (failAfterOps !== null && firestoreCalls.length >= failAfterOps) {
+          throw new Error('FirebaseError: network error');
+        }
+        firestoreCalls.push({ op: 'ARCHIVE_HISTORY', uid, id: entryId });
+      },
+      deleteHistory: async (uid, entryId) => {
+        firestoreCalls.push({ op: 'DELETE_HISTORY', uid, id: entryId });
+      },
+    },
+  });
+
+  // 1. Offline Caderneta extraction + parcel creation while offline
+  const extracted = extractCadernetaOffline(
+    'Caderneta Predial Rústica — Município de Mafra, Artigo Matricial 412, Secção G, com sobreiros adultos.'
+  );
+  assert.equal(extracted.municipality, 'Mafra');
+  assert.equal(extracted.hasProtectedOaks, true);
+
+  const offlineParcel = buildLocalParcelRecord({
+    label: extracted.suggestedLabel,
+    dico: extracted.dico,
+    matrixArticle: extracted.matrixArticle,
+    hasProtectedOaks: extracted.hasProtectedOaks,
+    vertices: extracted.vertices,
+    nowMs: 1763210000000,
+  });
+
+  const entryA = buildLocalHistoryEntry({
+    id: 'hist-offline-a',
+    uid: OFFLINE_LOCAL_UID,
+    category: 'INTERVENTION',
+    title: 'Limpeza Faixa Zona 2 com fio nylon',
+    parcelId: offlineParcel.id,
+    parcelLabel: offlineParcel.label,
+    municipality: offlineParcel.municipality,
+    referenceCode: 'INT-20261115',
+    areaM2: offlineParcel.spatial.mandatoryCleanAreaM2,
+    pirLevel: 2,
+    soilMoisturePct: 28.4,
+    summary: 'Executada limpeza preventiva offline.',
+    createdAtIso: '2026-11-15T09:00:00.000Z',
+  });
+
+  const entryB = buildLocalHistoryEntry({
+    id: 'hist-offline-b',
+    uid: OFFLINE_LOCAL_UID,
+    category: 'QUOTE',
+    title: 'Rascunho temporário a eliminar',
+    parcelId: offlineParcel.id,
+    parcelLabel: offlineParcel.label,
+    municipality: offlineParcel.municipality,
+    referenceCode: 'LEAD-TEMP',
+    areaM2: 1200,
+    pirLevel: 2,
+    soilMoisturePct: 28.4,
+    summary: 'Criado e apagado ainda sem rede.',
+    createdAtIso: '2026-11-15T09:05:00.000Z',
+  });
+
+  // 1b + 2. Fire parcel + history creation CONCURRENTLY (just like onCreateParcel in UI) while offline
+  const [parcelRecordRes] = await Promise.all([
+    coordinator.recordParcel(offlineParcel, null),
+    coordinator.recordHistoryCreation(entryA, null),
+  ]);
+  assert.equal(parcelRecordRes.syncResult.offlineSkipped, true);
+  assert.equal(firestoreCalls.length, 0, 'No Firestore calls should happen while offline');
+
+  await coordinator.recordHistoryArchive(entryA.id, null);
+  await coordinator.recordHistoryCreation(entryB, null);
+  await coordinator.recordHistoryDelete(entryB.id, null);
+
+  const hydratedOffline = await coordinator.hydrateState();
+  assert.equal(hydratedOffline.parcels.length, 1);
+  assert.equal(hydratedOffline.history.length, 1, 'Deleted offline entryB should be removed locally');
+  assert.equal(hydratedOffline.history[0].id, 'hist-offline-a');
+  assert.equal(hydratedOffline.history[0].status, 'ARCHIVED');
+
+  // Outbox should have exactly 3 operations: SAVE_PARCEL, CREATE_HISTORY(A), ARCHIVE_HISTORY(A)
+  const coalesced = coalesceOutboxOperations(hydratedOffline.outbox);
+  assert.deepEqual(
+    coalesced.map((o) => `${o.type}:${o.targetId}`),
+    [
+      `SAVE_PARCEL:${offlineParcel.id}`,
+      'CREATE_HISTORY:hist-offline-a',
+      'ARCHIVE_HISTORY:hist-offline-a',
+    ]
+  );
+
+  // Merge helpers annotate offline items as PENDING and prepend custom parcel
+  const mergedParcels = mergeParcelsWithOffline(INITIAL_PARCELS, hydratedOffline.parcels);
+  assert.equal(mergedParcels[0].id, offlineParcel.id);
+
+  const mergedBeforeSync = mergeHistoryWithOffline({
+    remoteItems: [],
+    localItems: hydratedOffline.history,
+    outbox: hydratedOffline.outbox,
+    activeUid: 'user-auth-99',
+  });
+  assert.equal(mergedBeforeSync.length, 1);
+  assert.equal(mergedBeforeSync[0].syncStatus, 'PENDING');
+  assert.equal(mergedBeforeSync[0].status, 'ARCHIVED');
+
+  // 3. Simulate transient drop mid-sync after 1 operation
+  online = true;
+  failAfterOps = 1;
+  const partialFlush = await coordinator.flushOutbox('user-auth-99');
+  assert.equal(partialFlush.syncedCount, 1);
+  assert.equal(partialFlush.remainingCount, 2, 'Remaining FIFO operations must stay queued');
+
+  // 4. Connection fully restored -> automatic flush drains remaining queue in strict order
+  failAfterOps = null;
+  const fullFlush = await coordinator.flushOutbox('user-auth-99');
+  assert.equal(fullFlush.syncedCount, 2);
+  assert.equal(fullFlush.remainingCount, 0);
+  assert.ok(fullFlush.lastSyncedAtIso);
+  assert.equal(backendParcelSyncCount, 1);
+
+  assert.deepEqual(firestoreCalls, [
+    { op: 'SAVE_PARCEL', uid: 'user-auth-99', id: offlineParcel.id },
+    { op: 'CREATE_HISTORY', uid: 'user-auth-99', id: 'hist-offline-a', status: 'ACTIVE' },
+    { op: 'ARCHIVE_HISTORY', uid: 'user-auth-99', id: 'hist-offline-a' },
+  ]);
+
+  const hydratedAfterSync = await coordinator.hydrateState();
+  assert.equal(hydratedAfterSync.outbox.length, 0);
+  const mergedAfterSync = mergeHistoryWithOffline({
+    remoteItems: [],
+    localItems: hydratedAfterSync.history,
+    outbox: hydratedAfterSync.outbox,
+    activeUid: 'user-auth-99',
+  });
+  assert.equal(mergedAfterSync[0].syncStatus, 'SYNCED');
+  assert.equal(mergedAfterSync[0].uid, 'user-auth-99');
+});
+
+test('buildParcelVerticesGeoJson exports RFC 7946 closed counterclockwise Polygon, EPSG:3763 vertex Points, and clean .geojson filename', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const { buildParcelGeoJsonFilename, buildParcelVerticesGeoJson } = await import('./spatialEngine.ts');
+
+  const sintraParcel = INITIAL_PARCELS[0];
+  const filename = buildParcelGeoJsonFilename(sintraParcel);
+  assert.ok(filename.endsWith('.geojson'), 'Expected .geojson extension');
+  assert.ok(/^[a-z0-9._-]+$/.test(filename), `Expected ASCII-safe filename, got ${filename}`);
+  assert.ok(filename.includes('sintra'), 'Expected municipality slug in filename');
+
+  const rawJson = buildParcelVerticesGeoJson(sintraParcel, '2026-11-15T16:00:00.000Z');
+  const parsed = JSON.parse(rawJson) as {
+    type: string;
+    bbox: [number, number, number, number];
+    crs: { type: string; properties: { name: string } };
+    features: Array<{
+      id: string;
+      type: string;
+      properties: Record<string, unknown>;
+      geometry: { type: string; coordinates: unknown };
+    }>;
+  };
+
+  assert.equal(parsed.type, 'FeatureCollection');
+  assert.equal(parsed.crs.properties.name, 'urn:ogc:def:crs:OGC:1.3:CRS84');
+  assert.equal(parsed.bbox.length, 4);
+  assert.ok(parsed.bbox[0] <= parsed.bbox[2] && parsed.bbox[1] <= parsed.bbox[3]);
+
+  const expectedVertexCount = sintraParcel.vertices.length;
+  assert.equal(parsed.features.length, 1 + expectedVertexCount);
+
+  const boundaryFeature = parsed.features[0];
+  assert.equal(boundaryFeature.geometry.type, 'Polygon');
+  assert.equal(boundaryFeature.properties.feature_role, 'PARCEL_BOUNDARY');
+  assert.equal(boundaryFeature.properties.parcel_id, sintraParcel.id);
+  assert.equal(boundaryFeature.properties.bupi_rgg_id, sintraParcel.bupiRggId);
+  assert.equal(boundaryFeature.properties.vertex_count, expectedVertexCount);
+  assert.equal(boundaryFeature.properties.exported_at, '2026-11-15T16:00:00.000Z');
+
+  const rings = boundaryFeature.geometry.coordinates as number[][][];
+  assert.equal(rings.length, 1);
+  const exteriorRing = rings[0];
+  assert.equal(exteriorRing.length, expectedVertexCount + 1, 'Polygon ring must have N + 1 coordinates');
+  assert.deepEqual(exteriorRing[0], exteriorRing[exteriorRing.length - 1], 'Polygon ring must be explicitly closed');
+
+  // Verify [longitude, latitude] ordering for Continental Portugal (lon < 0, lat > 36) and CCW orientation
+  let signedDoubleArea = 0;
+  for (let i = 0; i < exteriorRing.length - 1; i++) {
+    const [lon1, lat1] = exteriorRing[i];
+    const [lon2, lat2] = exteriorRing[i + 1];
+    assert.ok(lon1 < -6 && lon1 > -10, `Expected Portuguese longitude, got ${lon1}`);
+    assert.ok(lat1 > 36 && lat1 < 43, `Expected Portuguese latitude, got ${lat1}`);
+    signedDoubleArea += lon1 * lat2 - lon2 * lat1;
+  }
+  assert.ok(signedDoubleArea > 0, 'Exterior GeoJSON ring should follow RFC 7946 counterclockwise winding');
+
+  // Verify each exported Point vertex matches original vertices and carries EPSG:3763 metric coordinates
+  for (let idx = 0; idx < expectedVertexCount; idx++) {
+    const ptFeature = parsed.features[idx + 1];
+    assert.equal(ptFeature.geometry.type, 'Point');
+    assert.equal(ptFeature.properties.feature_role, 'PARCEL_VERTEX');
+    assert.equal(ptFeature.properties.vertex_index, idx + 1);
+    const coords = ptFeature.geometry.coordinates as [number, number];
+    assert.equal(coords[0], Number(sintraParcel.vertices[idx].lon.toFixed(6)));
+    assert.equal(coords[1], Number(sintraParcel.vertices[idx].lat.toFixed(6)));
+    assert.equal(typeof ptFeature.properties.pt_tm06_x_m, 'number');
+    assert.equal(typeof ptFeature.properties.pt_tm06_y_m, 'number');
+  }
+
+  // Verify already-closed input vertices are deduplicated before closing
+  const preClosedParcel = {
+    ...sintraParcel,
+    vertices: [...sintraParcel.vertices, sintraParcel.vertices[0]],
+  };
+  const dedupParsed = JSON.parse(buildParcelVerticesGeoJson(preClosedParcel)) as typeof parsed;
+  assert.equal(dedupParsed.features.length, 1 + expectedVertexCount);
+  assert.equal((dedupParsed.features[0].geometry.coordinates as number[][][])[0].length, expectedVertexCount + 1);
+});
 

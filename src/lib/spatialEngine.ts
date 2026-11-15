@@ -1,6 +1,7 @@
 import type {
   LandClass,
   LatLon,
+  ParcelRecord,
   PtTm06Coord,
   SpatialZoneBreakdown,
 } from '../types/domain.ts';
@@ -430,3 +431,158 @@ export function buildMunicipalGtfKml(params: {
   </Document>
 </kml>`;
 }
+
+function slugifyAscii(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function deduplicateClosingVertex(vertices: LatLon[]): LatLon[] {
+  if (vertices.length < 2) return vertices;
+  const first = vertices[0];
+  const last = vertices[vertices.length - 1];
+  if (Math.abs(first.lat - last.lat) < 1e-8 && Math.abs(first.lon - last.lon) < 1e-8) {
+    return vertices.slice(0, -1);
+  }
+  return vertices;
+}
+
+function toCounterClockwiseClosedRing(vertices: LatLon[]): Array<[number, number]> {
+  const unique = deduplicateClosingVertex(vertices);
+  if (unique.length === 0) return [];
+
+  const coords: Array<[number, number]> = unique.map((v) => [
+    Number(v.lon.toFixed(6)),
+    Number(v.lat.toFixed(6)),
+  ]);
+
+  let signedDoubleArea = 0;
+  for (let i = 0; i < coords.length; i++) {
+    const [x1, y1] = coords[i];
+    const [x2, y2] = coords[(i + 1) % coords.length];
+    signedDoubleArea += x1 * y2 - x2 * y1;
+  }
+
+  // RFC 7946 §3.1.6: exterior rings follow the right-hand rule (counterclockwise -> signedDoubleArea > 0)
+  const oriented =
+    signedDoubleArea < 0 && coords.length >= 3
+      ? [coords[0], ...coords.slice(1).reverse()]
+      : coords;
+
+  return [...oriented, [oriented[0][0], oriented[0][1]]];
+}
+
+export function buildParcelGeoJsonFilename(
+  parcel: Pick<ParcelRecord, 'id' | 'bupiRggId' | 'municipality' | 'label'>
+): string {
+  const refSlug = slugifyAscii(parcel.bupiRggId || parcel.id || 'parcela');
+  const munSlug = slugifyAscii(parcel.municipality || 'portugal');
+  const base = ['faixasegura', refSlug, munSlug].filter(Boolean).join('-');
+  return `${base || 'faixasegura-parcela'}.geojson`;
+}
+
+/**
+ * Exports the selected parcel's boundary polygon and individual corner vertices
+ * as an RFC 7946 GeoJSON FeatureCollection (CRS84 / WGS84 + ETRS89 / PT-TM06 EPSG:3763 attributes)
+ * for direct import into QGIS, ArcGIS Pro, Google Earth, BUPi, and PostGIS.
+ */
+export function buildParcelVerticesGeoJson(
+  parcel: ParcelRecord,
+  exportedAtIso: string = new Date().toISOString()
+): string {
+  const rawVertices =
+    parcel.vertices.length >= 3 ? parcel.vertices : parcel.spatial.polygons.parcel;
+  const uniqueVertices = deduplicateClosingVertex(rawVertices);
+  const closedRing = toCounterClockwiseClosedRing(uniqueVertices);
+
+  const lons = uniqueVertices.map((v) => Number(v.lon.toFixed(6)));
+  const lats = uniqueVertices.map((v) => Number(v.lat.toFixed(6)));
+  const bbox: [number, number, number, number] =
+    uniqueVertices.length > 0
+      ? [Math.min(...lons), Math.min(...lats), Math.max(...lons), Math.max(...lats)]
+      : [0, 0, 0, 0];
+
+  const boundaryFeature = {
+    type: 'Feature' as const,
+    id: parcel.id,
+    properties: {
+      feature_role: 'PARCEL_BOUNDARY',
+      parcel_id: parcel.id,
+      label: parcel.label,
+      bupi_rgg_id: parcel.bupiRggId,
+      matrix_article: parcel.matrixArticle,
+      municipality: parcel.municipality,
+      parish: parcel.parish,
+      district: parcel.district,
+      dico: parcel.dico,
+      dicofre: parcel.dicofre,
+      land_class: parcel.landClass,
+      vertex_count: uniqueVertices.length,
+      total_area_m2: parcel.spatial.totalAreaM2,
+      perimeter_m: parcel.spatial.perimeterM,
+      mandatory_clean_area_m2: parcel.spatial.mandatoryCleanAreaM2,
+      zone1_immediate_0_2m_m2: parcel.spatial.zone1ImmediateM2,
+      zone2_near_2_10m_m2: parcel.spatial.zone2NearM2,
+      zone3_extended_10_50m_m2: parcel.spatial.zone3ExtendedM2,
+      eredes_easement_m2: parcel.spatial.thirdPartyEasementM2,
+      exempt_area_m2: parcel.spatial.exemptAreaM2,
+      avg_slope_pct: parcel.avgSlopePct,
+      has_protected_oaks: parcel.hasProtectedOaks,
+      has_eredes_line: parcel.hasEredesLine,
+      centroid_wgs84_lat: parcel.spatial.centroidWgs84.lat,
+      centroid_wgs84_lon: parcel.spatial.centroidWgs84.lon,
+      centroid_pt_tm06_x_m: parcel.spatial.centroidPtTm06.x,
+      centroid_pt_tm06_y_m: parcel.spatial.centroidPtTm06.y,
+      metric_projection: 'ETRS89 / PT-TM06 (EPSG:3763)',
+      legal_basis: 'DL 82/2021 (SGIFR) + Despacho 675/2026',
+      exported_at: exportedAtIso,
+    },
+    geometry: {
+      type: 'Polygon' as const,
+      coordinates: [closedRing],
+    },
+  };
+
+  const vertexFeatures = uniqueVertices.map((vertex, idx) => {
+    const lon = Number(vertex.lon.toFixed(6));
+    const lat = Number(vertex.lat.toFixed(6));
+    const ptTm06 = wgs84ToPtTm06(vertex);
+    return {
+      type: 'Feature' as const,
+      id: `${parcel.id}-v${idx + 1}`,
+      properties: {
+        feature_role: 'PARCEL_VERTEX',
+        parcel_id: parcel.id,
+        bupi_rgg_id: parcel.bupiRggId,
+        vertex_index: idx + 1,
+        vertex_label: `V${idx + 1}`,
+        lon_wgs84: lon,
+        lat_wgs84: lat,
+        pt_tm06_x_m: ptTm06.x,
+        pt_tm06_y_m: ptTm06.y,
+      },
+      geometry: {
+        type: 'Point' as const,
+        coordinates: [lon, lat],
+      },
+    };
+  });
+
+  const featureCollection = {
+    type: 'FeatureCollection' as const,
+    name: `FaixaSegura_${parcel.bupiRggId || parcel.id}`,
+    bbox,
+    crs: {
+      type: 'name',
+      properties: { name: 'urn:ogc:def:crs:OGC:1.3:CRS84' },
+    },
+    features: [boundaryFeature, ...vertexFeatures],
+  };
+
+  return JSON.stringify(featureCollection, null, 2);
+}
+

@@ -96,10 +96,6 @@ export const PirSoilTrendPanel: React.FC<PirSoilTrendPanelProps> = ({
   const todayPoint = summary.points[summary.points.length - 1];
 
   const handleRecordDecision = async () => {
-    if (!isAuthenticated) {
-      onOpenHistoryModal();
-      return;
-    }
     setSavingDecision(true);
     try {
       await onLogDecisionToHistory({
@@ -391,7 +387,7 @@ export const PirSoilTrendPanel: React.FC<PirSoilTrendPanelProps> = ({
           </p>
         </div>
 
-        <div className="flex items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0">
           <button
             type="button"
             disabled={savingDecision}
@@ -403,10 +399,17 @@ export const PirSoilTrendPanel: React.FC<PirSoilTrendPanelProps> = ({
               ? 'Registado no Histórico!'
               : savingDecision
               ? 'A guardar...'
-              : isAuthenticated
-              ? 'Guardar Avaliação no Histórico'
-              : 'Entrar p/ Guardar no Histórico'}
+              : 'Guardar Avaliação no Histórico'}
           </button>
+          {!isAuthenticated && savedNotice && (
+            <button
+              type="button"
+              onClick={onOpenHistoryModal}
+              className="min-h-[44px] px-3 py-2 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 whitespace-nowrap"
+            >
+              Ver Histórico
+            </button>
+          )}
         </div>
       </div>
     </section>
