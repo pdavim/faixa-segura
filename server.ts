@@ -3,8 +3,10 @@ import { createServer as createHttpServer } from 'http';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
+import { WebSocketServer, WebSocket } from 'ws';
 import type {
   ActiveFireIncident,
+  AnepcNationalSummary,
   ComplianceCertificate,
   DailyPirForecast,
   ForestryProvider,
@@ -12,9 +14,13 @@ import type {
   ParcelRecord,
   PirLevel,
   QuoteLead,
+  RealtimeHazardFeedMeta,
+  RealtimeHazardsSnapshotPayload,
+  StormAlertIncident,
 } from './src/types/domain.ts';
 import {
   FALLBACK_ACTIVE_FIRES,
+  FALLBACK_ACTIVE_STORMS,
   INITIAL_CERTIFICATES,
   INITIAL_PARCELS,
   INITIAL_PROVIDERS,
@@ -35,6 +41,16 @@ import {
   computeSha256Hex,
   evaluateOperationalSemaphore,
 } from './src/lib/pirRules.ts';
+import {
+  DEFAULT_IPMA_AREA_LOCATIONS,
+  classifyAnepcIncidents,
+  consumeSseBuffer,
+  hydrateIpmaAreaLocations,
+  mergeSecondaryApiAbertaFires,
+  parseAnepcCountsPayload,
+  parseIpmaWarningsPayload,
+  type IpmaAreaLocation,
+} from './src/lib/officialAlertsIngestor.ts';
 
 dotenv.config();
 
@@ -267,71 +283,534 @@ async function startServer() {
     res.json({ dico, municipality: muni.name, source, forecasts });
   });
 
-  // 3. Active Rural Fires Radar (ANEPC / API Aberta + 15km Geospatial Proximity)
+  // 3. Server-Authoritative Real-Time IPMA & Proteção Civil (ANEPC) Aggregator Hub
+  interface SseSubscriber {
+    id: string;
+    res: express.Response;
+  }
+
+  class RealtimeOfficialHazardsHub {
+    private ipmaAreaLocations: Record<string, IpmaAreaLocation> = {
+      ...DEFAULT_IPMA_AREA_LOCATIONS,
+    };
+    private ipmaAreasFetchedAt = 0;
+
+    private anepcSseFires: Omit<ActiveFireIncident, 'distanceKm'>[] = [];
+    private anepcSseWeatherHazards: StormAlertIncident[] = [];
+    private apiAbertaFires: Omit<ActiveFireIncident, 'distanceKm'>[] = [];
+    private ipmaWarnings: StormAlertIncident[] = [];
+
+    private anepcNational: AnepcNationalSummary | null = null;
+    private anepcStreamConnected = false;
+    private anepcEverReceived = false;
+    private apiAbertaOk = false;
+    private ipmaOk = false;
+    private lastUpdatedIso = new Date().toISOString();
+    private lastDigest = '';
+
+    private sseClients = new Map<string, SseSubscriber>();
+    private wss: WebSocketServer;
+    private initialSyncPromise: Promise<void> | null = null;
+    private initialSyncResolve: (() => void) | null = null;
+    private upstreamAbort: AbortController | null = null;
+    private reconnectDelayMs = 3000;
+
+    constructor(wss: WebSocketServer) {
+      this.wss = wss;
+      this.initialSyncPromise = new Promise<void>((resolve) => {
+        this.initialSyncResolve = resolve;
+      });
+    }
+
+    public start(): void {
+      // Kick off initial IPMA + API Aberta sync and persistent ANEPC SADO SSE stream in parallel
+      void this.refreshUpstreamOnce().finally(() => {
+        this.markInitialReady();
+      });
+      void this.connectAnepcSadoStreamLoop();
+
+      // Refresh IPMA warnings & API Aberta every 60s on the server and broadcast any real changes
+      setInterval(() => {
+        void this.refreshUpstreamOnce();
+      }, 60_000);
+
+      // Keep SSE & WebSocket connections healthy through proxies
+      setInterval(() => {
+        for (const sub of this.sseClients.values()) {
+          try {
+            sub.res.write(': keepalive\n\n');
+          } catch {
+            this.sseClients.delete(sub.id);
+          }
+        }
+        for (const ws of this.wss.clients) {
+          if (ws.readyState === WebSocket.OPEN) {
+            try {
+              ws.ping();
+            } catch {
+              // Ignore ping errors on closing sockets
+            }
+          }
+        }
+      }, 22_000);
+    }
+
+    private markInitialReady(): void {
+      if (this.initialSyncResolve) {
+        const fn = this.initialSyncResolve;
+        this.initialSyncResolve = null;
+        fn();
+      }
+    }
+
+    public async waitUntilReady(timeoutMs = 3200): Promise<void> {
+      if (!this.initialSyncPromise || !this.initialSyncResolve) return;
+      await Promise.race([
+        this.initialSyncPromise,
+        new Promise<void>((r) => setTimeout(r, timeoutMs)),
+      ]);
+    }
+
+    private async ensureIpmaAreaLocations(): Promise<void> {
+      if (Date.now() - this.ipmaAreasFetchedAt < 6 * 3600_000) return;
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 3500);
+      try {
+        const res = await fetch('https://api.ipma.pt/open-data/distrits-islands.json', {
+          headers: { Accept: 'application/json', 'User-Agent': 'FaixaSegura/1.0' },
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (res.ok) {
+          const json = await res.json();
+          this.ipmaAreaLocations = hydrateIpmaAreaLocations(json);
+          this.ipmaAreasFetchedAt = Date.now();
+        }
+      } catch {
+        clearTimeout(timer);
+      }
+    }
+
+    public async refreshUpstreamOnce(): Promise<RealtimeHazardsSnapshotPayload> {
+      await this.ensureIpmaAreaLocations();
+
+      const [ipmaResult, apiAbertaResult] = await Promise.allSettled([
+        this.fetchIpmaWarningsOnce(),
+        this.fetchApiAbertaOnce(),
+      ]);
+
+      if (ipmaResult.status === 'fulfilled' && ipmaResult.value !== null) {
+        this.ipmaWarnings = ipmaResult.value;
+        this.ipmaOk = true;
+      }
+      if (apiAbertaResult.status === 'fulfilled' && apiAbertaResult.value !== null) {
+        this.apiAbertaFires = apiAbertaResult.value;
+        this.apiAbertaOk = true;
+      }
+
+      // If the persistent ANEPC SSE stream hasn't delivered its initial frame yet (or dropped),
+      // perform a fast bounded 1-shot SSE burst read so manual refreshes immediately pull SADO too.
+      if (!this.anepcStreamConnected && !this.anepcEverReceived) {
+        await this.pullSingleAnepcBurst(2600);
+      }
+
+      this.broadcastIfChanged(true);
+      return this.buildSnapshot('http');
+    }
+
+    private async fetchIpmaWarningsOnce(): Promise<StormAlertIncident[] | null> {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 4000);
+      try {
+        const res = await fetch(
+          'https://api.ipma.pt/open-data/forecast/warnings/warnings_www.json',
+          {
+            headers: { Accept: 'application/json', 'User-Agent': 'FaixaSegura/1.0' },
+            signal: ctrl.signal,
+          }
+        );
+        clearTimeout(timer);
+        if (!res.ok) return null;
+        const raw = await res.json();
+        return parseIpmaWarningsPayload(raw, this.ipmaAreaLocations);
+      } catch {
+        clearTimeout(timer);
+        return null;
+      }
+    }
+
+    private async fetchApiAbertaOnce(): Promise<Omit<ActiveFireIncident, 'distanceKm'>[] | null> {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 3500);
+      try {
+        const res = await fetch('https://api.apiaberta.pt/v1/anpc/incidents/active', {
+          headers: { Accept: 'application/json', 'User-Agent': 'FaixaSegura/1.0' },
+          signal: ctrl.signal,
+        });
+        clearTimeout(timer);
+        if (!res.ok) return null;
+        const json = (await res.json()) as { data?: unknown };
+        return mergeSecondaryApiAbertaFires([], json?.data);
+      } catch {
+        clearTimeout(timer);
+        return null;
+      }
+    }
+
+    private async pullSingleAnepcBurst(maxDurationMs: number): Promise<void> {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), maxDurationMs);
+      try {
+        const res = await fetch('https://ocorrenciasativas.pt/api/gw/site/incidents/stream', {
+          headers: {
+            Accept: 'text/event-stream',
+            'Cache-Control': 'no-cache',
+            'User-Agent': 'Mozilla/5.0 (compatible; FaixaSegura/1.0)',
+          },
+          signal: ctrl.signal,
+        });
+        if (!res.ok || !res.body) {
+          clearTimeout(timer);
+          return;
+        }
+        const reader = res.body.getReader();
+        const decoder = new TextDecoder('utf-8');
+        let buffer = '';
+        let gotIncidents = false;
+
+        while (!gotIncidents) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, { stream: true });
+          const { frames, remainder } = consumeSseBuffer(buffer);
+          buffer = remainder;
+          for (const frame of frames) {
+            if (this.applyAnepcFrame(frame.event, frame.data) && frame.event === 'incidents') {
+              gotIncidents = true;
+            }
+          }
+        }
+        ctrl.abort();
+      } catch {
+        // Expected on abort or offline network
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    private applyAnepcFrame(eventName: string, dataStr: string): boolean {
+      if (eventName === 'counts') {
+        const counts = parseAnepcCountsPayload(dataStr);
+        if (counts) {
+          this.anepcNational = counts;
+          this.anepcEverReceived = true;
+          return true;
+        }
+        return false;
+      }
+      if (eventName === 'incidents') {
+        const classified = classifyAnepcIncidents(dataStr);
+        this.anepcSseFires = classified.fires;
+        this.anepcSseWeatherHazards = classified.civilWeatherHazards;
+        this.anepcEverReceived = true;
+        this.markInitialReady();
+        return true;
+      }
+      return false;
+    }
+
+    private async connectAnepcSadoStreamLoop(): Promise<void> {
+      while (true) {
+        const ctrl = new AbortController();
+        this.upstreamAbort = ctrl;
+        let idleWatchdog: ReturnType<typeof setTimeout> | null = null;
+        const resetWatchdog = () => {
+          if (idleWatchdog) clearTimeout(idleWatchdog);
+          idleWatchdog = setTimeout(() => ctrl.abort(), 95_000);
+        };
+
+        try {
+          resetWatchdog();
+          const res = await fetch('https://ocorrenciasativas.pt/api/gw/site/incidents/stream', {
+            headers: {
+              Accept: 'text/event-stream',
+              'Cache-Control': 'no-cache',
+              'User-Agent': 'Mozilla/5.0 (compatible; FaixaSegura/1.0)',
+            },
+            signal: ctrl.signal,
+          });
+
+          if (!res.ok || !res.body) {
+            throw new Error(`ANEPC SSE HTTP ${res.status}`);
+          }
+
+          this.anepcStreamConnected = true;
+          this.reconnectDelayMs = 3000;
+          const reader = res.body.getReader();
+          const decoder = new TextDecoder('utf-8');
+          let buffer = '';
+
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            resetWatchdog();
+            buffer += decoder.decode(value, { stream: true });
+            const { frames, remainder } = consumeSseBuffer(buffer);
+            buffer = remainder;
+            let mutated = false;
+            for (const frame of frames) {
+              if (this.applyAnepcFrame(frame.event, frame.data)) {
+                mutated = true;
+              }
+            }
+            if (mutated) {
+              this.broadcastIfChanged(false);
+            }
+          }
+        } catch {
+          // Stream closed or timed out — reconnect with bounded backoff
+        } finally {
+          if (idleWatchdog) clearTimeout(idleWatchdog);
+          this.anepcStreamConnected = false;
+          this.upstreamAbort = null;
+        }
+
+        await new Promise<void>((r) => setTimeout(r, this.reconnectDelayMs));
+        this.reconnectDelayMs = Math.min(30_000, Math.round(this.reconnectDelayMs * 1.8));
+      }
+    }
+
+    public buildSnapshot(
+      transport: RealtimeHazardFeedMeta['transport'] = 'websocket'
+    ): RealtimeHazardsSnapshotPayload {
+      const anepcLive = this.anepcEverReceived || this.apiAbertaOk;
+      const ipmaLive = this.ipmaOk;
+
+      const liveFires = mergeSecondaryApiAbertaFires(this.anepcSseFires, this.apiAbertaFires);
+      // Only fall back to regional demo fires if ALL ANEPC live feeds are unreachable
+      const fires: Omit<ActiveFireIncident, 'distanceKm'>[] = anepcLive
+        ? liveFires
+        : structuredClone(FALLBACK_ACTIVE_FIRES);
+
+      const liveStorms: StormAlertIncident[] = [
+        ...this.ipmaWarnings,
+        ...this.anepcSseWeatherHazards,
+      ];
+      // Only fall back to regional demo storms if BOTH IPMA and ANEPC live feeds are unreachable
+      const storms: StormAlertIncident[] =
+        ipmaLive || anepcLive ? liveStorms : structuredClone(FALLBACK_ACTIVE_STORMS);
+
+      const anepcSourceLabel = this.anepcStreamConnected
+        ? 'ANEPC SADO (Stream Direto Ativo)'
+        : this.anepcEverReceived
+          ? 'ANEPC SADO (Sincronizado)'
+          : this.apiAbertaOk
+            ? 'ANEPC / API Aberta'
+            : 'Contingência Regional Offline';
+
+      const ipmaSourceLabel = ipmaLive
+        ? 'IPMA Open Data (Avisos Oficiais)'
+        : 'Contingência Meteorológica Regional';
+
+      return {
+        updatedAtIso: this.lastUpdatedIso,
+        fires,
+        storms,
+        meta: {
+          connected: true,
+          transport,
+          anepcLive,
+          ipmaLive,
+          anepcSourceLabel,
+          ipmaSourceLabel,
+          anepcNational: this.anepcNational,
+          ipmaActiveWarningsCount: this.ipmaWarnings.length,
+          activeFireIncidentsCount: fires.length,
+          activeWeatherIncidentsCount: storms.length,
+          lastUpdatedIso: this.lastUpdatedIso,
+        },
+      };
+    }
+
+    private broadcastIfChanged(forceTimestampUpdate: boolean): void {
+      const digestPayload = JSON.stringify({
+        fires: this.anepcSseFires.map((f) => [f.id, f.status, f.operatives, f.vehicles, f.aerialMeans]),
+        apiFires: this.apiAbertaFires.map((f) => [f.id, f.status]),
+        ipma: this.ipmaWarnings.map((w) => [w.id, w.severity, w.validUntil]),
+        weatherAnepc: this.anepcSseWeatherHazards.map((w) => [w.id, w.validUntil, w.operatives]),
+        counts: this.anepcNational,
+        anepcConn: this.anepcStreamConnected,
+        ipmaOk: this.ipmaOk,
+      });
+
+      if (!forceTimestampUpdate && digestPayload === this.lastDigest) {
+        return;
+      }
+
+      this.lastDigest = digestPayload;
+      this.lastUpdatedIso = new Date().toISOString();
+
+      // 1. Push to WebSocket clients
+      const wsSnapshot = this.buildSnapshot('websocket');
+      const wsMessage = JSON.stringify({
+        type: 'hazards:snapshot',
+        payload: wsSnapshot,
+      });
+      for (const client of this.wss.clients) {
+        if (client.readyState === WebSocket.OPEN) {
+          try {
+            client.send(wsMessage);
+          } catch {
+            // Ignore transient socket write error
+          }
+        }
+      }
+
+      // 2. Push to SSE clients
+      const sseSnapshot = this.buildSnapshot('sse');
+      const sseFrame = `event: hazards:snapshot\ndata: ${JSON.stringify(sseSnapshot)}\n\n`;
+      for (const sub of this.sseClients.values()) {
+        try {
+          sub.res.write(sseFrame);
+        } catch {
+          this.sseClients.delete(sub.id);
+        }
+      }
+    }
+
+    public registerSseClient(req: express.Request, res: express.Response): void {
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache, no-transform');
+      res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
+      res.flushHeaders?.();
+
+      const clientId = `sse_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      this.sseClients.set(clientId, { id: clientId, res });
+
+      const initialSnapshot = this.buildSnapshot('sse');
+      res.write(`event: hazards:snapshot\ndata: ${JSON.stringify(initialSnapshot)}\n\n`);
+
+      req.on('close', () => {
+        this.sseClients.delete(clientId);
+      });
+    }
+  }
+
+  const hazardsWss = new WebSocketServer({ noServer: true });
+  const hazardsHub = new RealtimeOfficialHazardsHub(hazardsWss);
+  hazardsHub.start();
+
+  httpServer.on('upgrade', (request, socket, head) => {
+    try {
+      const urlObj = new URL(request.url || '/', 'http://localhost');
+      if (urlObj.pathname === '/ws/hazards') {
+        hazardsWss.handleUpgrade(request, socket, head, (ws) => {
+          hazardsWss.emit('connection', ws, request);
+        });
+      }
+    } catch {
+      // Leave non-hazard upgrade paths untouched (e.g., Vite dev middleware)
+    }
+  });
+
+  hazardsWss.on('connection', (ws) => {
+    void hazardsHub.waitUntilReady(2500).then(() => {
+      if (ws.readyState === WebSocket.OPEN) {
+        ws.send(
+          JSON.stringify({
+            type: 'hazards:snapshot',
+            payload: hazardsHub.buildSnapshot('websocket'),
+          })
+        );
+      }
+    });
+
+    ws.on('message', (raw) => {
+      try {
+        const msg = JSON.parse(String(raw)) as { type?: string };
+        if (msg?.type === 'hazards:refresh') {
+          void hazardsHub.refreshUpstreamOnce();
+        } else if (msg?.type === 'hazards:ping') {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'hazards:pong', ts: new Date().toISOString() }));
+          }
+        }
+      } catch {
+        // Ignore malformed client frames
+      }
+    });
+  });
+
+  // 3a. Active Rural Fires Radar (ANEPC Real-Time Hub + Geospatial Proximity)
   app.get('/api/fires/active', async (req, res) => {
     const refLat = Number(req.query.lat) || 38.798412;
     const refLon = Number(req.query.lon) || -9.462108;
 
-    let incidents: ActiveFireIncident[] = [];
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), 3200);
+    await hazardsHub.waitUntilReady(2800);
+    const snapshot = hazardsHub.buildSnapshot('http');
 
-    try {
-      const apiRes = await fetch('https://api.apiaberta.pt/v1/anpc/incidents/active', {
-        signal: controller.signal,
-      });
-      clearTimeout(timer);
-      if (apiRes.ok) {
-        const payload = (await apiRes.json()) as {
-          data?: Array<{
-            id?: string | number;
-            concelho?: string;
-            freguesia?: string;
-            natureza?: string;
-            estado?: string;
-            lat?: number;
-            lng?: number;
-            man?: number;
-            terrain?: number;
-            aerial?: number;
-          }>;
-        };
-        if (Array.isArray(payload.data) && payload.data.length > 0) {
-          incidents = payload.data
-            .filter((it) => typeof it.lat === 'number' && typeof it.lng === 'number')
-            .slice(0, 12)
-            .map((it) => ({
-              id: String(it.id ?? Math.random()),
-              municipality: it.concelho || 'Concelho',
-              parish: it.freguesia || 'Freguesia',
-              nature: it.natureza?.toLowerCase().includes('florest') ? 'Povoamento Florestal' : 'Mato',
-              status: it.estado?.includes('Resolução') ? 'Em Resolução' : 'Em Curso',
-              lat: Number(it.lat),
-              lon: Number(it.lng),
-              distanceKm: haversineDistanceKm({ lat: refLat, lon: refLon }, { lat: Number(it.lat), lon: Number(it.lng) }),
-              operatives: Number(it.man ?? 12),
-              vehicles: Number(it.terrain ?? 4),
-              aerialMeans: Number(it.aerial ?? 0),
-              startedAt: 'Ativo ANEPC',
-              source: 'ANEPC / API Aberta',
-            }));
-        }
-      }
-    } catch {
-      clearTimeout(timer);
-    }
-
-    if (incidents.length === 0) {
-      incidents = FALLBACK_ACTIVE_FIRES.map((f) => ({
+    const incidents: ActiveFireIncident[] = snapshot.fires
+      .map((f) => ({
         ...f,
         distanceKm: haversineDistanceKm({ lat: refLat, lon: refLon }, { lat: f.lat, lon: f.lon }),
-      }));
-    }
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm);
 
-    incidents.sort((a, b) => a.distanceKm - b.distanceKm);
     res.json({
       within15KmCount: incidents.filter((i) => i.distanceKm <= 15).length,
       incidents,
+      meta: snapshot.meta,
+    });
+  });
+
+  // 3b. Real-Time SSE Stream for Official IPMA + Proteção Civil (ANEPC) Alerts
+  app.get('/api/hazards/stream', async (req, res) => {
+    await hazardsHub.waitUntilReady(2500);
+    hazardsHub.registerSseClient(req, res);
+  });
+
+  // 3c. Unified Multi-Parcel Wildfire + Severe Storm Snapshot (ANEPC + IPMA Warnings)
+  app.get('/api/hazards/active', async (req, res) => {
+    const refLat = Number(req.query.lat) || 38.798412;
+    const refLon = Number(req.query.lon) || -9.462108;
+
+    await hazardsHub.waitUntilReady(3200);
+    const snapshot = hazardsHub.buildSnapshot('http');
+
+    const firesWithDistance: ActiveFireIncident[] = snapshot.fires
+      .map((f) => ({
+        ...f,
+        distanceKm: haversineDistanceKm({ lat: refLat, lon: refLon }, { lat: f.lat, lon: f.lon }),
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+
+    res.json({
+      updatedAtIso: snapshot.updatedAtIso,
+      fires: firesWithDistance,
+      storms: snapshot.storms,
+      meta: snapshot.meta,
+    });
+  });
+
+  // 3d. Force Immediate Live Sync with IPMA & Proteção Civil and Broadcast to All Clients
+  app.post('/api/hazards/refresh', async (req, res) => {
+    const refLat = Number(req.body?.lat ?? req.query.lat) || 38.798412;
+    const refLon = Number(req.body?.lon ?? req.query.lon) || -9.462108;
+
+    const snapshot = await hazardsHub.refreshUpstreamOnce();
+    const firesWithDistance: ActiveFireIncident[] = snapshot.fires
+      .map((f) => ({
+        ...f,
+        distanceKm: haversineDistanceKm({ lat: refLat, lon: refLon }, { lat: f.lat, lon: f.lon }),
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+
+    res.json({
+      updatedAtIso: snapshot.updatedAtIso,
+      fires: firesWithDistance,
+      storms: snapshot.storms,
+      meta: snapshot.meta,
     });
   });
 

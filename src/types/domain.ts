@@ -116,8 +116,9 @@ export interface ActiveFireIncident {
   id: string;
   municipality: string;
   parish: string;
-  nature: 'Mato' | 'Povoamento Florestal' | 'Agrícola';
-  status: 'Em Curso' | 'Em Resolução' | 'Em Conclusão';
+  district?: string;
+  nature: 'Mato' | 'Povoamento Florestal' | 'Agrícola' | 'Situação Crítica';
+  status: 'Em Curso' | 'Em Resolução' | 'Em Conclusão' | 'Vigilância' | 'Despacho';
   lat: number;
   lon: number;
   distanceKm: number;
@@ -125,7 +126,12 @@ export interface ActiveFireIncident {
   vehicles: number;
   aerialMeans: number;
   startedAt: string;
-  source: 'ANEPC / API Aberta' | 'Simulação Preventiva Regional';
+  source:
+    | 'ANEPC Proteção Civil (Tempo Real)'
+    | 'ANEPC / API Aberta'
+    | 'Simulação Preventiva Regional';
+  anepcNaturezaCode?: string;
+  updatedAtIso?: string;
 }
 
 export interface PhotoEvidence {
@@ -291,13 +297,85 @@ export interface ParcelDocumentRecord {
   dataUrl?: string;
 }
 
+export type ProximityRadiusKm = 5 | 10 | 15 | 25;
+
+export type StormHazardKind =
+  | 'WINDSTORM'
+  | 'DRY_THUNDERSTORM'
+  | 'HEAVY_RAIN_FLOOD'
+  | 'EXTREME_GUSTS';
+
+export type StormSeverityLevel = 'YELLOW' | 'ORANGE' | 'RED';
+
+export interface StormAlertIncident {
+  id: string;
+  title: string;
+  kind: StormHazardKind;
+  severity: StormSeverityLevel;
+  municipality: string;
+  district: string;
+  lat: number;
+  lon: number;
+  radiusKm: number;
+  maxWindKmh: number;
+  precipitationMmH: number;
+  lightningRisk: boolean;
+  validUntil: string;
+  source:
+    | 'IPMA Avisos Oficiais (Tempo Real)'
+    | 'ANEPC Proteção Civil (Tempo Real)'
+    | 'IPMA Avisos Meteorológicos'
+    | 'Simulação Preventiva Regional'
+    | 'Teste de Proximidade no Mato';
+  ipmaAreaCode?: string;
+  isDistrictWideWarning?: boolean;
+  anepcNaturezaCode?: string;
+  operatives?: number;
+  vehicles?: number;
+  updatedAtIso?: string;
+}
+
+export type RealtimeTransportMode = 'websocket' | 'sse' | 'http' | 'offline';
+
+export interface AnepcNationalSummary {
+  totalOccurrences: number;
+  totalOperatives: number;
+  totalVehicles: number;
+  totalAerial: number;
+  totalFires: number;
+  totalSignificant: number;
+}
+
+export interface RealtimeHazardFeedMeta {
+  connected: boolean;
+  transport: RealtimeTransportMode;
+  anepcLive: boolean;
+  ipmaLive: boolean;
+  anepcSourceLabel: string;
+  ipmaSourceLabel: string;
+  anepcNational: AnepcNationalSummary | null;
+  ipmaActiveWarningsCount: number;
+  activeFireIncidentsCount: number;
+  activeWeatherIncidentsCount: number;
+  lastUpdatedIso: string;
+}
+
+export interface RealtimeHazardsSnapshotPayload {
+  updatedAtIso: string;
+  fires: Omit<ActiveFireIncident, 'distanceKm'>[];
+  storms: StormAlertIncident[];
+  meta: RealtimeHazardFeedMeta;
+}
+
 export interface UserAppSettings {
   pirAlertThreshold: 3 | 4;
-  proximityAlertRadiusKm: 10 | 15 | 25;
+  proximityAlertRadiusKm: ProximityRadiusKm;
   autoDownloadCertificatePdf: boolean;
   defaultBufferRule: '50M_BUILDING' | '100M_SETTLEMENT';
   offlineAutoSync: boolean;
   notifyQuotesWhatsapp: boolean;
+  enableFireProximityAlerts?: boolean;
+  enableStormProximityAlerts?: boolean;
+  prioritizeForestScrubAlerts?: boolean;
+  browserNotificationsEnabled?: boolean;
 }
-
-

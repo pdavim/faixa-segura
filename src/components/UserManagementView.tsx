@@ -2721,13 +2721,13 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
               </select>
             </div>
 
-            {/* Active Fire Radar Radius */}
+            {/* Active Fire & Storm Proximity Radar Radius */}
             <div className="space-y-2 pt-3 border-t border-slate-200 dark:border-[#263248]">
               <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                Raio de Vigia do Radar de Ocorrências Ativas ANEPC
+                Raio de Alerta de Incêndios e Tempestades nos Seus Terrenos
               </div>
-              <div className="grid grid-cols-3 gap-2">
-                {([10, 15, 25] as const).map((km) => {
+              <div className="grid grid-cols-4 gap-2">
+                {([5, 10, 15, 25] as const).map((km) => {
                   const active = userSettings.proximityAlertRadiusKm === km;
                   return (
                     <button
@@ -2782,6 +2782,51 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                   Permanente
                 </span>
               </div>
+
+              <label className="flex items-center justify-between gap-3 min-h-[40px] cursor-pointer text-xs text-slate-800 dark:text-slate-200">
+                <span>Alertar para incêndios rurais próximos de qualquer terreno da carteira</span>
+                <input
+                  type="checkbox"
+                  checked={userSettings.enableFireProximityAlerts !== false}
+                  onChange={(e) =>
+                    onUpdateSettings({
+                      ...userSettings,
+                      enableFireProximityAlerts: e.target.checked,
+                    })
+                  }
+                  className="w-4 h-4 rounded accent-[#14532D] shrink-0"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-3 min-h-[40px] cursor-pointer text-xs text-slate-800 dark:text-slate-200">
+                <span>Alertar para tempestades, vento forte e trovoada seca (IPMA)</span>
+                <input
+                  type="checkbox"
+                  checked={userSettings.enableStormProximityAlerts !== false}
+                  onChange={(e) =>
+                    onUpdateSettings({
+                      ...userSettings,
+                      enableStormProximityAlerts: e.target.checked,
+                    })
+                  }
+                  className="w-4 h-4 rounded accent-[#14532D] shrink-0"
+                />
+              </label>
+
+              <label className="flex items-center justify-between gap-3 min-h-[40px] cursor-pointer text-xs text-slate-800 dark:text-slate-200">
+                <span>Prioridade reforçada (+20% raio de vigia) para terrenos em mato / floresta</span>
+                <input
+                  type="checkbox"
+                  checked={userSettings.prioritizeForestScrubAlerts !== false}
+                  onChange={(e) =>
+                    onUpdateSettings({
+                      ...userSettings,
+                      prioritizeForestScrubAlerts: e.target.checked,
+                    })
+                  }
+                  className="w-4 h-4 rounded accent-[#14532D] shrink-0"
+                />
+              </label>
 
               <label className="flex items-center justify-between gap-3 min-h-[40px] cursor-pointer text-xs text-slate-800 dark:text-slate-200">
                 <span>Transferir automaticamente o PDF A4 ao emitir um Auto SHA-256</span>

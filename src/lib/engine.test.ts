@@ -1869,16 +1869,447 @@ test('evaluatePublicVerifyCodeInput provides live character length feedback, FS-
   assert.equal(validUrl.normalizedCode, 'FS-20260524-7D9E');
   assert.equal(validUrl.isValidToSubmit, true);
 
-  // 6. Verify prominent High Contrast badge classes and live preview test IDs in PublicWebviewHomepage.tsx
+  // 6. Verify prominent High Contrast badge subtle pulsing CSS animation & live preview test IDs
   const homepageSrc = fs.readFileSync(
     path.resolve(import.meta.dirname, '../components/PublicWebviewHomepage.tsx'),
     'utf8'
   );
+  const indexCssSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../index.css'),
+    'utf8'
+  );
   assert.ok(homepageSrc.includes('font-extrabold'));
-  assert.ok(homepageSrc.includes('motion-safe:animate-pulse'));
+  assert.ok(homepageSrc.includes('hc-badge-subtle-pulse'));
   assert.ok(homepageSrc.includes('border-[3px]'));
   assert.ok(homepageSrc.includes('Alto Contraste Ativo'));
   assert.ok(homepageSrc.includes('data-testid="public-verify-format-preview"'));
   assert.ok(homepageSrc.includes('data-testid="public-verify-length-counter"'));
+  assert.ok(indexCssSrc.includes('@keyframes hc-badge-subtle-pulse'));
+  assert.ok(indexCssSrc.includes('@keyframes hc-badge-halo-pulse'));
+  assert.ok(indexCssSrc.includes('prefers-reduced-motion: reduce'));
 });
 
+test('QrCertificateScannerModal renders inline Recent Scanned Certificates section (last 5) persisted in localStorage with individual removal', async () => {
+  const {
+    LS_KEY_QR_SCAN_HISTORY,
+    MAX_QR_SCAN_HISTORY_ITEMS,
+    appendQrScanHistory,
+    loadQrScanHistory,
+    removeQrScanHistoryItem,
+  } = await import('./qrVerification.ts');
+  const { INITIAL_CERTIFICATES } = await import('../data/seedCatalog.ts');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  const mem = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      mem.set(k, v);
+    },
+    removeItem: (k: string) => {
+      mem.delete(k);
+    },
+  };
+
+  assert.equal(MAX_QR_SCAN_HISTORY_ITEMS, 5);
+
+  // Append 6 certificates and verify only the latest 5 are persisted under LS_KEY_QR_SCAN_HISTORY
+  const base = INITIAL_CERTIFICATES[0];
+  for (let i = 1; i <= 6; i++) {
+    appendQrScanHistory(
+      {
+        ...base,
+        id: `cert-field-${i}`,
+        shortCode: `FS-2026111${i}-B00${i}`,
+      },
+      {
+        scannedAtIso: `2026-11-16T12:0${i}:00.000Z`,
+        source: 'CAMERA',
+        storage: mockStorage,
+      }
+    );
+  }
+
+  const persistedRaw = mockStorage.getItem(LS_KEY_QR_SCAN_HISTORY);
+  assert.ok(persistedRaw, 'Scan history must be serialized in localStorage');
+  const loaded = loadQrScanHistory(mockStorage);
+  assert.equal(loaded.length, 5);
+  assert.deepEqual(
+    loaded.map((item) => item.certificate.shortCode),
+    [
+      'FS-20261116-B006',
+      'FS-20261115-B005',
+      'FS-20261114-B004',
+      'FS-20261113-B003',
+      'FS-20261112-B002',
+    ]
+  );
+
+  // Individual removal updates localStorage and preserves remaining entries in order
+  const afterRemoveMiddle = removeQrScanHistoryItem('fs-20261114-b004', mockStorage);
+  assert.equal(afterRemoveMiddle.length, 4);
+  assert.deepEqual(
+    loadQrScanHistory(mockStorage).map((item) => item.certificate.shortCode),
+    [
+      'FS-20261116-B006',
+      'FS-20261115-B005',
+      'FS-20261113-B003',
+      'FS-20261112-B002',
+    ]
+  );
+
+  // Verify QrCertificateScannerModal exposes the inline Recent Scanned Certificates section in the default view
+  const modalSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../components/QrCertificateScannerModal.tsx'),
+    'utf8'
+  );
+  assert.ok(modalSrc.includes('data-testid="qr-recent-scans-section"'));
+  assert.ok(modalSrc.includes('data-testid="qr-recent-scans-list"'));
+  assert.ok(modalSrc.includes('data-testid="qr-recent-scans-empty"'));
+  assert.ok(modalSrc.includes('LS_KEY_QR_SCAN_HISTORY'));
+});
+
+test('parcelHazardMonitor evaluates wildfires and severe storms across all user parcels, prioritizes forest/scrub properties, and persists acknowledgments & simulations', async () => {
+  const {
+    FALLBACK_ACTIVE_FIRES,
+    FALLBACK_ACTIVE_STORMS,
+    INITIAL_PARCELS,
+  } = await import('../data/seedCatalog.ts');
+  const { haversineDistanceKm } = await import('./spatialEngine.ts');
+  const {
+    buildSimulatedFireNearParcel,
+    buildSimulatedStormNearParcel,
+    computeCardinalBearingPt,
+    evaluateMultiParcelHazards,
+    loadAcknowledgedHazardAlertIds,
+    loadSimulatedFieldHazards,
+    offsetLatLonByKmAndBearing,
+    saveSimulatedFieldHazards,
+    toggleAcknowledgeHazardAlertId,
+  } = await import('./parcelHazardMonitor.ts');
+
+  // 1. Geodesic bearing & offset math
+  const origin = { lat: 39.7438, lon: -8.8072 };
+  const nePoint = offsetLatLonByKmAndBearing(origin, 2.3, 45);
+  const neDist = haversineDistanceKm(origin, nePoint);
+  const neBearing = computeCardinalBearingPt(origin, nePoint);
+  assert.ok(Math.abs(neDist - 2.3) < 0.08, `Expected ~2.3 km, got ${neDist}`);
+  assert.equal(neBearing.cardinalPt, 'NE');
+
+  const nwPoint = offsetLatLonByKmAndBearing(origin, 3.1, 315);
+  assert.equal(computeCardinalBearingPt(origin, nwPoint).cardinalPt, 'NO');
+
+  // 2. Multi-parcel evaluation at default 15 km radius:
+  // Active Sintra parcel is SAFE, while remote forest parcels (Leiria & Valongo) trigger CRITICAL alerts!
+  const eval15 = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: FALLBACK_ACTIVE_FIRES,
+    storms: FALLBACK_ACTIVE_STORMS,
+    settings: {
+      proximityAlertRadiusKm: 15,
+      enableFireProximityAlerts: true,
+      enableStormProximityAlerts: true,
+      prioritizeForestScrubAlerts: true,
+    },
+  });
+
+  assert.equal(eval15.parcelSummaries['parcel-sintra-colares']?.status, 'SAFE');
+  assert.equal(eval15.parcelSummaries['parcel-leiria-pinhal']?.status, 'CRITICAL');
+  assert.equal(eval15.parcelSummaries['parcel-valongo-serra']?.status, 'CRITICAL');
+  assert.equal(eval15.counts.affectedParcelsCount, 2);
+  assert.ok(eval15.counts.fireAlertsCount >= 2);
+  assert.ok(eval15.counts.stormAlertsCount >= 2);
+  assert.equal(eval15.counts.unacknowledgedCount, eval15.counts.totalAlerts);
+
+  // 3. Narrowing radius to 5 km clears distant regional hazards, and injecting a simulated forest fire triggers immediate CRITICAL alert
+  const eval5Safe = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: FALLBACK_ACTIVE_FIRES,
+    storms: FALLBACK_ACTIVE_STORMS,
+    settings: {
+      proximityAlertRadiusKm: 5,
+      enableFireProximityAlerts: true,
+      enableStormProximityAlerts: true,
+      prioritizeForestScrubAlerts: true,
+    },
+  });
+  assert.equal(eval5Safe.counts.totalAlerts, 0);
+  assert.equal(eval5Safe.parcelSummaries['parcel-leiria-pinhal']?.status, 'SAFE');
+
+  const simFireLeiria = buildSimulatedFireNearParcel(INITIAL_PARCELS[1]);
+  const simStormSintra = buildSimulatedStormNearParcel(INITIAL_PARCELS[0]);
+  const eval5WithSim = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: [simFireLeiria, ...FALLBACK_ACTIVE_FIRES],
+    storms: [simStormSintra, ...FALLBACK_ACTIVE_STORMS],
+    settings: {
+      proximityAlertRadiusKm: 5,
+      enableFireProximityAlerts: true,
+      enableStormProximityAlerts: true,
+      prioritizeForestScrubAlerts: true,
+    },
+  });
+  assert.equal(eval5WithSim.parcelSummaries['parcel-leiria-pinhal']?.status, 'CRITICAL');
+  assert.equal(eval5WithSim.parcelSummaries['parcel-sintra-colares']?.status, 'CRITICAL');
+  assert.equal(eval5WithSim.counts.affectedParcelsCount, 2);
+
+  // 4. Widening radius to 25 km brings Sintra into surveillance (Mafra fire ~23.4 km & Cascais storm)
+  const eval25 = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: FALLBACK_ACTIVE_FIRES,
+    storms: FALLBACK_ACTIVE_STORMS,
+    settings: {
+      proximityAlertRadiusKm: 25,
+      enableFireProximityAlerts: true,
+      enableStormProximityAlerts: true,
+      prioritizeForestScrubAlerts: true,
+    },
+  });
+  assert.notEqual(eval25.parcelSummaries['parcel-sintra-colares']?.status, 'SAFE');
+  assert.equal(eval25.counts.affectedParcelsCount, 3);
+
+  // 5. Channel toggles & acknowledgment/simulation persistence
+  const firesOnly = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: FALLBACK_ACTIVE_FIRES,
+    storms: FALLBACK_ACTIVE_STORMS,
+    settings: {
+      proximityAlertRadiusKm: 15,
+      enableFireProximityAlerts: true,
+      enableStormProximityAlerts: false,
+      prioritizeForestScrubAlerts: true,
+    },
+  });
+  assert.equal(firesOnly.counts.stormAlertsCount, 0);
+  assert.ok(firesOnly.counts.fireAlertsCount >= 2);
+
+  const mem = new Map<string, string>();
+  const kv = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      mem.set(k, v);
+    },
+    removeItem: (k: string) => {
+      mem.delete(k);
+    },
+  };
+
+  const firstAlertId = eval15.alerts[0].alertId;
+  const ackedIds = toggleAcknowledgeHazardAlertId([], firstAlertId, kv);
+  assert.deepEqual(loadAcknowledgedHazardAlertIds(kv), [firstAlertId]);
+
+  const evalAfterAck = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: FALLBACK_ACTIVE_FIRES,
+    storms: FALLBACK_ACTIVE_STORMS,
+    settings: { proximityAlertRadiusKm: 15 },
+    acknowledgedAlertIds: ackedIds,
+  });
+  assert.equal(evalAfterAck.counts.unacknowledgedCount, eval15.counts.totalAlerts - 1);
+
+  saveSimulatedFieldHazards({ fires: [simFireLeiria], storms: [simStormSintra] }, kv);
+  assert.equal(loadSimulatedFieldHazards(kv).fires.length, 1);
+  assert.equal(loadSimulatedFieldHazards(kv).storms.length, 1);
+  saveSimulatedFieldHazards({ fires: [], storms: [] }, kv);
+  assert.equal(loadSimulatedFieldHazards(kv).fires.length, 0);
+});
+
+test('officialAlertsIngestor parses chunked ANEPC SADO SSE streams, classifies Proteção Civil occurrences, maps IPMA PTO/STB warnings, and matches district-wide IPMA alerts to user parcels', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const {
+    classifyAnepcIncidents,
+    consumeSseBuffer,
+    doesIpmaWarningMatchParcelDistrict,
+    hydrateIpmaAreaLocations,
+    mergeSecondaryApiAbertaFires,
+    parseAnepcCountsPayload,
+    parseIpmaWarningsPayload,
+    resolveIpmaAreaCodeForDistrict,
+  } = await import('./officialAlertsIngestor.ts');
+  const { evaluateMultiParcelHazards } = await import('./parcelHazardMonitor.ts');
+
+  // 1. Official Portuguese District <-> IPMA idAreaAviso resolution (including PTO & STB)
+  assert.equal(resolveIpmaAreaCodeForDistrict('Porto'), 'PTO');
+  assert.equal(resolveIpmaAreaCodeForDistrict('Setúbal'), 'STB');
+  assert.equal(resolveIpmaAreaCodeForDistrict('Setubal'), 'STB');
+  assert.equal(resolveIpmaAreaCodeForDistrict('Leiria'), 'LRA');
+  assert.equal(resolveIpmaAreaCodeForDistrict('Lisboa'), 'LSB');
+  assert.equal(resolveIpmaAreaCodeForDistrict('Évora'), 'EVO');
+
+  // 2. Chunked SSE buffer assembly across arbitrary TCP packet splits
+  const sampleIncidentsArray = [
+    {
+      id: '01a1c67b-ad19-74be-821d-514846e2cf68',
+      dates: { started: '2026-11-16T10:00:00', last_updated: '2026-11-16T13:40:36' },
+      means_involved: { aerial: 0, aquatic: 0, man: 14, terrain: 4, total_meios: 18 },
+      location: {
+        district: 'Leiria',
+        county: 'Leiria',
+        parish: 'Leiria, Pousos, Barreira e Cortes',
+      },
+      coordinates: { latitude: '39.74917900', longitude: '-8.80283200' },
+      occurrence: {
+        status: 'Vigilância',
+        natureza: 'Situação Crítica',
+        naturezaCode: '9999',
+        category: 'fire',
+        category_name: 'Incêndios',
+        significant: false,
+      },
+    },
+    {
+      id: 'tree-fall-valongo-1',
+      dates: { started: '2026-11-16T12:15:00', last_updated: '2026-11-16T13:42:00' },
+      means_involved: { aerial: 0, aquatic: 0, man: 8, terrain: 2, total_meios: 10 },
+      location: {
+        district: 'Porto',
+        county: 'Valongo',
+        parish: 'Valongo',
+      },
+      coordinates: { latitude: '41.186200', longitude: '-8.496100' },
+      occurrence: {
+        status: 'Em Curso',
+        natureza: 'Queda de Árvore',
+        naturezaCode: '4301',
+        category: 'weather',
+        category_name: 'Comprometimento de Segurança ou Serviços',
+        significant: false,
+      },
+    },
+    {
+      id: 'medical-indoor-ignore',
+      dates: { started: '2026-11-16T12:30:00' },
+      means_involved: { man: 2, terrain: 1 },
+      location: { district: 'Lisboa', county: 'Sintra', parish: 'Colares' },
+      coordinates: { latitude: '38.799100', longitude: '-9.462000' },
+      occurrence: {
+        status: 'Em Curso',
+        natureza: 'Assistência em Saúde',
+        category: 'health',
+        category_name: 'Pré-Hospitalar',
+      },
+    },
+  ];
+
+  const fullSseStream =
+    `event: counts\ndata: {"total_ocorrencias":51,"total_operacionais":150,"total_veiculos":61,"total_aereos":0,"total_incendios":1,"total_significativas":0}\n\n` +
+    `: keepalive\n\n` +
+    `event: incidents\ndata: ${JSON.stringify(sampleIncidentsArray)}\n\n`;
+
+  // Split right in the middle of the JSON array to prove consumeSseBuffer never emits truncated JSON
+  const chunk1 = fullSseStream.slice(0, 210);
+  const chunk2 = fullSseStream.slice(210);
+
+  const step1 = consumeSseBuffer(chunk1);
+  assert.equal(step1.frames.length, 1);
+  assert.equal(step1.frames[0].event, 'counts');
+  const counts = parseAnepcCountsPayload(step1.frames[0].data);
+  assert.ok(counts);
+  assert.equal(counts.totalOccurrences, 51);
+  assert.equal(counts.totalOperatives, 150);
+
+  const step2 = consumeSseBuffer(step1.remainder + chunk2);
+  assert.equal(step2.frames.length, 1);
+  assert.equal(step2.frames[0].event, 'incidents');
+  assert.equal(step2.remainder, '');
+
+  const classified = classifyAnepcIncidents(step2.frames[0].data);
+  assert.equal(classified.fires.length, 1);
+  assert.equal(classified.fires[0].source, 'ANEPC Proteção Civil (Tempo Real)');
+  assert.equal(classified.fires[0].nature, 'Situação Crítica');
+  assert.equal(classified.civilWeatherHazards.length, 1);
+  assert.equal(classified.civilWeatherHazards[0].source, 'ANEPC Proteção Civil (Tempo Real)');
+  assert.ok(classified.civilWeatherHazards[0].title.includes('Queda de Árvore'));
+
+  // Secondary API Aberta deduplication within 0.75 km
+  const mergedFires = mergeSecondaryApiAbertaFires(classified.fires, [
+    { id: 999, concelho: 'Leiria', lat: 39.7492, lng: -8.8029, man: 14, terrain: 4 },
+    { id: 1001, concelho: 'Mação', freguesia: 'Amêndoa', lat: 39.612, lng: -8.041, man: 32, terrain: 9 },
+  ]);
+  assert.equal(mergedFires.length, 2);
+
+  // 3. Official IPMA warnings parsing (PTO Porto land warning kept; PTO marine Agitação Marítima excluded for land parcels)
+  const hydratedAreas = hydrateIpmaAreaLocations({
+    data: [
+      { idAreaAviso: 'PTO', local: 'Porto', latitude: '41.1580', longitude: '-8.6294' },
+      { idAreaAviso: 'VRL', local: 'Vila Real', latitude: '41.3006', longitude: '-7.7441' },
+    ],
+  });
+  const ipmaWarnings = parseIpmaWarningsPayload(
+    [
+      {
+        idAreaAviso: 'PTO',
+        awarenessTypeName: 'Precipitação',
+        awarenessLevelID: 'yellow',
+        startTime: '2026-11-16T18:00:00',
+        endTime: '2026-11-17T06:00:00',
+        text: 'Precipitação persistente e por vezes forte, em especial nas serras.',
+      },
+      {
+        idAreaAviso: 'VRL',
+        awarenessTypeName: 'Vento',
+        awarenessLevelID: 'orange',
+        startTime: '2026-11-16T18:00:00',
+        endTime: '2026-11-17T06:00:00',
+        text: 'Rajadas até 95 km/h nas terras altas.',
+      },
+      {
+        idAreaAviso: 'PTO',
+        awarenessTypeName: 'Agitação Marítima',
+        awarenessLevelID: 'orange',
+        startTime: '2026-11-16T12:00:00',
+        endTime: '2026-11-17T12:00:00',
+        text: 'Ondas de noroeste com 4 a 5 metros.',
+      },
+      {
+        idAreaAviso: 'LSB',
+        awarenessTypeName: 'Vento',
+        awarenessLevelID: 'green',
+        startTime: '2026-11-16T12:00:00',
+        endTime: '2026-11-17T12:00:00',
+        text: '',
+      },
+    ],
+    hydratedAreas
+  );
+  assert.equal(ipmaWarnings.length, 2, 'Marine-only Agitação Marítima and green warnings must be excluded');
+  const ptoRain = ipmaWarnings.find((w) => w.id.includes('precipitacao'));
+  assert.ok(ptoRain);
+  assert.equal(ptoRain.isDistrictWideWarning, true);
+
+  const valongoParcel = INITIAL_PARCELS.find((p) => p.id === 'parcel-valongo-serra')!;
+  assert.equal(doesIpmaWarningMatchParcelDistrict(ptoRain, valongoParcel), true);
+
+  // 4a. IPMA Yellow district warning alone puts Valongo in WARNING ('Em Vigilância'), not CRITICAL
+  const ipmaOnlyEval = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: [],
+    storms: ipmaWarnings,
+    settings: { proximityAlertRadiusKm: 5 },
+  });
+  assert.equal(ipmaOnlyEval.parcelSummaries['parcel-valongo-serra']?.status, 'WARNING');
+  assert.equal(ipmaOnlyEval.parcelSummaries['parcel-sintra-colares']?.status, 'SAFE');
+
+  // 4b. Combined with live ANEPC occurrences (0.7 km Leiria Situação Crítica + 0.8 km Valongo 8-man Queda de Árvore):
+  const liveEval = evaluateMultiParcelHazards({
+    parcels: INITIAL_PARCELS,
+    fires: classified.fires,
+    storms: [...ipmaWarnings, ...classified.civilWeatherHazards],
+    settings: {
+      proximityAlertRadiusKm: 5,
+      enableFireProximityAlerts: true,
+      enableStormProximityAlerts: true,
+      prioritizeForestScrubAlerts: true,
+    },
+  });
+
+  assert.equal(liveEval.parcelSummaries['parcel-sintra-colares']?.status, 'SAFE');
+  assert.equal(liveEval.parcelSummaries['parcel-leiria-pinhal']?.status, 'CRITICAL');
+  assert.equal(liveEval.parcelSummaries['parcel-valongo-serra']?.status, 'CRITICAL');
+  const valongoDistrictAlert = liveEval.alerts.find(
+    (a) => a.parcelId === 'parcel-valongo-serra' && a.inSameWarnedDistrict === true
+  );
+  assert.ok(valongoDistrictAlert, 'Valongo parcel in Porto district must receive PTO IPMA land warning');
+  assert.equal(valongoDistrictAlert.urgency, 'WARNING');
+});

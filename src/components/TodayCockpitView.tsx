@@ -19,18 +19,39 @@ import type {
   ParcelRecord,
   PermissionStatus,
   PirLevel,
+  RealtimeHazardFeedMeta,
+  UserAppSettings,
 } from '../types/domain.ts';
+import type { MultiParcelHazardEvaluation } from '../lib/parcelHazardMonitor.ts';
 import { getStatutoryDeadlineStatus, PIR_SCALE } from '../lib/pirRules.ts';
 import { PirSoilTrendPanel } from './PirSoilTrendPanel.tsx';
 import { RegionalFireIncidentsChart } from './RegionalFireIncidentsChart.tsx';
+import { ParcelHazardControlPanel } from './ParcelHazardControlPanel.tsx';
 
 interface TodayCockpitViewProps {
+  parcels: ParcelRecord[];
   activeParcel: ParcelRecord;
   forecasts: DailyPirForecast[];
   pirSource: string;
   fires: ActiveFireIncident[];
   within15KmCount: number;
+  userSettings: UserAppSettings;
+  multiParcelEvaluation: MultiParcelHazardEvaluation;
+  hazardFeedMeta?: RealtimeHazardFeedMeta;
+  hasActiveSimulation: boolean;
+  isRefreshingHazards: boolean;
+  lastHazardCheckLabel: string;
+  notificationPermissionState: 'unsupported' | 'default' | 'granted' | 'denied';
   isAuthenticated: boolean;
+  onUpdateSettings: (next: UserAppSettings) => void;
+  onRefreshHazards: () => void;
+  onSelectParcel: (parcelId: string) => void;
+  onFocusParcelOnMap: (parcelId: string) => void;
+  onToggleAcknowledgeAlert: (alertId: string) => void;
+  onSimulateFireNearParcel: (parcel: ParcelRecord) => void;
+  onSimulateStormNearParcel: (parcel: ParcelRecord) => void;
+  onClearSimulations: () => void;
+  onRequestBrowserNotifications: () => void;
   onLogDecisionToHistory: (payload: {
     pirLevel: PirLevel;
     soilMoisturePct: number;
@@ -58,12 +79,29 @@ function statusLabelPt(status: PermissionStatus): string {
 }
 
 export const TodayCockpitView: React.FC<TodayCockpitViewProps> = ({
+  parcels,
   activeParcel,
   forecasts,
   pirSource,
   fires,
   within15KmCount,
+  userSettings,
+  multiParcelEvaluation,
+  hazardFeedMeta,
+  hasActiveSimulation,
+  isRefreshingHazards,
+  lastHazardCheckLabel,
+  notificationPermissionState,
   isAuthenticated,
+  onUpdateSettings,
+  onRefreshHazards,
+  onSelectParcel,
+  onFocusParcelOnMap,
+  onToggleAcknowledgeAlert,
+  onSimulateFireNearParcel,
+  onSimulateStormNearParcel,
+  onClearSimulations,
+  onRequestBrowserNotifications,
   onLogDecisionToHistory,
   onOpenHistoryModal,
   onNavigateTab,
@@ -321,6 +359,28 @@ export const TodayCockpitView: React.FC<TodayCockpitViewProps> = ({
         </div>
       </section>
 
+      {/* Multi-Parcel Wildfire & Storm Proximity Control Across All Registered User Properties */}
+      <ParcelHazardControlPanel
+        parcels={parcels}
+        activeParcelId={activeParcel.id}
+        evaluation={multiParcelEvaluation}
+        userSettings={userSettings}
+        feedMeta={hazardFeedMeta}
+        hasActiveSimulation={hasActiveSimulation}
+        isRefreshing={isRefreshingHazards}
+        lastCheckedAtLabel={lastHazardCheckLabel}
+        notificationPermissionState={notificationPermissionState}
+        onUpdateSettings={onUpdateSettings}
+        onRefreshHazards={onRefreshHazards}
+        onSelectParcel={onSelectParcel}
+        onFocusParcelOnMap={onFocusParcelOnMap}
+        onToggleAcknowledgeAlert={onToggleAcknowledgeAlert}
+        onSimulateFireNearParcel={onSimulateFireNearParcel}
+        onSimulateStormNearParcel={onSimulateStormNearParcel}
+        onClearSimulations={onClearSimulations}
+        onRequestBrowserNotifications={onRequestBrowserNotifications}
+      />
+
       {/* Recharts 7-Day PIR Meteorological Risk & Soil Moisture Evolution Panel */}
       <PirSoilTrendPanel
         activeParcel={activeParcel}
@@ -425,7 +485,7 @@ export const TodayCockpitView: React.FC<TodayCockpitViewProps> = ({
                 Radar ANEPC · Ocorrências Rurais
               </h2>
               <span className="text-xs font-mono tabular-nums text-slate-600 dark:text-slate-400">
-                Raio 15 km: {within15KmCount}
+                Raio {userSettings.proximityAlertRadiusKm} km: {within15KmCount}
               </span>
             </div>
             <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">
@@ -447,7 +507,7 @@ export const TodayCockpitView: React.FC<TodayCockpitViewProps> = ({
                   <div className="text-right shrink-0">
                     <div
                       className={`text-sm font-bold font-mono tabular-nums ${
-                        inc.distanceKm <= 15
+                        inc.distanceKm <= userSettings.proximityAlertRadiusKm
                           ? 'text-[#DC2626]'
                           : 'text-slate-800 dark:text-slate-200'
                       }`}

@@ -5,11 +5,15 @@
 
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
+  AlertTriangle,
   Check,
+  CloudLightning,
   Download,
+  Flame,
   History,
   LogOut,
   Map as MapIcon,
+  MapPin,
   Moon,
   Share2,
   Sun,
@@ -29,13 +33,13 @@ import type {
   ParcelRecord,
   PirLevel,
   QuoteLead,
+  StormAlertIncident,
   UserAccountProfile,
   UserAppSettings,
   UserHistoryCategory,
   UserHistoryRecord,
 } from './types/domain.ts';
 import {
-  FALLBACK_ACTIVE_FIRES,
   INITIAL_CERTIFICATES,
   INITIAL_PARCELS,
   INITIAL_PROVIDERS,
@@ -45,6 +49,16 @@ import {
 import { evaluateOperationalSemaphore } from './lib/pirRules.ts';
 import { buildSevenDayPirSoilSeries } from './lib/pirTrendEngine.ts';
 import { haversineDistanceKm } from './lib/spatialEngine.ts';
+import {
+  buildSimulatedFireNearParcel,
+  buildSimulatedStormNearParcel,
+  evaluateMultiParcelHazards,
+  loadAcknowledgedHazardAlertIds,
+  loadSimulatedFieldHazards,
+  saveSimulatedFieldHazards,
+  toggleAcknowledgeHazardAlertId,
+  type SimulatedFieldHazardsState,
+} from './lib/parcelHazardMonitor.ts';
 import {
   archiveUserHistoryEntry,
   auth,
@@ -100,6 +114,7 @@ import {
   toggleFavoriteProviderId,
 } from './lib/userWorkspaceStore.ts';
 import { useOnlineStatus, usePWAInstall } from './hooks/usePWAInstall.ts';
+import { useRealtimeHazards } from './hooks/useRealtimeHazards.ts';
 import { TodayCockpitView } from './components/TodayCockpitView.tsx';
 import { MapZonesView } from './components/MapZonesView.tsx';
 import { CertifyQuotesView } from './components/CertifyQuotesView.tsx';
@@ -205,20 +220,78 @@ export default function App() {
 
   const activeParcel = parcels.find((p) => p.id === activeParcelId) ?? parcels[0];
 
+  const isOnline = useOnlineStatus();
+
   const [forecasts, setForecasts] = useState<DailyPirForecast[]>(() =>
     buildInitialForecasts(activeParcel.dico)
   );
   const [pirSource, setPirSource] = useState<string>('IPMA RCM');
-  const [fires, setFires] = useState<ActiveFireIncident[]>(() =>
-    FALLBACK_ACTIVE_FIRES.map((f) => ({
-      ...f,
-      distanceKm: haversineDistanceKm(activeParcel.spatial.centroidWgs84, {
-        lat: f.lat,
-        lon: f.lon,
-      }),
-    }))
+  const {
+    rawFires,
+    rawStorms,
+    feedMeta: hazardFeedMeta,
+    isRefreshing: isRefreshingHazards,
+    lastCheckedAtLabel: lastHazardCheckLabel,
+    forceRefresh: refreshActiveHazardsFeed,
+  } = useRealtimeHazards({
+    isOnline,
+    referenceCoord: activeParcel.spatial.centroidWgs84,
+  });
+  const [simulatedHazards, setSimulatedHazards] = useState<SimulatedFieldHazardsState>(() =>
+    loadSimulatedFieldHazards()
   );
-  const [within15KmCount, setWithin15KmCount] = useState<number>(0);
+  const [acknowledgedAlertIds, setAcknowledgedAlertIds] = useState<string[]>(() =>
+    loadAcknowledgedHazardAlertIds()
+  );
+  const [notificationPermissionState, setNotificationPermissionState] = useState<
+    'unsupported' | 'default' | 'granted' | 'denied'
+  >(() => {
+    if (typeof window === 'undefined' || typeof Notification === 'undefined') {
+      return 'unsupported';
+    }
+    return Notification.permission;
+  });
+  const notifiedAlertIdsRef = useRef<Set<string>>(new Set());
+
+  const combinedFires = useMemo(
+    () => [...simulatedHazards.fires, ...rawFires],
+    [simulatedHazards.fires, rawFires]
+  );
+  const combinedStorms = useMemo(
+    () => [...simulatedHazards.storms, ...rawStorms],
+    [simulatedHazards.storms, rawStorms]
+  );
+
+  const fires = useMemo<ActiveFireIncident[]>(() => {
+    const centroid = activeParcel.spatial.centroidWgs84;
+    return combinedFires
+      .map((f) => ({
+        ...f,
+        distanceKm: haversineDistanceKm(centroid, { lat: f.lat, lon: f.lon }),
+      }))
+      .sort((a, b) => a.distanceKm - b.distanceKm);
+  }, [combinedFires, activeParcel.spatial.centroidWgs84]);
+
+  const within15KmCount = useMemo(
+    () => fires.filter((f) => f.distanceKm <= userSettings.proximityAlertRadiusKm).length,
+    [fires, userSettings.proximityAlertRadiusKm]
+  );
+
+  const multiParcelEvaluation = useMemo(
+    () =>
+      evaluateMultiParcelHazards({
+        parcels,
+        fires: combinedFires,
+        storms: combinedStorms,
+        settings: userSettings,
+        acknowledgedAlertIds,
+      }),
+    [parcels, combinedFires, combinedStorms, userSettings, acknowledgedAlertIds]
+  );
+
+  const hasActiveSimulation =
+    simulatedHazards.fires.length > 0 || simulatedHazards.storms.length > 0;
+
   const [verifyingCert, setVerifyingCert] = useState<ComplianceCertificate | null>(null);
   const [showIosInstallGuide, setShowIosInstallGuide] = useState(false);
 
@@ -277,7 +350,6 @@ export default function App() {
   const [showHistoryModal, setShowHistoryModal] = useState<boolean>(false);
 
   const { isInstallable, isInstalled, isIOS, install } = usePWAInstall();
-  const isOnline = useOnlineStatus();
 
   // Only flush to Cloud Firestore when authenticated via real Firebase Auth (cloudUserProfile)
   const cloudUidRef = useRef<string | null>(null);
@@ -668,21 +740,10 @@ export default function App() {
 
   // Initial hydration handled via pullRemoteBackendState on online boot
 
-  // Fetch PIR 3-day semaphore and Active Fires whenever activeParcel changes or connection returns
+  // Fetch PIR 3-day semaphore when activeParcel changes
   useEffect(() => {
     setForecasts(buildInitialForecasts(activeParcel.dico));
-    const c = activeParcel.spatial.centroidWgs84;
-    const radiusKm = userSettings.proximityAlertRadiusKm;
-
-    if (!isOnline) {
-      const localFires = FALLBACK_ACTIVE_FIRES.map((f) => ({
-        ...f,
-        distanceKm: haversineDistanceKm(c, { lat: f.lat, lon: f.lon }),
-      }));
-      setFires(localFires);
-      setWithin15KmCount(localFires.filter((f) => f.distanceKm <= radiusKm).length);
-      return;
-    }
+    if (!isOnline) return;
 
     fetch(`/api/pir/${encodeURIComponent(activeParcel.dico)}`)
       .then((r) => (r.ok ? r.json() : null))
@@ -693,20 +754,35 @@ export default function App() {
         }
       })
       .catch(() => {});
+  }, [activeParcel.id, activeParcel.dico, isOnline]);
 
-    fetch(`/api/fires/active?lat=${c.lat}&lon=${c.lon}`)
-      .then((r) => (r.ok ? r.json() : null))
-      .then((data) => {
-        if (Array.isArray(data?.incidents)) {
-          setFires(data.incidents);
-          const countWithinRadius = data.incidents.filter(
-            (inc: ActiveFireIncident) => Number(inc.distanceKm) <= radiusKm
-          ).length;
-          setWithin15KmCount(countWithinRadius);
-        }
-      })
-      .catch(() => {});
-  }, [activeParcel.id, activeParcel.dico, isOnline, userSettings.proximityAlertRadiusKm]);
+  // Dispatch Web Notification when opted-in and a critical unacknowledged parcel alert is detected
+  useEffect(() => {
+    if (
+      !userSettings.browserNotificationsEnabled ||
+      typeof window === 'undefined' ||
+      typeof Notification === 'undefined' ||
+      Notification.permission !== 'granted'
+    ) {
+      return;
+    }
+
+    for (const alert of multiParcelEvaluation.unacknowledgedAlerts) {
+      if (alert.urgency !== 'CRITICAL') continue;
+      if (notifiedAlertIdsRef.current.has(alert.alertId)) continue;
+      notifiedAlertIdsRef.current.add(alert.alertId);
+      try {
+        new Notification(
+          `FaixaSegura: ${alert.category === 'FIRE' ? 'Incêndio' : 'Tempestade'} perto de ${alert.parcelLabel}`,
+          {
+            body: `${alert.hazardTitle} a ${alert.centerDistanceKm.toFixed(1)} km (${alert.cardinalPt}) do terreno em ${alert.parcelMunicipality}.`,
+          }
+        );
+      } catch {
+        // Ignore browser notification restrictions in constrained contexts
+      }
+    }
+  }, [multiParcelEvaluation.unacknowledgedAlerts, userSettings.browserNotificationsEnabled]);
 
   const handleNavigate = (tab: NavTab, subMode?: string) => {
     if (tab === 'docs') {
@@ -726,6 +802,48 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   };
 
+  const handleFocusParcelOnMap = useCallback((parcelId: string) => {
+    setActiveParcelId(parcelId);
+    setActiveTab('map');
+    window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
+  }, []);
+
+  const handleToggleAcknowledgeAlert = useCallback((alertId: string) => {
+    setAcknowledgedAlertIds((prev) => toggleAcknowledgeHazardAlertId(prev, alertId));
+  }, []);
+
+  const handleSimulateFireNearParcel = useCallback((targetParcel: ParcelRecord) => {
+    const simFire = buildSimulatedFireNearParcel(targetParcel);
+    setSimulatedHazards((prev) => {
+      const next: SimulatedFieldHazardsState = {
+        fires: [simFire, ...prev.fires.filter((f) => f.id !== simFire.id)],
+        storms: prev.storms,
+      };
+      return saveSimulatedFieldHazards(next);
+    });
+    setAcknowledgedAlertIds((prev) =>
+      prev.filter((id) => id !== `alert:fire:${targetParcel.id}:${simFire.id}`)
+    );
+  }, []);
+
+  const handleSimulateStormNearParcel = useCallback((targetParcel: ParcelRecord) => {
+    const simStorm = buildSimulatedStormNearParcel(targetParcel);
+    setSimulatedHazards((prev) => {
+      const next: SimulatedFieldHazardsState = {
+        fires: prev.fires,
+        storms: [simStorm, ...prev.storms.filter((s) => s.id !== simStorm.id)],
+      };
+      return saveSimulatedFieldHazards(next);
+    });
+    setAcknowledgedAlertIds((prev) =>
+      prev.filter((id) => id !== `alert:storm:${targetParcel.id}:${simStorm.id}`)
+    );
+  }, []);
+
+  const handleClearSimulations = useCallback(() => {
+    setSimulatedHazards(saveSimulatedFieldHazards({ fires: [], storms: [] }));
+  }, []);
+
   const handleToggleFavoriteProvider = useCallback((providerId: string) => {
     setFavoriteProviderIds((prev) => {
       const next = toggleFavoriteProviderId(prev, providerId);
@@ -738,6 +856,33 @@ export default function App() {
     const clean = saveUserAppSettings(nextSettings);
     setUserSettings(clean);
   }, []);
+
+  const handleRequestBrowserNotifications = useCallback(async () => {
+    if (typeof window === 'undefined' || typeof Notification === 'undefined') {
+      setNotificationPermissionState('unsupported');
+      return;
+    }
+    if (Notification.permission === 'granted') {
+      setNotificationPermissionState('granted');
+      handleUpdateUserSettings({
+        ...userSettings,
+        browserNotificationsEnabled: !userSettings.browserNotificationsEnabled,
+      });
+      return;
+    }
+    try {
+      const result = await Notification.requestPermission();
+      setNotificationPermissionState(result);
+      if (result === 'granted') {
+        handleUpdateUserSettings({
+          ...userSettings,
+          browserNotificationsEnabled: true,
+        });
+      }
+    } catch {
+      // Ignore permission dialog restrictions
+    }
+  }, [userSettings, handleUpdateUserSettings]);
 
   const handleDeleteParcel = useCallback(
     async (targetParcelId: string): Promise<{ ok: boolean; error?: string }> => {
@@ -1039,11 +1184,20 @@ export default function App() {
               }}
               className="min-h-[42px] flex-1 sm:flex-initial sm:w-60 lg:w-72 min-w-0 px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-900 dark:text-white truncate"
             >
-              {parcels.map((p) => (
-                <option key={p.id} value={p.id}>
-                  {p.label} ({p.municipality})
-                </option>
-              ))}
+              {parcels.map((p) => {
+                const hazardSummary = multiParcelEvaluation.parcelSummaries[p.id];
+                const suffix =
+                  hazardSummary?.status === 'CRITICAL'
+                    ? ' · Alerta Crítico'
+                    : hazardSummary?.status === 'WARNING'
+                      ? ' · Em Vigilância'
+                      : '';
+                return (
+                  <option key={p.id} value={p.id}>
+                    {p.label} ({p.municipality}){suffix}
+                  </option>
+                );
+              })}
             </select>
             <button
               type="button"
@@ -1161,16 +1315,160 @@ export default function App() {
         </div>
       )}
 
+      {/* Global Persistent Multi-Parcel Wildfire & Storm Proximity Alert Banner */}
+      {multiParcelEvaluation.unacknowledgedAlerts.length > 0 && (() => {
+        const topAlert = multiParcelEvaluation.unacknowledgedAlerts[0];
+        const isCritical = topAlert.urgency === 'CRITICAL';
+        const extraAlerts = multiParcelEvaluation.unacknowledgedAlerts.length - 1;
+        const isOtherParcel = topAlert.parcelId !== activeParcel.id;
+        return (
+          <div
+            role="region"
+            aria-label="Alerta de proximidade de incêndio ou tempestade nos terrenos do utilizador"
+            data-testid="global-parcel-hazard-banner"
+            className="max-w-7xl w-full mx-auto px-4 sm:px-6 pt-4"
+          >
+            <div
+              className={`rounded-2xl border p-4 flex flex-col lg:flex-row lg:items-center justify-between gap-3.5 ${
+                isCritical
+                  ? 'bg-rose-50/90 dark:bg-rose-950/35 border-rose-300 dark:border-rose-800/80 text-slate-900 dark:text-slate-100'
+                  : 'bg-amber-50/90 dark:bg-amber-950/30 border-amber-300 dark:border-amber-800/80 text-slate-900 dark:text-slate-100'
+              }`}
+            >
+              <div className="min-w-0 space-y-1">
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs tabular-nums">
+                  <span
+                    className={`inline-flex items-center gap-1.5 font-bold ${
+                      isCritical
+                        ? 'text-[#DC2626] dark:text-rose-400'
+                        : 'text-[#B45309] dark:text-[#FBBF24]'
+                    }`}
+                  >
+                    {topAlert.category === 'FIRE' ? (
+                      <Flame className="w-4 h-4 shrink-0" aria-hidden="true" />
+                    ) : (
+                      <CloudLightning className="w-4 h-4 shrink-0" aria-hidden="true" />
+                    )}
+                    <span>
+                      {isCritical ? 'Alerta Crítico nos Seus Terrenos' : 'Vigilância nos Seus Terrenos'}
+                    </span>
+                  </span>
+                  <span aria-hidden="true" className="text-slate-400">
+                    ·
+                  </span>
+                  <span className="font-semibold">
+                    {topAlert.parcelLabel} ({topAlert.parcelMunicipality})
+                  </span>
+                  {isOtherParcel && (
+                    <>
+                      <span aria-hidden="true" className="text-slate-400">
+                        ·
+                      </span>
+                      <span className="font-medium text-slate-600 dark:text-slate-300">
+                        Noutro terreno da sua carteira
+                      </span>
+                    </>
+                  )}
+                  <span aria-hidden="true" className="text-slate-400">
+                    ·
+                  </span>
+                  <span className="font-mono font-bold">
+                    {topAlert.inSameWarnedDistrict
+                      ? 'No distrito do terreno'
+                      : `${topAlert.centerDistanceKm.toFixed(1)} km (${topAlert.cardinalPt})`}
+                  </span>
+                  {extraAlerts > 0 && (
+                    <>
+                      <span aria-hidden="true" className="text-slate-400">
+                        ·
+                      </span>
+                      <span className="font-medium text-slate-600 dark:text-slate-300">
+                        +{extraAlerts} outro(s) alerta(s) ativo(s)
+                      </span>
+                    </>
+                  )}
+                </div>
+
+                <p className="text-xs sm:text-sm font-semibold text-slate-900 dark:text-white">
+                  {topAlert.hazardTitle} em {topAlert.hazardLocation} —{' '}
+                  <span className="font-normal text-slate-700 dark:text-slate-200">
+                    {topAlert.isForestScrub
+                      ? 'Terreno situado em zona de mato/floresta sob vigilância prioritária.'
+                      : 'Dentro do raio de segurança configurado.'}
+                  </span>
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  data-testid="global-banner-focus-map-btn"
+                  onClick={() => handleFocusParcelOnMap(topAlert.parcelId)}
+                  className="min-h-[40px] px-3.5 py-2 rounded-xl bg-[#DC2626] hover:bg-[#B91C1C] text-white text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  <MapPin className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>Ver Terreno Afetado</span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="global-banner-open-control-btn"
+                  onClick={() => {
+                    if (activeTab !== 'today') {
+                      handleNavigate('today');
+                    } else if (typeof document !== 'undefined') {
+                      document
+                        .getElementById('parcel-hazard-control-heading')
+                        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                    }
+                  }}
+                  className="min-h-[40px] px-3 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  <AlertTriangle className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>Abrir Controlo ({multiParcelEvaluation.counts.affectedParcelsCount} terrenos)</span>
+                </button>
+
+                <button
+                  type="button"
+                  data-testid="global-banner-ack-btn"
+                  onClick={() => handleToggleAcknowledgeAlert(topAlert.alertId)}
+                  className="min-h-[40px] px-3 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-white/80 dark:bg-[#0B0F17]/70 text-xs font-semibold text-slate-700 dark:text-slate-300 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+                >
+                  Marcar como Visto
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Main Content Workspace */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 sm:px-6 py-6">
         {activeTab === 'today' && (
           <TodayCockpitView
+            parcels={parcels}
             activeParcel={activeParcel}
             forecasts={forecasts}
             pirSource={pirSource}
             fires={fires}
             within15KmCount={within15KmCount}
+            userSettings={userSettings}
+            multiParcelEvaluation={multiParcelEvaluation}
+            hazardFeedMeta={hazardFeedMeta}
+            hasActiveSimulation={hasActiveSimulation}
+            isRefreshingHazards={isRefreshingHazards}
+            lastHazardCheckLabel={lastHazardCheckLabel}
+            notificationPermissionState={notificationPermissionState}
             isAuthenticated={Boolean(userProfile)}
+            onUpdateSettings={handleUpdateUserSettings}
+            onRefreshHazards={() => void refreshActiveHazardsFeed()}
+            onSelectParcel={(id) => setActiveParcelId(id)}
+            onFocusParcelOnMap={handleFocusParcelOnMap}
+            onToggleAcknowledgeAlert={handleToggleAcknowledgeAlert}
+            onSimulateFireNearParcel={handleSimulateFireNearParcel}
+            onSimulateStormNearParcel={handleSimulateStormNearParcel}
+            onClearSimulations={handleClearSimulations}
+            onRequestBrowserNotifications={() => void handleRequestBrowserNotifications()}
             onOpenHistoryModal={() => setShowHistoryModal(true)}
             onLogDecisionToHistory={async ({ pirLevel, soilMoisturePct, verdictLabel, detail }) => {
               await recordHistoryOfflineFirst({
@@ -1196,6 +1494,8 @@ export default function App() {
             activeParcel={activeParcel}
             municipalities={municipalities}
             fires={fires}
+            storms={combinedStorms}
+            proximityAlertRadiusKm={userSettings.proximityAlertRadiusKm}
             onSelectParcel={(id) => setActiveParcelId(id)}
             onCreateParcel={(created) => {
               void recordParcelOfflineFirst(created);

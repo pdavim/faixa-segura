@@ -5,6 +5,7 @@ import type {
   MunicipalityInfo,
   ParcelRecord,
   QuoteLead,
+  StormAlertIncident,
 } from '../types/domain.ts';
 import { computeParcelFgc } from '../lib/spatialEngine.ts';
 
@@ -379,3 +380,55 @@ export const FALLBACK_ACTIVE_FIRES: Omit<ActiveFireIncident, 'distanceKm'>[] = [
     source: 'Simulação Preventiva Regional',
   },
 ];
+
+export const FALLBACK_ACTIVE_STORMS: StormAlertIncident[] = [
+  {
+    id: 'storm_2026_leiria_trovoada',
+    title: 'Trovoada Seca e Rajadas Convectivas no Pinhal Litoral',
+    kind: 'DRY_THUNDERSTORM',
+    severity: 'ORANGE',
+    municipality: 'Marinha Grande / Leiria',
+    district: 'Leiria',
+    lat: 39.815,
+    lon: -8.912,
+    radiusKm: 5,
+    maxWindKmh: 86,
+    precipitationMmH: 4,
+    lightningRisk: true,
+    validUntil: 'Hoje · até às 22h00',
+    source: 'Simulação Preventiva Regional',
+  },
+  {
+    id: 'storm_2026_valongo_vento',
+    title: 'Depressão Atlântica — Vento Forte e Queda de Árvores em Encosta',
+    kind: 'WINDSTORM',
+    severity: 'ORANGE',
+    municipality: 'Gondomar / Valongo',
+    district: 'Porto',
+    lat: 41.122,
+    lon: -8.598,
+    radiusKm: 4.5,
+    maxWindKmh: 94,
+    precipitationMmH: 26,
+    lightningRisk: false,
+    validUntil: 'Hoje · até às 23h30',
+    source: 'Simulação Preventiva Regional',
+  },
+  {
+    id: 'storm_2026_cascais_costa',
+    title: 'Rajadas Costeiras e Aguaceiros Fortes na Linha de Cascais',
+    kind: 'EXTREME_GUSTS',
+    severity: 'YELLOW',
+    municipality: 'Cascais',
+    district: 'Lisboa',
+    lat: 38.675,
+    lon: -9.305,
+    radiusKm: 3.5,
+    maxWindKmh: 72,
+    precipitationMmH: 14,
+    lightningRisk: false,
+    validUntil: 'Amanhã · até às 06h00',
+    source: 'Simulação Preventiva Regional',
+  },
+];
+

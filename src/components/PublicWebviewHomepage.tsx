@@ -546,8 +546,8 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
                   )}
                 </div>
 
-                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                  <div className="flex items-center gap-2 flex-1 min-w-0">
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
+                  <div className="flex items-center gap-2.5 flex-1 min-w-0">
                     <input
                       id="public-verify-code-input"
                       type="text"
@@ -581,7 +581,7 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
                         role="status"
                         data-testid="public-verify-hc-badge"
                         title="Modo de Alto Contraste ativo para inspeção sob luz solar intensa no terreno"
-                        className="min-h-[44px] px-3 py-2 rounded-xl border-[3px] border-black dark:border-white bg-[#FACC15] text-black text-xs font-extrabold tracking-tight ring-2 ring-black/30 dark:ring-[#FACC15]/75 shadow-sm motion-safe:animate-pulse inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                        className="hc-badge-subtle-pulse min-h-[44px] px-3 py-2 rounded-xl border-[3px] border-black dark:border-white bg-[#FACC15] text-black text-xs font-extrabold tracking-tight ring-2 ring-black/30 dark:ring-[#FACC15]/75 shadow-sm inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
                       >
                         <Contrast className="w-4 h-4 stroke-[2.75] shrink-0" aria-hidden="true" />
                         <span>Alto Contraste Ativo</span>

@@ -442,6 +442,30 @@ export function appendQrScanHistory(
   return saveQrScanHistory(updated, options?.storage);
 }
 
+export function removeScannedCertificateFromHistory(
+  existing: QrScannedCertificateEntry[],
+  shortCodeOrId: string
+): QrScannedCertificateEntry[] {
+  const needle = shortCodeOrId.trim().toUpperCase();
+  if (!needle) return existing.slice(0, MAX_QR_SCAN_HISTORY_ITEMS);
+  return existing
+    .filter((entry) => {
+      const code = entry.certificate.shortCode.trim().toUpperCase();
+      const id = entry.certificate.id.trim().toUpperCase();
+      return code !== needle && id !== needle;
+    })
+    .slice(0, MAX_QR_SCAN_HISTORY_ITEMS);
+}
+
+export function removeQrScanHistoryItem(
+  shortCodeOrId: string,
+  storage?: QrHistoryStorageLike
+): QrScannedCertificateEntry[] {
+  const current = loadQrScanHistory(storage);
+  const next = removeScannedCertificateFromHistory(current, shortCodeOrId);
+  return saveQrScanHistory(next, storage);
+}
+
 export function clearQrScanHistory(storage?: QrHistoryStorageLike): void {
   const store = resolveDefaultQrStorage(storage);
   if (!store) return;

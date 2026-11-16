@@ -28,12 +28,14 @@ import type {
   LatLon,
   MunicipalityInfo,
   ParcelRecord,
+  StormAlertIncident,
 } from '../types/domain.ts';
 import {
   buildParcelGeoJsonFilename,
   buildParcelVerticesGeoJson,
   computeParcelLeafletBounds,
   computePolygonMetrics3763,
+  haversineDistanceKm,
 } from '../lib/spatialEngine.ts';
 import {
   buildLocalParcelRecord,
@@ -172,6 +174,8 @@ interface MapZonesViewProps {
   activeParcel: ParcelRecord;
   municipalities: MunicipalityInfo[];
   fires: ActiveFireIncident[];
+  storms?: StormAlertIncident[];
+  proximityAlertRadiusKm?: number;
   onSelectParcel: (parcelId: string) => void;
   onCreateParcel: (newParcel: ParcelRecord) => void;
   onNavigateTab: (tab: 'today' | 'map' | 'certify' | 'providers' | 'docs', subMode?: string) => void;
@@ -182,6 +186,8 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   activeParcel,
   municipalities,
   fires,
+  storms = [],
+  proximityAlertRadiusKm = 15,
   onSelectParcel,
   onCreateParcel,
   onNavigateTab,
@@ -198,6 +204,7 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     eredes: true,
     exempt: true,
     neighborRisk: true,
+    hazardPerimeter: true,
   });
 
   // Drawing custom polygon state
@@ -628,21 +635,89 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
       });
     }
 
-    // 8. Active ANEPC Fires markers
-    fires.forEach((f) => {
-      L.circleMarker([f.lat, f.lon], {
-        radius: 8,
-        color: '#FFFFFF',
-        weight: 2,
-        fillColor: '#DC2626',
-        fillOpacity: 0.95,
-      })
-        .bindTooltip(`Fogo Ativo ANEPC: ${f.municipality} (${f.distanceKm.toFixed(1)} km)`, {
-          sticky: true,
+    // 8. Proximity Surveillance Ring + Active ANEPC Fires & IPMA Storm Cells
+    if (visibleLayers.hazardPerimeter) {
+      L.circle([sp.centroidWgs84.lat, sp.centroidWgs84.lon], {
+        radius: proximityAlertRadiusKm * 1000,
+        color: '#22C55E',
+        weight: 1.5,
+        dashArray: '6, 6',
+        fillColor: '#22C55E',
+        fillOpacity: 0.03,
+        interactive: false,
+      }).addTo(group);
+
+      storms.forEach((st) => {
+        const stormColor =
+          st.severity === 'RED'
+            ? '#DC2626'
+            : st.severity === 'ORANGE'
+              ? '#D97706'
+              : '#0284C7';
+        const distKm = haversineDistanceKm(sp.centroidWgs84, { lat: st.lat, lon: st.lon });
+
+        L.circle([st.lat, st.lon], {
+          radius: st.radiusKm * 1000,
+          color: stormColor,
+          weight: 2,
+          dashArray: '6, 4',
+          fillColor: stormColor,
+          fillOpacity: 0.12,
         })
-        .addTo(group);
-    });
-  }, [activeParcel, visibleLayers, drawnVertices, drawVertexActionMode, handleDeleteDrawnVertexAt, fires]);
+          .bindTooltip(
+            `Tempestade / Aviso Meteorológico: ${st.title} · Rajadas ${st.maxWindKmh} km/h (${distKm.toFixed(1)} km)`,
+            { sticky: true }
+          )
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `ALERTA TEMPESTADE (${st.municipality}): ${st.title} — Vento até ${st.maxWindKmh} km/h, precipitação ${st.precipitationMmH} mm/h (${st.validUntil}).`
+            )
+          )
+          .addTo(group);
+
+        L.circleMarker([st.lat, st.lon], {
+          radius: 7,
+          color: '#FFFFFF',
+          weight: 2,
+          fillColor: stormColor,
+          fillOpacity: 0.95,
+        })
+          .bindTooltip(
+            `Centro de Tempestade (${st.municipality}): ${distKm.toFixed(1)} km · ${st.maxWindKmh} km/h`,
+            { sticky: true }
+          )
+          .addTo(group);
+      });
+
+      fires.forEach((f) => {
+        L.circleMarker([f.lat, f.lon], {
+          radius: 8,
+          color: '#FFFFFF',
+          weight: 2,
+          fillColor: '#DC2626',
+          fillOpacity: 0.95,
+        })
+          .bindTooltip(`Fogo Ativo ANEPC: ${f.municipality} (${f.distanceKm.toFixed(1)} km)`, {
+            sticky: true,
+          })
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `OCORRÊNCIA ANEPC (${f.municipality} · ${f.parish}): Incêndio em ${f.nature} (${f.status}) a ${f.distanceKm.toFixed(1)} km deste terreno (${f.operatives} operacionais).`
+            )
+          )
+          .addTo(group);
+      });
+    }
+  }, [
+    activeParcel,
+    visibleLayers,
+    drawnVertices,
+    drawVertexActionMode,
+    handleDeleteDrawnVertexAt,
+    fires,
+    storms,
+    proximityAlertRadiusKm,
+  ]);
 
   const drawnMetrics = computePolygonMetrics3763(drawnVertices);
 
@@ -1053,6 +1128,21 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             >
               <span className="w-2.5 h-2.5 rounded-sm bg-[#A855F7] shrink-0" aria-hidden="true" />
               Vizinho em Risco
+            </button>
+            <button
+              type="button"
+              data-testid="layer-toggle-hazard-perimeter"
+              onClick={() =>
+                setVisibleLayers((v) => ({ ...v, hazardPerimeter: !v.hazardPerimeter }))
+              }
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 tabular-nums ${
+                visibleLayers.hazardPerimeter
+                  ? 'border-[#DC2626] bg-[#DC2626]/10 text-slate-900 dark:text-white'
+                  : 'border-slate-300 dark:border-slate-700 text-slate-500'
+              }`}
+            >
+              <span className="w-2.5 h-2.5 rounded-full bg-[#DC2626] shrink-0" aria-hidden="true" />
+              Incêndios & Tempestades ({proximityAlertRadiusKm} km)
             </button>
           </div>
 

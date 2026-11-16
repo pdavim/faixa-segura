@@ -5,6 +5,7 @@ import type {
   ParcelDocumentCategory,
   ParcelDocumentRecord,
   ParcelRecord,
+  ProximityRadiusKm,
   UserAppSettings,
 } from '../types/domain.ts';
 import { INITIAL_PARCELS, INITIAL_PROVIDERS, MUNICIPALITIES } from '../data/seedCatalog.ts';
@@ -47,6 +48,10 @@ export const DEFAULT_USER_APP_SETTINGS: UserAppSettings = {
   defaultBufferRule: '50M_BUILDING',
   offlineAutoSync: true,
   notifyQuotesWhatsapp: true,
+  enableFireProximityAlerts: true,
+  enableStormProximityAlerts: true,
+  prioritizeForestScrubAlerts: true,
+  browserNotificationsEnabled: false,
 };
 
 export const DEFAULT_FAVORITE_PROVIDER_IDS: string[] = INITIAL_PROVIDERS[0]
@@ -446,8 +451,10 @@ export function saveFavoriteProviderIds(
 export function sanitizeUserAppSettings(raw: Partial<UserAppSettings> | null | undefined): UserAppSettings {
   const src = raw ?? {};
   const pirAlertThreshold: 3 | 4 = src.pirAlertThreshold === 3 ? 3 : 4;
-  const proximityAlertRadiusKm: 10 | 15 | 25 =
-    src.proximityAlertRadiusKm === 10 || src.proximityAlertRadiusKm === 25
+  const proximityAlertRadiusKm: ProximityRadiusKm =
+    src.proximityAlertRadiusKm === 5 ||
+    src.proximityAlertRadiusKm === 10 ||
+    src.proximityAlertRadiusKm === 25
       ? src.proximityAlertRadiusKm
       : 15;
   const defaultBufferRule: '50M_BUILDING' | '100M_SETTLEMENT' =
@@ -469,6 +476,22 @@ export function sanitizeUserAppSettings(raw: Partial<UserAppSettings> | null | u
       typeof src.notifyQuotesWhatsapp === 'boolean'
         ? src.notifyQuotesWhatsapp
         : DEFAULT_USER_APP_SETTINGS.notifyQuotesWhatsapp,
+    enableFireProximityAlerts:
+      typeof src.enableFireProximityAlerts === 'boolean'
+        ? src.enableFireProximityAlerts
+        : true,
+    enableStormProximityAlerts:
+      typeof src.enableStormProximityAlerts === 'boolean'
+        ? src.enableStormProximityAlerts
+        : true,
+    prioritizeForestScrubAlerts:
+      typeof src.prioritizeForestScrubAlerts === 'boolean'
+        ? src.prioritizeForestScrubAlerts
+        : true,
+    browserNotificationsEnabled:
+      typeof src.browserNotificationsEnabled === 'boolean'
+        ? src.browserNotificationsEnabled
+        : false,
   };
 }
 

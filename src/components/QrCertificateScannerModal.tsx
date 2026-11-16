@@ -13,12 +13,14 @@ import {
 } from 'lucide-react';
 import type { ComplianceCertificate } from '../types/domain.ts';
 import {
+  LS_KEY_QR_SCAN_HISTORY,
   MAX_QR_SCAN_HISTORY_ITEMS,
   appendQrScanHistory,
   clearQrScanHistory,
   decodeQrRgbaFrame,
   describeCameraAccessErrorPt,
   loadQrScanHistory,
+  removeQrScanHistoryItem,
   resolveCertificateFromPayload,
   type QrScanSource,
   type QrScannedCertificateEntry,
@@ -339,8 +341,17 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
         onClose();
       }
     };
+    const onStorage = (e: StorageEvent) => {
+      if (!e.key || e.key === LS_KEY_QR_SCAN_HISTORY) {
+        setScanHistory(loadQrScanHistory());
+      }
+    };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
+    window.addEventListener('storage', onStorage);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('storage', onStorage);
+    };
   }, [isOpen, onClose, stopCameraResources]);
 
   if (!isOpen) return null;
@@ -424,6 +435,11 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
     stopCameraResources();
     onCertificateVerified(certificate);
     onClose();
+  };
+
+  const handleRemoveHistoryItem = (shortCode: string) => {
+    const updated = removeQrScanHistoryItem(shortCode);
+    setScanHistory(updated);
   };
 
   const handleClearHistory = () => {
@@ -686,13 +702,125 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
                 <button
                   type="submit"
                   disabled={isVerifyingPayload}
-                  className="min-h-[44px] px-4 py-2 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] hc:bg-[#0A3619] hc:dark:bg-[#4ADE80] hc:border-2 hc:border-black hc:dark:border-white text-white dark:text-slate-950 hc:dark:text-black text-xs font-semibold hc:font-bold inline-flex items-center justify-center gap-1.5 whitespace-nowrap"
+                  className="min-h-[44px] px-4 py-2 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] hc:bg-[#0A3619] hc:dark:bg-[#4ADE80] hc:border-2 hc:border-black hc:dark:border-white text-white dark:text-slate-950 hc:dark:text-black text-xs font-semibold hc:font-bold inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
                 >
                   <CheckCircle2 className="w-4 h-4" aria-hidden="true" />
                   <span>Validar Código</span>
                 </button>
               </div>
             </form>
+
+            {/* Dedicated Section: Last 5 Successfully Scanned Certificates (Persisted in localStorage) */}
+            <section
+              aria-labelledby="qr-recent-scans-heading"
+              data-testid="qr-recent-scans-section"
+              className="pt-4 border-t border-slate-200 dark:border-[#263248] hc:border-t-2 hc:border-black hc:dark:border-white space-y-2.5"
+            >
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-1.5 min-w-0">
+                  <History
+                    className="w-4 h-4 text-[#14532D] dark:text-[#22C55E] hc:text-black hc:dark:text-[#4ADE80] shrink-0"
+                    aria-hidden="true"
+                  />
+                  <h3
+                    id="qr-recent-scans-heading"
+                    className="text-xs font-bold text-slate-900 dark:text-white hc:text-black hc:dark:text-white"
+                  >
+                    Últimos Certificados Validados
+                  </h3>
+                  <span
+                    aria-hidden="true"
+                    className="text-xs text-slate-400 dark:text-slate-500 hc:text-black hc:dark:text-white"
+                  >
+                    ·
+                  </span>
+                  <span
+                    data-testid="qr-recent-scans-count"
+                    className="text-xs font-mono tabular-nums font-semibold hc:font-bold text-slate-600 dark:text-slate-300 hc:text-black hc:dark:text-white"
+                  >
+                    {scanHistory.length}/{MAX_QR_SCAN_HISTORY_ITEMS}
+                  </span>
+                </div>
+
+                {scanHistory.length > 0 && (
+                  <button
+                    type="button"
+                    data-testid="qr-recent-clear-btn"
+                    onClick={handleClearHistory}
+                    className="min-h-[34px] px-2 py-1 rounded-lg text-xs font-semibold hc:font-bold text-slate-600 dark:text-slate-300 hc:text-black hc:dark:text-white hover:text-[#DC2626] dark:hover:text-red-400 hover:underline hc:underline underline-offset-4 inline-flex items-center gap-1 whitespace-nowrap shrink-0"
+                  >
+                    <Trash2 className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                    <span>Limpar</span>
+                  </button>
+                )}
+              </div>
+
+              {scanHistory.length === 0 ? (
+                <p
+                  data-testid="qr-recent-scans-empty"
+                  className="text-xs text-slate-500 dark:text-slate-400 hc:text-black hc:dark:text-white hc:font-semibold leading-relaxed"
+                >
+                  Nenhum certificado validado recentemente neste dispositivo. Os últimos{' '}
+                  {MAX_QR_SCAN_HISTORY_ITEMS} autos verificados ficam guardados localmente para
+                  consulta imediata durante vistorias no terreno.
+                </p>
+              ) : (
+                <ul data-testid="qr-recent-scans-list" className="space-y-2">
+                  {scanHistory.map((entry) => {
+                    const cert = entry.certificate;
+                    return (
+                      <li
+                        key={cert.shortCode}
+                        className="flex items-stretch gap-1.5 rounded-xl border border-slate-200 dark:border-[#263248] hc:border-2 hc:border-black hc:dark:border-white bg-[#F8FAFC] dark:bg-[#0B0F17] hc:bg-white hc:dark:bg-black p-1.5"
+                      >
+                        <button
+                          type="button"
+                          data-testid={`qr-recent-open-${cert.shortCode}`}
+                          onClick={() => handleRevisitCertificate(cert)}
+                          className="flex-1 min-w-0 text-left rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800/80 px-2.5 py-1.5 transition-colors space-y-1"
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="font-mono tabular-nums text-xs font-bold text-slate-950 dark:text-white hc:text-black hc:dark:text-white truncate">
+                              #{cert.shortCode}
+                            </span>
+                            <span className="inline-flex items-center gap-0.5 text-xs font-semibold hc:font-bold text-[#14532D] dark:text-[#22C55E] hc:text-[#0A3619] hc:dark:text-[#4ADE80] whitespace-nowrap shrink-0">
+                              <span>Consultar</span>
+                              <ChevronRight className="w-3.5 h-3.5" aria-hidden="true" />
+                            </span>
+                          </div>
+
+                          <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-slate-600 dark:text-slate-300 hc:text-black hc:dark:text-white hc:font-semibold">
+                            <span className="font-semibold text-slate-800 dark:text-slate-200 hc:text-black hc:dark:text-white truncate max-w-[180px] sm:max-w-[230px]">
+                              {cert.parcelLabel}
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span>{cert.municipality}</span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-mono tabular-nums">
+                              {cert.cleanedAreaM2.toFixed(0)} m²
+                            </span>
+                            <span aria-hidden="true">·</span>
+                            <span className="font-mono tabular-nums">
+                              {formatScanTimestampPt(entry.scannedAtIso)}
+                            </span>
+                          </div>
+                        </button>
+
+                        <button
+                          type="button"
+                          data-testid={`qr-recent-remove-${cert.shortCode}`}
+                          aria-label={`Remover certificado ${cert.shortCode} das leituras recentes`}
+                          onClick={() => handleRemoveHistoryItem(cert.shortCode)}
+                          className="min-h-[44px] min-w-[40px] px-2 rounded-lg flex items-center justify-center text-slate-400 hover:text-[#DC2626] dark:hover:text-red-400 hc:text-black hc:dark:text-white hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </section>
           </div>
         ) : (
           <div
@@ -753,12 +881,15 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
                 {scanHistory.map((entry) => {
                   const cert = entry.certificate;
                   return (
-                    <li key={cert.shortCode}>
+                    <li
+                      key={cert.shortCode}
+                      className="flex items-stretch gap-1.5 rounded-xl border border-slate-200 dark:border-[#263248] hc:border-2 hc:border-black hc:dark:border-white bg-[#F8FAFC] dark:bg-[#0B0F17] hc:bg-white hc:dark:bg-black p-2"
+                    >
                       <button
                         type="button"
                         data-testid={`qr-history-item-${cert.shortCode}`}
                         onClick={() => handleRevisitCertificate(cert)}
-                        className="w-full text-left rounded-xl border border-slate-200 dark:border-[#263248] hc:border-2 hc:border-black hc:dark:border-white bg-[#F8FAFC] dark:bg-[#0B0F17] hc:bg-white hc:dark:bg-black hover:bg-slate-100 dark:hover:bg-slate-800/80 p-3.5 transition-colors space-y-1.5"
+                        className="flex-1 min-w-0 text-left rounded-lg hover:bg-slate-100 dark:hover:bg-slate-800/80 px-2.5 py-1.5 transition-colors space-y-1.5"
                       >
                         <div className="flex items-center justify-between gap-2">
                           <span className="font-mono tabular-nums text-xs sm:text-sm font-bold text-slate-950 dark:text-white hc:text-black hc:dark:text-white">
@@ -783,6 +914,16 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
                           <span aria-hidden="true">·</span>
                           <span>{formatScanTimestampPt(entry.scannedAtIso)}</span>
                         </div>
+                      </button>
+
+                      <button
+                        type="button"
+                        data-testid={`qr-history-remove-${cert.shortCode}`}
+                        aria-label={`Remover certificado ${cert.shortCode} do histórico`}
+                        onClick={() => handleRemoveHistoryItem(cert.shortCode)}
+                        className="min-h-[44px] min-w-[40px] px-2 rounded-lg flex items-center justify-center text-slate-400 hover:text-[#DC2626] dark:hover:text-red-400 hc:text-black hc:dark:text-white hover:bg-slate-100 dark:hover:bg-slate-800 shrink-0"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" aria-hidden="true" />
                       </button>
                     </li>
                   );
