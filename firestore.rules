@@ -136,8 +136,10 @@ service cloud.firestore {
           'uid',
           'parcelId',
           'label',
+          'district',
           'municipality',
           'dico',
+          'parish',
           'matrixArticle',
           'bupiRggId',
           'landClass',
@@ -146,6 +148,7 @@ service cloud.firestore {
           'avgSlopePct',
           'hasEredesLine',
           'hasProtectedOaks',
+          'userNotes',
           'createdAt',
           'updatedAt'
         ])
@@ -153,8 +156,10 @@ service cloud.firestore {
         && data.uid == request.auth.uid
         && data.parcelId is string && data.parcelId.size() >= 1 && data.parcelId.size() <= 128 && data.parcelId.matches('^[a-zA-Z0-9_\\-]+$')
         && data.label is string && data.label.size() >= 2 && data.label.size() <= 120
+        && (!('district' in data) || (data.district is string && data.district.size() >= 2 && data.district.size() <= 80))
         && data.municipality is string && data.municipality.size() >= 2 && data.municipality.size() <= 80
         && data.dico is string && data.dico.size() == 4 && data.dico.matches('^[0-9]{4}$')
+        && (!('parish' in data) || (data.parish is string && data.parish.size() >= 1 && data.parish.size() <= 180))
         && data.matrixArticle is string && data.matrixArticle.size() >= 1 && data.matrixArticle.size() <= 80
         && data.bupiRggId is string && data.bupiRggId.size() >= 1 && data.bupiRggId.size() <= 40
         && data.landClass is string && data.landClass.size() >= 10 && data.landClass.size() <= 20
@@ -164,6 +169,7 @@ service cloud.firestore {
         && data.avgSlopePct is number && data.avgSlopePct >= 0 && data.avgSlopePct <= 100
         && data.hasEredesLine is bool
         && data.hasProtectedOaks is bool
+        && (!('userNotes' in data) || (data.userNotes is string && data.userNotes.size() <= 2000))
         && data.createdAt is timestamp
         && data.updatedAt is timestamp;
     }
@@ -308,8 +314,10 @@ service cloud.firestore {
             && incoming().updatedAt == request.time
             && incoming().diff(existing()).affectedKeys().hasOnly([
               'label',
+              'district',
               'municipality',
               'dico',
+              'parish',
               'matrixArticle',
               'bupiRggId',
               'landClass',
@@ -318,6 +326,7 @@ service cloud.firestore {
               'avgSlopePct',
               'hasEredesLine',
               'hasProtectedOaks',
+              'userNotes',
               'updatedAt'
             ])
             && hasUserAnchor(userId)

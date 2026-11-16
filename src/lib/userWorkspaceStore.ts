@@ -8,6 +8,10 @@ import type {
   UserAppSettings,
 } from '../types/domain.ts';
 import { INITIAL_PARCELS, INITIAL_PROVIDERS, MUNICIPALITIES } from '../data/seedCatalog.ts';
+import {
+  findMunicipalityByDico,
+  resolveMergedMunicipalityCatalog,
+} from '../data/portugalAdminCatalog.ts';
 import { computeParcelFgc } from './spatialEngine.ts';
 
 export interface KeyValueStorageLike {
@@ -51,6 +55,7 @@ export const DEFAULT_FAVORITE_PROVIDER_IDS: string[] = INITIAL_PROVIDERS[0]
 
 export interface ParcelMutationInput {
   label: string;
+  district?: string;
   dico: string;
   parish?: string;
   matrixArticle?: string;
@@ -59,7 +64,43 @@ export interface ParcelMutationInput {
   avgSlopePct: number;
   hasEredesLine: boolean;
   hasProtectedOaks: boolean;
+  userNotes?: string;
   vertices?: LatLon[];
+}
+
+export interface ParcelLocalLlmNotePayload {
+  schemaVersion: 'faixasegura.local-llm-notes.v1';
+  parcelId: string;
+  label: string;
+  district: string;
+  municipality: string;
+  dico: string;
+  parish: string;
+  matrixArticle: string;
+  bupiRggId: string;
+  landClass: LandClass;
+  userNotes: string;
+  characterCount: number;
+  readyForExtraction: boolean;
+}
+
+export function buildParcelLocalLlmNotePayload(parcel: ParcelRecord): ParcelLocalLlmNotePayload {
+  const cleanNotes = (parcel.userNotes ?? '').trim().slice(0, 2000);
+  return {
+    schemaVersion: 'faixasegura.local-llm-notes.v1',
+    parcelId: parcel.id,
+    label: parcel.label,
+    district: parcel.district,
+    municipality: parcel.municipality,
+    dico: parcel.dico,
+    parish: parcel.parish,
+    matrixArticle: parcel.matrixArticle,
+    bupiRggId: parcel.bupiRggId,
+    landClass: parcel.landClass,
+    userNotes: cleanNotes,
+    characterCount: cleanNotes.length,
+    readyForExtraction: cleanNotes.length > 0,
+  };
 }
 
 export function buildDefaultRectangleAroundCenter(center: LatLon): LatLon[] {
@@ -73,6 +114,57 @@ export function buildDefaultRectangleAroundCenter(center: LatLon): LatLon[] {
 
 export function formatVerticesMultiline(vertices: LatLon[]): string {
   return vertices.map((v) => `${v.lat.toFixed(6)}, ${v.lon.toFixed(6)}`).join('\n');
+}
+
+export function normalizeVertexCoord(point: LatLon): LatLon {
+  return {
+    lat: Number(point.lat.toFixed(6)),
+    lon: Number(point.lon.toFixed(6)),
+  };
+}
+
+export function appendPolygonVertex(vertices: readonly LatLon[], point: LatLon): LatLon[] {
+  return [...vertices, normalizeVertexCoord(point)];
+}
+
+export function updatePolygonVertexAt(
+  vertices: readonly LatLon[],
+  index: number,
+  point: LatLon
+): LatLon[] {
+  if (!Number.isInteger(index) || index < 0 || index >= vertices.length) {
+    return [...vertices];
+  }
+  const normalized = normalizeVertexCoord(point);
+  return vertices.map((existing, idx) => (idx === index ? normalized : existing));
+}
+
+export function removePolygonVertexAt(vertices: readonly LatLon[], index: number): LatLon[] {
+  if (!Number.isInteger(index) || index < 0 || index >= vertices.length) {
+    return [...vertices];
+  }
+  return vertices.filter((_, idx) => idx !== index);
+}
+
+export function clearAllPolygonVertices(): LatLon[] {
+  return [];
+}
+
+export function resolveNextSelectedVertexIndexAfterRemoval(
+  prevSelectedIndex: number | null,
+  removedIndex: number,
+  nextLength: number
+): number | null {
+  if (prevSelectedIndex === null || nextLength <= 0) {
+    return null;
+  }
+  if (prevSelectedIndex === removedIndex) {
+    return Math.min(removedIndex, nextLength - 1);
+  }
+  if (prevSelectedIndex > removedIndex) {
+    return prevSelectedIndex - 1;
+  }
+  return Math.min(prevSelectedIndex, nextLength - 1);
 }
 
 export function parseVerticesMultiline(rawText: string): {
@@ -159,9 +251,9 @@ export function applyParcelUpdate(
   patch: Partial<ParcelMutationInput> & { recenterVerticesOnMunicipalityChange?: boolean },
   municipalities: MunicipalityInfo[] = MUNICIPALITIES
 ): ParcelRecord {
-  const catalog = municipalities.length > 0 ? municipalities : MUNICIPALITIES;
+  const catalog = resolveMergedMunicipalityCatalog(municipalities);
   const targetDico = patch.dico ?? existing.dico;
-  const muni = catalog.find((m) => m.dico === targetDico) ?? catalog[0];
+  const muni = findMunicipalityByDico(targetDico, catalog);
   const dicoChanged = muni.dico !== existing.dico;
 
   let nextVertices = existing.vertices;
@@ -203,10 +295,15 @@ export function applyParcelUpdate(
 
   const nextParish =
     patch.parish !== undefined && patch.parish.trim().length > 0
-      ? patch.parish.trim().slice(0, 80)
+      ? patch.parish.trim().slice(0, 180)
       : dicoChanged
         ? muni.name
         : existing.parish;
+
+  const nextDistrict =
+    patch.district !== undefined && patch.district.trim().length >= 2
+      ? patch.district.trim().slice(0, 80)
+      : muni.district;
 
   const nextMatrix =
     patch.matrixArticle !== undefined && patch.matrixArticle.trim().length > 0
@@ -218,12 +315,17 @@ export function applyParcelUpdate(
       ? patch.bupiRggId.trim().slice(0, 40)
       : existing.bupiRggId;
 
+  const nextUserNotes =
+    patch.userNotes !== undefined
+      ? patch.userNotes.trim().slice(0, 2000)
+      : (existing.userNotes ?? '');
+
   return {
     ...existing,
     label: nextLabel,
     parish: nextParish,
     municipality: muni.name,
-    district: muni.district,
+    district: nextDistrict,
     dico: muni.dico,
     dicofre: dicoChanged ? muni.dicofreDefault : existing.dicofre,
     isPriorityParish: dicoChanged ? muni.isPriorityParishDefault : existing.isPriorityParish,
@@ -241,6 +343,7 @@ export function applyParcelUpdate(
     protectedOakNotes: nextHasOaks
       ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
       : 'Sem quercíneas protegidas assinaladas no polígono.',
+    userNotes: nextUserNotes,
     vertices: nextVertices,
     buildingCenter: nextSpatial.centroidWgs84,
     spatial: nextSpatial,
@@ -758,3 +861,225 @@ export function createBrowserParcelDocumentStorage(): ParcelDocumentStorageAdapt
     },
   };
 }
+
+export const LS_KEY_THEME_DARK = 'fs_user_theme_dark_v1';
+export const LS_KEY_THEME_HIGH_CONTRAST = 'fs_user_theme_high_contrast_v1';
+
+export function loadThemeDarkPreference(storage?: KeyValueStorageLike | null): boolean {
+  const target =
+    storage !== undefined
+      ? storage
+      : typeof localStorage !== 'undefined'
+        ? localStorage
+        : null;
+  if (!target) return false;
+  try {
+    return target.getItem(LS_KEY_THEME_DARK) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveThemeDarkPreference(
+  darkMode: boolean,
+  storage?: KeyValueStorageLike | null
+): boolean {
+  const target =
+    storage !== undefined
+      ? storage
+      : typeof localStorage !== 'undefined'
+        ? localStorage
+        : null;
+  if (target) {
+    try {
+      target.setItem(LS_KEY_THEME_DARK, darkMode ? 'true' : 'false');
+    } catch {
+      // Ignore storage quota restrictions
+    }
+  }
+  return darkMode;
+}
+
+export function loadHighContrastPreference(storage?: KeyValueStorageLike | null): boolean {
+  const target =
+    storage !== undefined
+      ? storage
+      : typeof localStorage !== 'undefined'
+        ? localStorage
+        : null;
+  if (!target) return false;
+  try {
+    return target.getItem(LS_KEY_THEME_HIGH_CONTRAST) === 'true';
+  } catch {
+    return false;
+  }
+}
+
+export function saveHighContrastPreference(
+  highContrastMode: boolean,
+  storage?: KeyValueStorageLike | null
+): boolean {
+  const target =
+    storage !== undefined
+      ? storage
+      : typeof localStorage !== 'undefined'
+        ? localStorage
+        : null;
+  if (target) {
+    try {
+      target.setItem(LS_KEY_THEME_HIGH_CONTRAST, highContrastMode ? 'true' : 'false');
+    } catch {
+      // Ignore storage quota restrictions
+    }
+  }
+  return highContrastMode;
+}
+
+export function resolveDocumentThemeClasses(params: {
+  darkMode: boolean;
+  highContrastMode: boolean;
+}): {
+  activeClasses: Array<'dark' | 'high-contrast'>;
+  inactiveClasses: Array<'dark' | 'high-contrast'>;
+  dataHighContrast: 'true' | 'false';
+} {
+  const activeClasses: Array<'dark' | 'high-contrast'> = [];
+  const inactiveClasses: Array<'dark' | 'high-contrast'> = [];
+
+  if (params.darkMode) {
+    activeClasses.push('dark');
+  } else {
+    inactiveClasses.push('dark');
+  }
+
+  if (params.highContrastMode) {
+    activeClasses.push('high-contrast');
+  } else {
+    inactiveClasses.push('high-contrast');
+  }
+
+  return {
+    activeClasses,
+    inactiveClasses,
+    dataHighContrast: params.highContrastMode ? 'true' : 'false',
+  };
+}
+
+export type UserGalleryItemId =
+  | 'properties'
+  | 'favorites'
+  | 'settings'
+  | 'theme'
+  | 'history'
+  | 'docs'
+  | 'logout';
+
+export interface UserGalleryCardDescriptor {
+  id: UserGalleryItemId;
+  title: string;
+  shortTitle: string;
+  kicker: string;
+  description: string;
+  actionKind: 'SECTION' | 'LOGOUT';
+}
+
+export function buildUserGalleryCatalog(params: {
+  parcelCount: number;
+  documentCount: number;
+  favoriteProviderCount: number;
+  darkMode: boolean;
+  historyCount: number;
+  certificateCount: number;
+  displayName: string;
+  isCloudSession: boolean;
+}): UserGalleryCardDescriptor[] {
+  const {
+    parcelCount,
+    documentCount,
+    favoriteProviderCount,
+    darkMode,
+    historyCount,
+    certificateCount,
+    displayName,
+    isCloudSession,
+  } = params;
+
+  return [
+    {
+      id: 'properties',
+      title: 'Terrenos & Documentos',
+      shortTitle: 'Terrenos & Docs',
+      kicker: `${parcelCount} terrenos · ${documentCount} documentos`,
+      description:
+        'Adicione, atualize ou elimine propriedades BUPi e gira os documentos associados a cada terreno.',
+      actionKind: 'SECTION',
+    },
+    {
+      id: 'favorites',
+      title: 'Prestadores Favoritos',
+      shortTitle: 'Favoritos',
+      kicker: `${favoriteProviderCount} prestadores guardados`,
+      description:
+        'Acesso rápido às equipas florestais certificadas ICNF preferidas para pedidos de orçamento.',
+      actionKind: 'SECTION',
+    },
+    {
+      id: 'settings',
+      title: 'Perfil & Configurações',
+      shortTitle: 'Configurações',
+      kicker: `Titular: ${displayName.split(' ')[0] || 'Utilizador'}`,
+      description:
+        'Dados fiscais para Autos SHA-256, limiares de alerta IPMA RCM, raio ANEPC e sincronização.',
+      actionKind: 'SECTION',
+    },
+    {
+      id: 'theme',
+      title: 'Tema & Modo Escuro',
+      shortTitle: 'Tema & Escuro',
+      kicker: darkMode ? 'Modo Escuro ativo' : 'Modo Solar (Claro) ativo',
+      description:
+        'Alterne entre o Modo Escuro de descanso visual e o Modo Solar de alto contraste no terreno.',
+      actionKind: 'SECTION',
+    },
+    {
+      id: 'history',
+      title: 'Histórico & Autos',
+      shortTitle: 'Histórico',
+      kicker: `${historyCount} registos · ${certificateCount} autos SHA-256`,
+      description:
+        'Consulte intervenções realizadas, cronologia de conformidade e comprovativos PDF emitidos.',
+      actionKind: 'SECTION',
+    },
+    {
+      id: 'docs',
+      title: 'Documentação Técnica',
+      shortTitle: 'Documentação',
+      kicker: 'DL 82/2021 · EPSG:3763 · Servidor',
+      description:
+        'Arquitetura geoespacial, enquadramento legal SGIFR e guia de configuração Linux/Redis.',
+      actionKind: 'SECTION',
+    },
+    {
+      id: 'logout',
+      title: 'Terminar Sessão',
+      shortTitle: 'Logout',
+      kicker: isCloudSession ? 'Sessão Google Cloud ativa' : 'Sessão local ativa',
+      description:
+        'Encerre em segurança a sessão atual neste dispositivo e regresse ao ecrã inicial.',
+      actionKind: 'LOGOUT',
+    },
+  ];
+}
+
+/**
+ * Computes the expected number of thumbnail columns in UserManagementView:
+ * - Web mode (width >= 1280px) or Tablet horizontal mode (width >= 768px and landscape width > height): 3 per row
+ * - Mobile mode (width < 768px) or Tablet vertical mode (768px <= width < 1280px and portrait height >= width): 2 per row
+ */
+export function resolveExpectedUserGalleryColumns(widthPx: number, heightPx: number): 2 | 3 {
+  if (widthPx >= 1280) return 3;
+  if (widthPx >= 768 && widthPx > heightPx) return 3;
+  return 2;
+}
+
+

@@ -447,7 +447,9 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
 
   const label = clampString(parcel.label, 2, 120, 'Parcela BUPi');
   const municipality = clampString(parcel.municipality, 2, 80, 'Sintra');
+  const district = clampString(parcel.district, 2, 80, 'Lisboa');
   const dico = sanitizeDico(parcel.dico);
+  const parish = clampString(parcel.parish, 1, 180, municipality);
   const matrixArticle = clampString(parcel.matrixArticle, 1, 80, 'Rústico');
   const bupiRggId = clampString(parcel.bupiRggId, 1, 40, 'RGG-LOCAL');
   const landClass =
@@ -462,13 +464,16 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
   const avgSlopePct = Math.max(0, Math.min(100, Number(parcel.avgSlopePct) || 0));
   const hasEredesLine = Boolean(parcel.hasEredesLine);
   const hasProtectedOaks = Boolean(parcel.hasProtectedOaks);
+  const userNotes = (parcel.userNotes ?? '').trim().slice(0, 2000);
 
   if (existingSnap.exists()) {
     try {
       await updateDoc(parcelRef, {
         label,
+        district,
         municipality,
         dico,
+        parish,
         matrixArticle,
         bupiRggId,
         landClass,
@@ -477,6 +482,7 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
         avgSlopePct,
         hasEredesLine,
         hasProtectedOaks,
+        userNotes,
         updatedAt: serverTimestamp(),
       });
       return;
@@ -490,8 +496,10 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
       uid,
       parcelId,
       label,
+      district,
       municipality,
       dico,
+      parish,
       matrixArticle,
       bupiRggId,
       landClass,
@@ -500,6 +508,7 @@ export async function saveUserParcelToCloud(uidRaw: string, parcel: ParcelRecord
       avgSlopePct,
       hasEredesLine,
       hasProtectedOaks,
+      userNotes,
       createdAt: serverTimestamp(),
       updatedAt: serverTimestamp(),
     });

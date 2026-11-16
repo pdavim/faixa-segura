@@ -78,6 +78,7 @@ export interface ParcelRecord {
   isPriorityParish: boolean;
   hasProtectedOaks: boolean;
   protectedOakNotes: string;
+  userNotes?: string;
   vertices: LatLon[];
   buildingCenter: LatLon;
   hasEredesLine: boolean;

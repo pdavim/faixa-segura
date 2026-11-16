@@ -21,6 +21,7 @@ import {
   INITIAL_QUOTES,
   MUNICIPALITIES,
 } from './src/data/seedCatalog.ts';
+import { getParishesByMunicipality } from './src/data/portugalAdminCatalog.ts';
 import {
   buildMunicipalGtfGeoJson,
   buildMunicipalGtfKml,
@@ -186,6 +187,26 @@ async function startServer() {
     });
   });
 
+  app.get('/api/parishes/:dico', (req, res) => {
+    const rawDico = String(req.params.dico || '1111').trim().padStart(4, '0');
+    const muni = MUNICIPALITIES.find((m) => m.dico === rawDico);
+    if (!muni) {
+      res.status(404).json({ error: 'Concelho DICO não encontrado.' });
+      return;
+    }
+    const parishes = getParishesByMunicipality({
+      dico: muni.dico,
+      municipalityName: muni.name,
+    });
+    res.json({
+      dico: muni.dico,
+      municipality: muni.name,
+      district: muni.district,
+      count: parishes.length,
+      parishes,
+    });
+  });
+
   // 2. IPMA PIR 3-Day Operational Semaphore (with 1h TTL cache)
   app.get('/api/pir/:dico', async (req, res) => {
     const dico = req.params.dico || '1111';
@@ -337,12 +358,18 @@ async function startServer() {
         ? body.id
         : `parcel-${Date.now()}`;
 
+    const existingMatch = parcelsStore.find((p) => p.id === requestedId);
+    const cleanUserNotes =
+      typeof body.userNotes === 'string'
+        ? body.userNotes.trim().slice(0, 2000)
+        : (existingMatch?.userNotes ?? '');
+
     const newParcel: ParcelRecord = {
       id: requestedId,
       label: body.label.trim(),
-      parish: body.parish?.trim() || muni.name,
+      parish: body.parish?.trim() || existingMatch?.parish || muni.name,
       municipality: muni.name,
-      district: muni.district,
+      district: body.district?.trim() || muni.district,
       dico: muni.dico,
       dicofre: muni.dicofreDefault,
       matrixArticle: body.matrixArticle?.trim() || 'Rústico — Art.º 204, Secção D',
@@ -357,17 +384,18 @@ async function startServer() {
       protectedOakNotes: body.hasProtectedOaks
         ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
         : 'Sem quercíneas protegidas assinaladas no polígono.',
+      userNotes: cleanUserNotes,
       vertices: body.vertices,
       buildingCenter: spatial.centroidWgs84,
       hasEredesLine,
       eredesType: hasEredesLine ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea',
-      ndviHistory: [
+      ndviHistory: existingMatch?.ndviHistory ?? [
         { date: '2026-03-15', ndvi: 0.43, ndmi: 0.28, cloudCoverPct: 7 },
         { date: '2026-04-02', ndvi: 0.51, ndmi: 0.23, cloudCoverPct: 10 },
         { date: '2026-04-18', ndvi: 0.57, ndmi: 0.19, cloudCoverPct: 6 },
         { date: '2026-05-04', ndvi: 0.63, ndmi: 0.15, cloudCoverPct: 8 },
       ],
-      neighborInfo: {
+      neighborInfo: existingMatch?.neighborInfo ?? {
         bupiRef: 'Confrontação Poente (Titular a apurar pela Câmara)',
         vegetationDescription: 'Mato contínuo e silvado junto à estrema poente',
         shrubHeightM: 1.75,
@@ -420,7 +448,7 @@ async function startServer() {
       label: body.label?.trim() || existing.label,
       parish: body.parish?.trim() || existing.parish,
       municipality: muni.name,
-      district: muni.district,
+      district: body.district?.trim() || muni.district,
       dico: muni.dico,
       dicofre: muni.dico !== existing.dico ? muni.dicofreDefault : existing.dicofre,
       matrixArticle: body.matrixArticle?.trim() || existing.matrixArticle,
@@ -433,6 +461,10 @@ async function startServer() {
       protectedOakNotes: hasProtectedOaks
         ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
         : 'Sem quercíneas protegidas assinaladas no polígono.',
+      userNotes:
+        typeof body.userNotes === 'string'
+          ? body.userNotes.trim().slice(0, 2000)
+          : (existing.userNotes ?? ''),
       vertices,
       buildingCenter: spatial.centroidWgs84,
       spatial,
@@ -539,8 +571,13 @@ async function startServer() {
 
   // Public Certificate Verification (/api/verify/:shortCode)
   app.get('/api/verify/:shortCode', (req, res) => {
-    const code = req.params.shortCode.trim().toUpperCase();
-    const cert = certificatesStore.find((c) => c.shortCode.toUpperCase() === code);
+    const code = req.params.shortCode.trim().replace(/^#/, '').toUpperCase();
+    const cert = certificatesStore.find(
+      (c) =>
+        c.shortCode.toUpperCase() === code ||
+        c.sha256Hash.toUpperCase() === code ||
+        c.id.toUpperCase() === code
+    );
     if (!cert) {
       res.status(404).json({ error: 'Certificado não encontrado no registo criptográfico.' });
       return;
@@ -671,6 +708,7 @@ async function startServer() {
     ];
 
     res.json({
+      district: matchedMuni.district,
       municipality: matchedMuni.name,
       dico: matchedMuni.dico,
       matrixArticle: `Rústico — Art.º ${artMatch?.[1] || '218'}, Secção ${secMatch?.[1] || 'F'}`,

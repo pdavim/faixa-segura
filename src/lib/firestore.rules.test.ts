@@ -111,7 +111,7 @@ function isValidUserHistoryEntry(data: Record<string, unknown>, authUid: string)
 }
 
 function isValidUserSavedParcel(data: Record<string, unknown>, authUid: string): boolean {
-  const keys = [
+  const requiredKeys = [
     'uid',
     'parcelId',
     'label',
@@ -128,20 +128,38 @@ function isValidUserSavedParcel(data: Record<string, unknown>, authUid: string):
     'createdAt',
     'updatedAt',
   ];
+  const allowedKeys = [...requiredKeys, 'district', 'parish', 'userNotes'];
+  const actualKeys = Object.keys(data);
+  const keysOk =
+    requiredKeys.every((k) => actualKeys.includes(k)) &&
+    actualKeys.every((k) => allowedKeys.includes(k));
+
+  const districtOk =
+    !('district' in data) ||
+    (typeof data.district === 'string' && data.district.length >= 2 && data.district.length <= 80);
+  const parishOk =
+    !('parish' in data) ||
+    (typeof data.parish === 'string' && data.parish.length >= 1 && data.parish.length <= 180);
+  const userNotesOk =
+    !('userNotes' in data) ||
+    (typeof data.userNotes === 'string' && data.userNotes.length <= 2000);
+
   return (
-    hasExactKeys(data, keys) &&
+    keysOk &&
     isValidId(data.uid) &&
     data.uid === authUid &&
     isValidId(data.parcelId) &&
     typeof data.label === 'string' &&
     data.label.length >= 2 &&
     data.label.length <= 120 &&
+    districtOk &&
     typeof data.municipality === 'string' &&
     data.municipality.length >= 2 &&
     data.municipality.length <= 80 &&
     typeof data.dico === 'string' &&
     data.dico.length === 4 &&
     DICO_RE.test(data.dico) &&
+    parishOk &&
     typeof data.matrixArticle === 'string' &&
     data.matrixArticle.length >= 1 &&
     data.matrixArticle.length <= 80 &&
@@ -161,6 +179,7 @@ function isValidUserSavedParcel(data: Record<string, unknown>, authUid: string):
     data.avgSlopePct <= 100 &&
     typeof data.hasEredesLine === 'boolean' &&
     typeof data.hasProtectedOaks === 'boolean' &&
+    userNotesOk &&
     typeof data.createdAt === 'number' &&
     typeof data.updatedAt === 'number'
   );
@@ -296,8 +315,10 @@ function evaluateFirestoreRule(ctx: RequestContext): 'ALLOWED' | 'PERMISSION_DEN
       const allowedDiff = changedKeys.every((k) =>
         [
           'label',
+          'district',
           'municipality',
           'dico',
+          'parish',
           'matrixArticle',
           'bupiRggId',
           'landClass',
@@ -306,6 +327,7 @@ function evaluateFirestoreRule(ctx: RequestContext): 'ALLOWED' | 'PERMISSION_DEN
           'avgSlopePct',
           'hasEredesLine',
           'hasProtectedOaks',
+          'userNotes',
           'updatedAt',
         ].includes(k)
       );
@@ -604,6 +626,65 @@ test('Dirty Dozen adversarial payloads all return PERMISSION_DENIED while legiti
         ...validParcelPayload,
         parcelId: 'parcel-hijack',
         updatedAt: now + 5000,
+      },
+      existingDocs,
+    }),
+    'PERMISSION_DENIED'
+  );
+
+  // Owner updates district, 138-char official CAOP parish, and Local LLM userNotes within <= 2000 chars
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'update',
+      nowMs: now + 6000,
+      existingData: validParcelPayload,
+      incomingData: {
+        ...validParcelPayload,
+        district: 'Évora',
+        municipality: 'Alandroal',
+        dico: '0701',
+        parish:
+          'União das freguesias de Alandroal (Nossa Senhora da Conceição), São Brás dos Matos (Mina do Bugalho) e Juromenha (Nossa Senhora do Loreto)',
+        userNotes: 'Sobreiros adultos a norte junto ao ribeiro; acesso por caminho alcatroado.',
+        updatedAt: now + 6000,
+      },
+      existingDocs,
+    }),
+    'ALLOWED'
+  );
+
+  // Reject oversized parish (> 180 chars)
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'update',
+      nowMs: now + 6500,
+      existingData: validParcelPayload,
+      incomingData: {
+        ...validParcelPayload,
+        parish: 'P'.repeat(185),
+        updatedAt: now + 6500,
+      },
+      existingDocs,
+    }),
+    'PERMISSION_DENIED'
+  );
+
+  // Reject oversized userNotes (> 2000 chars Denial-of-Wallet guard)
+  assert.equal(
+    evaluateFirestoreRule({
+      auth: { uid: 'user_1', email_verified: true },
+      pathSegments: ['users', 'user_1', 'parcels', 'parcel-101'],
+      operation: 'update',
+      nowMs: now + 7000,
+      existingData: validParcelPayload,
+      incomingData: {
+        ...validParcelPayload,
+        userNotes: 'N'.repeat(2005),
+        updatedAt: now + 7000,
       },
       existingDocs,
     }),

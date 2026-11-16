@@ -1,6 +1,7 @@
 @import "tailwindcss";
 @import "leaflet/dist/leaflet.css";
 @custom-variant dark (&:where(.dark, .dark *));
+@custom-variant hc (&:where(.high-contrast, .high-contrast *));
 
 :root {
   /* === 1. SUPERFÍCIES SOLAR-FIRST (LIGHT DEFAULT P/ TERRENO) === */
@@ -41,6 +42,35 @@
   --fs-text-secondary: #94A3B8;
   --fs-brand-primary: #22C55E;
   color-scheme: dark;
+}
+
+.high-contrast {
+  --fs-bg-canvas: #FFFFFF;
+  --fs-bg-surface: #FFFFFF;
+  --fs-border-strong: #000000;
+  --fs-text-primary: #000000;
+  --fs-text-secondary: #0F172A;
+  --fs-brand-primary: #0A3619;
+  --fs-cta-amber: #92400E;
+}
+
+.dark.high-contrast {
+  --fs-bg-canvas: #000000;
+  --fs-bg-surface: #000000;
+  --fs-border-strong: #FFFFFF;
+  --fs-text-primary: #FFFFFF;
+  --fs-text-secondary: #F8FAFC;
+  --fs-brand-primary: #4ADE80;
+}
+
+.high-contrast :focus-visible {
+  outline: 3px solid #000000;
+  outline-offset: 2px;
+}
+
+.dark.high-contrast :focus-visible {
+  outline: 3px solid #FACC15;
+  outline-offset: 2px;
 }
 
 @layer base {

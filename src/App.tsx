@@ -64,6 +64,7 @@ import {
   OFFLINE_LOCAL_UID,
   OfflineSyncCoordinator,
   buildLocalHistoryEntry,
+  computeEffectivePendingSyncCount,
   createBrowserOfflineStorageAdapter,
   mergeHistoryWithOffline,
   mergeParcelsWithOffline,
@@ -83,12 +84,18 @@ import {
   shouldAutoStartWorkspace,
   type EntryModeOverride,
 } from './lib/appShellMode.ts';
+import { findCertificateByScannedPayload } from './lib/qrVerification.ts';
 import {
   createBrowserParcelDocumentStorage,
   loadFavoriteProviderIds,
+  loadHighContrastPreference,
+  loadThemeDarkPreference,
   loadUserAppSettings,
   removeParcelSafely,
+  resolveDocumentThemeClasses,
   saveFavoriteProviderIds,
+  saveHighContrastPreference,
+  saveThemeDarkPreference,
   saveUserAppSettings,
   toggleFavoriteProviderId,
 } from './lib/userWorkspaceStore.ts';
@@ -138,9 +145,29 @@ function buildInitialForecasts(dico: string): DailyPirForecast[] {
 export default function App() {
   const [activeTab, setActiveTab] = useState<NavTab>('today');
   const [certifySubMode, setCertifySubMode] = useState<string>('certificate');
-  const [userInitialSubTab, setUserInitialSubTab] = useState<UserSubTab>('properties');
+  const [userInitialSubTab, setUserInitialSubTab] = useState<UserSubTab>('gallery');
   const [userSubTabNonce, setUserSubTabNonce] = useState<number>(0);
-  const [darkMode, setDarkMode] = useState<boolean>(false);
+  const [darkMode, setDarkMode] = useState<boolean>(() => loadThemeDarkPreference());
+  const [highContrastMode, setHighContrastMode] = useState<boolean>(() =>
+    loadHighContrastPreference()
+  );
+
+  const updateDarkMode = useCallback((nextValue: boolean | ((prev: boolean) => boolean)) => {
+    setDarkMode((prev) => {
+      const resolved = typeof nextValue === 'function' ? nextValue(prev) : nextValue;
+      return saveThemeDarkPreference(resolved);
+    });
+  }, []);
+
+  const updateHighContrastMode = useCallback(
+    (nextValue: boolean | ((prev: boolean) => boolean)) => {
+      setHighContrastMode((prev) => {
+        const resolved = typeof nextValue === 'function' ? nextValue(prev) : nextValue;
+        return saveHighContrastPreference(resolved);
+      });
+    },
+    []
+  );
 
   // Domain state initialized deterministically so zero-latency rendering works immediately
   const initialDeepLinkParcelId = useMemo(
@@ -269,28 +296,36 @@ export default function App() {
         archiveHistory: archiveUserHistoryEntry,
         deleteHistory: deleteUserHistoryEntry,
         syncParcelToBackend: async (parcel) => {
-          await fetch('/api/parcels', {
+          const resp = await fetch('/api/parcels', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               id: parcel.id,
               label: parcel.label,
+              district: parcel.district,
               dico: parcel.dico,
               parish: parcel.parish,
               matrixArticle: parcel.matrixArticle,
               bupiRggId: parcel.bupiRggId,
               avgSlopePct: parcel.avgSlopePct,
               hasProtectedOaks: parcel.hasProtectedOaks,
+              userNotes: parcel.userNotes ?? '',
               vertices: parcel.vertices,
               landClass: parcel.landClass,
               hasEredesLine: parcel.hasEredesLine,
             }),
           });
+          if (!resp.ok) {
+            throw new Error(`Falha HTTP ${resp.status} na sincronização do terreno.`);
+          }
         },
         deleteParcelFromBackend: async (parcelId) => {
-          await fetch(`/api/parcels/${encodeURIComponent(parcelId)}`, {
+          const resp = await fetch(`/api/parcels/${encodeURIComponent(parcelId)}`, {
             method: 'DELETE',
           });
+          if (!resp.ok && resp.status !== 404) {
+            throw new Error(`Falha HTTP ${resp.status} ao remover terreno no servidor.`);
+          }
         },
       },
     });
@@ -406,12 +441,53 @@ export default function App() {
     [remoteHistory, localHistory, outboxOps, userProfile?.uid]
   );
 
+  const effectivePendingSyncCount = useMemo(
+    () => computeEffectivePendingSyncCount(outboxOps, isCloudSession),
+    [outboxOps, isCloudSession]
+  );
+
   const activeHistoryCount = useMemo(
     () => displayedHistory.filter((h) => h.status === 'ACTIVE').length,
     [displayedHistory]
   );
 
   const currentSoilMoisturePct = buildSevenDayPirSoilSeries(activeParcel, forecasts[0]).currentSoilMoisturePct;
+
+  const pullRemoteBackendState = useCallback(async () => {
+    if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+    try {
+      const r = await fetch('/api/state');
+      if (!r.ok) return;
+      const data = await r.json();
+      if (!data) return;
+      const offlineState = await syncCoordinator.hydrateState();
+      if (Array.isArray(data.municipalities)) setMunicipalities(data.municipalities);
+      if (Array.isArray(data.parcels) && data.parcels.length > 0) {
+        setParcels(
+          mergeParcelsWithOffline(
+            data.parcels,
+            offlineState.parcels,
+            offlineState.deletedParcelIds
+          )
+        );
+      }
+      if (Array.isArray(data.certificates)) setCertificates(data.certificates);
+      if (Array.isArray(data.providers)) setProviders(data.providers);
+      if (Array.isArray(data.quotes)) setQuotes(data.quotes);
+
+      const params = new URLSearchParams(window.location.search);
+      const verifyCode = params.get('verify');
+      if (verifyCode && Array.isArray(data.certificates)) {
+        const { certificate: found } = findCertificateByScannedPayload(
+          data.certificates,
+          verifyCode
+        );
+        if (found) setVerifyingCert(found);
+      }
+    } catch {
+      // Offline-resilient: silent fallback to IndexedDB / localStorage state
+    }
+  }, [syncCoordinator]);
 
   // Hydrate offline IndexedDB / localStorage parcels, history, outbox, and parcel documents immediately on boot
   useEffect(() => {
@@ -433,27 +509,46 @@ export default function App() {
     return () => mq.removeEventListener?.('change', onChange);
   }, []);
 
-  // Automatically resume Firestore synchronization whenever connection returns or tab regains focus
+  // Unconditional automatic offline <-> online synchronization (IndexedDB <-> API & Cloud Firestore)
   useEffect(() => {
-    if (userSettings.offlineAutoSync && isOnline && cloudUserProfile?.uid) {
-      void flushPendingToFirestore(cloudUserProfile.uid);
-    }
-  }, [userSettings.offlineAutoSync, isOnline, cloudUserProfile?.uid, flushPendingToFirestore]);
+    if (!isOnline) return;
+    void (async () => {
+      await flushPendingToFirestore(cloudUserProfile?.uid ?? null);
+      await pullRemoteBackendState();
+    })();
+  }, [isOnline, cloudUserProfile?.uid, flushPendingToFirestore, pullRemoteBackendState]);
 
   useEffect(() => {
+    const triggerAutoSync = () => {
+      if (typeof navigator !== 'undefined' && navigator.onLine === false) return;
+      void (async () => {
+        await flushPendingToFirestore(cloudUidRef.current);
+        await pullRemoteBackendState();
+      })();
+    };
+
     const handleVisibility = () => {
-      if (
-        userSettings.offlineAutoSync &&
-        document.visibilityState === 'visible' &&
-        navigator.onLine !== false &&
-        cloudUidRef.current
-      ) {
-        void flushPendingToFirestore(cloudUidRef.current);
+      if (document.visibilityState === 'visible') {
+        triggerAutoSync();
       }
     };
+
+    window.addEventListener('online', triggerAutoSync);
     document.addEventListener('visibilitychange', handleVisibility);
-    return () => document.removeEventListener('visibilitychange', handleVisibility);
-  }, [userSettings.offlineAutoSync, flushPendingToFirestore]);
+    return () => {
+      window.removeEventListener('online', triggerAutoSync);
+      document.removeEventListener('visibilitychange', handleVisibility);
+    };
+  }, [flushPendingToFirestore, pullRemoteBackendState]);
+
+  // Background automatic retry loop while online if any pending sync operations remain
+  useEffect(() => {
+    if (!isOnline || effectivePendingSyncCount <= 0) return;
+    const timer = window.setInterval(() => {
+      void flushPendingToFirestore(cloudUidRef.current);
+    }, 12_000);
+    return () => window.clearInterval(timer);
+  }, [isOnline, effectivePendingSyncCount, flushPendingToFirestore]);
 
   // Listen to Firebase Auth state and attach real-time Firestore listener only when authenticated
   useEffect(() => {
@@ -501,15 +596,18 @@ export default function App() {
     };
   }, [syncCoordinator, refreshOfflineMirror, flushPendingToFirestore]);
 
-  // Sync dark mode class on <html>
+  // Sync dark mode and sunlight high-contrast classes on <html>
   useEffect(() => {
     const root = document.documentElement;
-    if (darkMode) {
-      root.classList.add('dark');
-    } else {
-      root.classList.remove('dark');
+    const resolved = resolveDocumentThemeClasses({ darkMode, highContrastMode });
+    for (const cls of resolved.activeClasses) {
+      root.classList.add(cls);
     }
-  }, [darkMode]);
+    for (const cls of resolved.inactiveClasses) {
+      root.classList.remove(cls);
+    }
+    root.setAttribute('data-high-contrast', resolved.dataHighContrast);
+  }, [darkMode, highContrastMode]);
 
   // Resolve pending ?parcel=<id> deep-link if the target parcel arrives asynchronously (API / IndexedDB)
   useEffect(() => {
@@ -568,38 +666,7 @@ export default function App() {
     }, 2800);
   }, [activeParcel.id]);
 
-  // Hydrate live backend state and check ?verify= query param while preserving offline-created parcels
-  useEffect(() => {
-    fetch('/api/state')
-      .then((r) => (r.ok ? r.json() : null))
-      .then(async (data) => {
-        if (!data) return;
-        const offlineState = await syncCoordinator.hydrateState();
-        if (Array.isArray(data.municipalities)) setMunicipalities(data.municipalities);
-        if (Array.isArray(data.parcels) && data.parcels.length > 0) {
-          setParcels(
-            mergeParcelsWithOffline(
-              data.parcels,
-              offlineState.parcels,
-              offlineState.deletedParcelIds
-            )
-          );
-        }
-        if (Array.isArray(data.certificates)) setCertificates(data.certificates);
-        if (Array.isArray(data.providers)) setProviders(data.providers);
-        if (Array.isArray(data.quotes)) setQuotes(data.quotes);
-
-        const params = new URLSearchParams(window.location.search);
-        const verifyCode = params.get('verify');
-        if (verifyCode && Array.isArray(data.certificates)) {
-          const found = data.certificates.find(
-            (c: ComplianceCertificate) => c.shortCode.toUpperCase() === verifyCode.toUpperCase()
-          );
-          if (found) setVerifyingCert(found);
-        }
-      })
-      .catch(() => {});
-  }, [syncCoordinator]);
+  // Initial hydration handled via pullRemoteBackendState on online boot
 
   // Fetch PIR 3-day semaphore and Active Fires whenever activeParcel changes or connection returns
   useEffect(() => {
@@ -650,8 +717,8 @@ export default function App() {
       return;
     }
     setActiveTab(tab);
-    if (tab === 'user' && subMode) {
-      setUserInitialSubTab(subMode as UserSubTab);
+    if (tab === 'user') {
+      setUserInitialSubTab((subMode as UserSubTab | undefined) ?? 'gallery');
       setUserSubTabNonce((n) => n + 1);
     } else if (subMode) {
       setCertifySubMode(subMode);
@@ -760,6 +827,30 @@ export default function App() {
     window.scrollTo({ top: 0, behavior: 'instant' as ScrollBehavior });
   }, [cloudUserProfile]);
 
+  const handlePublicVerifyCertificate = useCallback((cert: ComplianceCertificate) => {
+    setVerifyingCert(cert);
+    try {
+      const nextUrl = new URL(window.location.href);
+      nextUrl.searchParams.set('verify', cert.shortCode);
+      window.history.replaceState({}, '', nextUrl.toString());
+    } catch {
+      // Ignore history replace errors in restricted sandboxes
+    }
+  }, []);
+
+  const handleCloseVerifyModal = useCallback(() => {
+    setVerifyingCert(null);
+    try {
+      const nextUrl = new URL(window.location.href);
+      if (nextUrl.searchParams.has('verify')) {
+        nextUrl.searchParams.delete('verify');
+        window.history.replaceState({}, '', nextUrl.toString());
+      }
+    } catch {
+      // Ignore history replace errors
+    }
+  }, []);
+
   // PRE-LOGIN GATEWAY: Standard Browser WebView Homepage vs Standalone WebApp Onboarding Splash
   if (!isAuthenticated) {
     return (
@@ -769,7 +860,7 @@ export default function App() {
             darkMode={darkMode}
             isOnline={isOnline}
             isFirebaseConfigured={isFirebaseConfigured}
-            onToggleDarkMode={() => setDarkMode((d) => !d)}
+            onToggleDarkMode={() => updateDarkMode((d) => !d)}
             onSignInGoogle={async () => {
               await signInWithGooglePopup();
             }}
@@ -780,12 +871,16 @@ export default function App() {
         ) : (
           <PublicWebviewHomepage
             darkMode={darkMode}
+            highContrastMode={highContrastMode}
             isOnline={isOnline}
             isFirebaseConfigured={isFirebaseConfigured}
             isInstallable={isInstallable}
             isInstalled={isInstalled}
             isIOS={isIOS}
-            onToggleDarkMode={() => setDarkMode((d) => !d)}
+            certificates={certificates}
+            onVerifyCertificate={handlePublicVerifyCertificate}
+            onToggleDarkMode={() => updateDarkMode((d) => !d)}
+            onToggleHighContrast={() => updateHighContrastMode((hc) => !hc)}
             onSignInGoogle={async () => {
               await signInWithGooglePopup();
             }}
@@ -797,10 +892,10 @@ export default function App() {
           />
         )}
 
-        {/* Public SHA-256 QR Verification Modal remains accessible via ?verify= links */}
+        {/* Public SHA-256 QR Verification Modal remains accessible via ?verify= links & QR scanner */}
         <CertificateVerifyModal
           certificate={verifyingCert}
-          onClose={() => setVerifyingCert(null)}
+          onClose={handleCloseVerifyModal}
         />
 
         {/* iOS Safari Install Instructions Dialog */}
@@ -983,10 +1078,10 @@ export default function App() {
                 <span className="hidden sm:inline">
                   {userProfile
                     ? `Histórico (${activeHistoryCount}) · ${userProfile.displayName.split(' ')[0]}${
-                        outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''
+                        effectivePendingSyncCount > 0 ? ` · ${effectivePendingSyncCount} pend.` : ''
                       }`
-                    : activeHistoryCount > 0 || outboxOps.length > 0
-                    ? `Histórico (${activeHistoryCount})${outboxOps.length > 0 ? ` · ${outboxOps.length} pend.` : ''}`
+                    : activeHistoryCount > 0 || effectivePendingSyncCount > 0
+                    ? `Histórico (${activeHistoryCount})${effectivePendingSyncCount > 0 ? ` · ${effectivePendingSyncCount} pend.` : ''}`
                     : 'Entrar / Histórico'}
                 </span>
                 <span className="sm:hidden">
@@ -1018,8 +1113,8 @@ export default function App() {
               {/* Solar Light / Dark Night Mode Switch */}
               <button
                 type="button"
-                onClick={() => setDarkMode((d) => !d)}
-                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                onClick={() => updateDarkMode((d) => !d)}
+                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 {darkMode ? (
                   <>
@@ -1041,7 +1136,7 @@ export default function App() {
                 type="button"
                 onClick={() => void handleSignOutAll()}
                 aria-label="Terminar sessão"
-                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 <LogOut className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" aria-hidden="true" />
                 <span className="hidden sm:inline">Terminar Sessão</span>
@@ -1061,7 +1156,7 @@ export default function App() {
         >
           <WifiOff className="w-4 h-4 shrink-0" aria-hidden="true" />
           <span>
-            Modo Offline no Terreno ({storageBackend === 'indexeddb' ? 'IndexedDB' : 'localStorage'}) — {parcels.length} terrenos ({offlineParcelsCount} personalizados) · {outboxOps.length} operação(ões) em fila para sincronização automática com Firestore.
+            Modo Offline no Terreno ({storageBackend === 'indexeddb' ? 'IndexedDB' : 'localStorage'}) — {parcels.length} terrenos ({offlineParcelsCount} personalizados) · {effectivePendingSyncCount} operação(ões) em fila para sincronização automática assim que a rede regressar.
           </span>
         </div>
       )}
@@ -1214,11 +1309,11 @@ export default function App() {
             userSettings={userSettings}
             certificates={certificates}
             historyItems={displayedHistory}
-            pendingSyncCount={outboxOps.length}
+            pendingSyncCount={effectivePendingSyncCount}
             isSyncing={isSyncing}
             lastSyncedAtIso={lastSyncedAtIso}
             storageBackend={storageBackend}
-            onToggleDarkMode={(nextDark) => setDarkMode(nextDark)}
+            onToggleDarkMode={(nextDark) => updateDarkMode(nextDark)}
             onSelectParcel={(id) => setActiveParcelId(id)}
             onCreateParcel={async (created) => {
               await recordParcelOfflineFirst(created, true);
@@ -1418,7 +1513,7 @@ export default function App() {
         currentSoilMoisturePct={currentSoilMoisturePct}
         syncError={historySyncError}
         isOnline={isOnline}
-        pendingSyncCount={outboxOps.length}
+        pendingSyncCount={effectivePendingSyncCount}
         isSyncing={isSyncing}
         lastSyncedAtIso={lastSyncedAtIso}
         storageBackend={storageBackend}

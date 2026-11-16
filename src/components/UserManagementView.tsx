@@ -1,6 +1,8 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import {
   Archive,
+  ArrowLeft,
+  ArrowRight,
   BookOpen,
   CheckCircle2,
   Download,
@@ -12,6 +14,7 @@ import {
   LogOut,
   MapPin,
   Moon,
+  PenTool,
   Plus,
   QrCode,
   RefreshCw,
@@ -27,6 +30,7 @@ import type {
   ComplianceCertificate,
   ForestryProvider,
   LandClass,
+  LatLon,
   MunicipalityInfo,
   ParcelDocumentCategory,
   ParcelDocumentRecord,
@@ -43,17 +47,49 @@ import {
   applyParcelUpdate,
   buildDefaultRectangleAroundCenter,
   buildParcelDocumentRecord,
+  buildParcelLocalLlmNotePayload,
+  buildUserGalleryCatalog,
   filterDocumentsForParcel,
   formatFileSizePt,
   formatVerticesMultiline,
   parseVerticesMultiline,
   validateDocumentUploadInput,
   validateParcelMutationInput,
+  type UserGalleryItemId,
 } from '../lib/userWorkspaceStore.ts';
+import {
+  CUSTOM_USER_INPUT_VALUE,
+  buildBupiCodeOptions,
+  buildMatrixArticleOptions,
+  findMunicipalityByDico,
+  getDistrictsList,
+  getMunicipalitiesByDistrict,
+  getParishesByMunicipality,
+  resolveDropdownOrCustomValue,
+  resolveMergedMunicipalityCatalog,
+} from '../data/portugalAdminCatalog.ts';
 
 import { DocsArchitectureView } from './DocsArchitectureView.tsx';
+import { ParcelPolygonMapModal } from './ParcelPolygonMapModal.tsx';
+import faixaSeguraLogoImg from '../assets/images/faixasegura_pwa_logo_1794821062754.jpg';
 
-export type UserSubTab = 'properties' | 'favorites' | 'settings' | 'history' | 'docs';
+export type UserSubTab =
+  | 'gallery'
+  | 'properties'
+  | 'favorites'
+  | 'settings'
+  | 'theme'
+  | 'history'
+  | 'docs';
+
+const USER_SECTION_LABELS: Record<Exclude<UserSubTab, 'gallery'>, string> = {
+  properties: 'Terrenos & Documentos',
+  favorites: 'Prestadores Favoritos',
+  settings: 'Perfil & Configurações',
+  theme: 'Tema & Modo Escuro',
+  history: 'Histórico & Autos SHA-256',
+  docs: 'Documentação Técnica',
+};
 
 interface UserManagementViewProps {
   initialSubTab?: UserSubTab;
@@ -112,7 +148,7 @@ const LAND_CLASS_LABELS: Record<LandClass, string> = {
 };
 
 export const UserManagementView: React.FC<UserManagementViewProps> = ({
-  initialSubTab = 'properties',
+  initialSubTab = 'gallery',
   subTabRequestNonce = 0,
   profile,
   isCloudSession,
@@ -159,18 +195,59 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     }
   }, [initialSubTab, subTabRequestNonce]);
 
+  const allMunicipalities = useMemo(
+    () => resolveMergedMunicipalityCatalog(municipalities),
+    [municipalities]
+  );
+  const districtsList = useMemo(() => getDistrictsList(), []);
+
   // ==================== 1. PROPERTY CRUD & PER-PARCEL DOCUMENTS STATE ====================
+  const initialNewMuni = useMemo(
+    () =>
+      findMunicipalityByDico(
+        profile.preferredDico || activeParcel.dico || '1111',
+        allMunicipalities
+      ),
+    [profile.preferredDico, activeParcel.dico, allMunicipalities]
+  );
+
   const [parcelSearch, setParcelSearch] = useState('');
   const [showAddParcelForm, setShowAddParcelForm] = useState(false);
   const [newLabel, setNewLabel] = useState('');
-  const [newDico, setNewDico] = useState(profile.preferredDico || activeParcel.dico || '1111');
-  const [newParish, setNewParish] = useState('');
-  const [newMatrixArticle, setNewMatrixArticle] = useState('');
-  const [newBupiRggId, setNewBupiRggId] = useState('');
+  const [newDistrict, setNewDistrict] = useState<string>(initialNewMuni.district);
+  const [newDico, setNewDico] = useState<string>(initialNewMuni.dico);
+  const [newParishOption, setNewParishOption] = useState<string>(
+    () =>
+      getParishesByMunicipality({
+        dico: initialNewMuni.dico,
+        municipalityName: initialNewMuni.name,
+      })[0] ?? initialNewMuni.name
+  );
+  const [newParishCustom, setNewParishCustom] = useState('');
+  const [newMatrixOption, setNewMatrixOption] = useState<string>(
+    () =>
+      buildMatrixArticleOptions({
+        landClass: 'FOREST_SCRUB',
+        dico: initialNewMuni.dico,
+        municipalityName: initialNewMuni.name,
+        existingParcels: parcels,
+      })[0]?.value ?? 'Rústico — Art.º 204, Secção D'
+  );
+  const [newMatrixCustom, setNewMatrixCustom] = useState('');
+  const [newBupiOption, setNewBupiOption] = useState<string>(
+    () =>
+      buildBupiCodeOptions({
+        dico: initialNewMuni.dico,
+        municipalityName: initialNewMuni.name,
+        existingParcels: parcels,
+      })[0]?.value ?? ''
+  );
+  const [newBupiCustom, setNewBupiCustom] = useState('');
   const [newLandClass, setNewLandClass] = useState<LandClass>('FOREST_SCRUB');
   const [newAvgSlope, setNewAvgSlope] = useState<number>(12);
   const [newHasEredes, setNewHasEredes] = useState(false);
   const [newHasOaks, setNewHasOaks] = useState(false);
+  const [newUserNotes, setNewUserNotes] = useState('');
   const [newCadernetaRaw, setNewCadernetaRaw] = useState('');
   const [newVerticesRaw, setNewVerticesRaw] = useState('');
   const [addParcelError, setAddParcelError] = useState<string | null>(null);
@@ -179,17 +256,28 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   // Inline Edit Parcel State
   const [editingParcelId, setEditingParcelId] = useState<string | null>(null);
   const [editLabel, setEditLabel] = useState('');
+  const [editDistrict, setEditDistrict] = useState('Lisboa');
   const [editDico, setEditDico] = useState('1111');
-  const [editParish, setEditParish] = useState('');
-  const [editMatrix, setEditMatrix] = useState('');
-  const [editBupi, setEditBupi] = useState('');
+  const [editParishOption, setEditParishOption] = useState('');
+  const [editParishCustom, setEditParishCustom] = useState('');
+  const [editMatrixOption, setEditMatrixOption] = useState('');
+  const [editMatrixCustom, setEditMatrixCustom] = useState('');
+  const [editBupiOption, setEditBupiOption] = useState('');
+  const [editBupiCustom, setEditBupiCustom] = useState('');
   const [editLandClass, setEditLandClass] = useState<LandClass>('FOREST_SCRUB');
   const [editSlope, setEditSlope] = useState<number>(12);
   const [editHasEredes, setEditHasEredes] = useState(false);
   const [editHasOaks, setEditHasOaks] = useState(false);
+  const [editUserNotes, setEditUserNotes] = useState('');
   const [editVerticesRaw, setEditVerticesRaw] = useState('');
-  const [showEditVertices, setShowEditVertices] = useState(false);
+  const [editVerticesTouched, setEditVerticesTouched] = useState(false);
+  const [showEditVertices, setShowEditVertices] = useState(true);
   const [editParcelError, setEditParcelError] = useState<string | null>(null);
+
+  // Interactive Polygon Map Modal State ('new' form or 'edit' existing parcel)
+  const [polygonMapTarget, setPolygonMapTarget] = useState<
+    { mode: 'new' } | { mode: 'edit'; parcel: ParcelRecord } | null
+  >(null);
 
   // Inline Delete Confirmation State
   const [confirmDeleteParcelId, setConfirmDeleteParcelId] = useState<string | null>(null);
@@ -219,16 +307,202 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
   // ==================== 4. HISTORY FILTER STATE ====================
   const [historyQuery, setHistoryQuery] = useState('');
 
+  // Derived Cascading Options for Create New Parcel Form
+  const newMunicipalitiesForDistrict = useMemo(
+    () => getMunicipalitiesByDistrict(newDistrict, allMunicipalities),
+    [newDistrict, allMunicipalities]
+  );
+  const selectedNewMuni = useMemo(
+    () => findMunicipalityByDico(newDico, allMunicipalities),
+    [newDico, allMunicipalities]
+  );
+  const newParishesForMuni = useMemo(
+    () =>
+      getParishesByMunicipality({
+        dico: selectedNewMuni.dico,
+        municipalityName: selectedNewMuni.name,
+      }),
+    [selectedNewMuni.dico, selectedNewMuni.name]
+  );
+  const newMatrixOptions = useMemo(
+    () =>
+      buildMatrixArticleOptions({
+        landClass: newLandClass,
+        dico: selectedNewMuni.dico,
+        municipalityName: selectedNewMuni.name,
+        existingParcels: parcels,
+        currentValue:
+          newMatrixOption !== CUSTOM_USER_INPUT_VALUE ? newMatrixOption : undefined,
+      }),
+    [newLandClass, selectedNewMuni.dico, selectedNewMuni.name, parcels, newMatrixOption]
+  );
+  const newBupiOptions = useMemo(
+    () =>
+      buildBupiCodeOptions({
+        dico: selectedNewMuni.dico,
+        municipalityName: selectedNewMuni.name,
+        existingParcels: parcels,
+        currentValue:
+          newBupiOption !== CUSTOM_USER_INPUT_VALUE ? newBupiOption : undefined,
+      }),
+    [selectedNewMuni.dico, selectedNewMuni.name, parcels, newBupiOption]
+  );
+
+  // Derived Cascading Options for Edit Existing Parcel Form
+  const editMunicipalitiesForDistrict = useMemo(
+    () => getMunicipalitiesByDistrict(editDistrict, allMunicipalities),
+    [editDistrict, allMunicipalities]
+  );
+  const selectedEditMuni = useMemo(
+    () => findMunicipalityByDico(editDico, allMunicipalities),
+    [editDico, allMunicipalities]
+  );
+  const editingParcelObj = useMemo(
+    () => (editingParcelId ? parcels.find((p) => p.id === editingParcelId) ?? null : null),
+    [editingParcelId, parcels]
+  );
+  const editParishesForMuni = useMemo(
+    () =>
+      getParishesByMunicipality({
+        dico: selectedEditMuni.dico,
+        municipalityName: selectedEditMuni.name,
+        currentParish:
+          editingParcelObj && editingParcelObj.dico === selectedEditMuni.dico
+            ? editingParcelObj.parish
+            : undefined,
+      }),
+    [selectedEditMuni.dico, selectedEditMuni.name, editingParcelObj]
+  );
+  const editMatrixOptions = useMemo(
+    () =>
+      buildMatrixArticleOptions({
+        landClass: editLandClass,
+        dico: selectedEditMuni.dico,
+        municipalityName: selectedEditMuni.name,
+        existingParcels: parcels,
+        currentValue:
+          editMatrixOption !== CUSTOM_USER_INPUT_VALUE ? editMatrixOption : undefined,
+      }),
+    [editLandClass, selectedEditMuni.dico, selectedEditMuni.name, parcels, editMatrixOption]
+  );
+  const editBupiOptions = useMemo(
+    () =>
+      buildBupiCodeOptions({
+        dico: selectedEditMuni.dico,
+        municipalityName: selectedEditMuni.name,
+        existingParcels: parcels,
+        currentValue:
+          editBupiOption !== CUSTOM_USER_INPUT_VALUE ? editBupiOption : undefined,
+      }),
+    [selectedEditMuni.dico, selectedEditMuni.name, parcels, editBupiOption]
+  );
+
+  const handleNewDistrictChange = (nextDistrict: string) => {
+    setNewDistrict(nextDistrict);
+    const munis = getMunicipalitiesByDistrict(nextDistrict, allMunicipalities);
+    const firstMuni = munis[0] ?? allMunicipalities[0];
+    setNewDico(firstMuni.dico);
+    const parishes = getParishesByMunicipality({
+      dico: firstMuni.dico,
+      municipalityName: firstMuni.name,
+    });
+    setNewParishOption(parishes[0] ?? firstMuni.name);
+    setNewParishCustom('');
+    if (newMatrixOption !== CUSTOM_USER_INPUT_VALUE) {
+      const mOpts = buildMatrixArticleOptions({
+        landClass: newLandClass,
+        dico: firstMuni.dico,
+        municipalityName: firstMuni.name,
+        existingParcels: parcels,
+      });
+      setNewMatrixOption(mOpts[0]?.value ?? 'Rústico — Art.º 204, Secção D');
+    }
+    if (newBupiOption !== CUSTOM_USER_INPUT_VALUE) {
+      const bOpts = buildBupiCodeOptions({
+        dico: firstMuni.dico,
+        municipalityName: firstMuni.name,
+        existingParcels: parcels,
+      });
+      setNewBupiOption(bOpts[0]?.value ?? '');
+    }
+  };
+
+  const handleNewDicoChange = (nextDico: string) => {
+    const muni = findMunicipalityByDico(nextDico, allMunicipalities);
+    setNewDistrict(muni.district);
+    setNewDico(muni.dico);
+    const parishes = getParishesByMunicipality({
+      dico: muni.dico,
+      municipalityName: muni.name,
+    });
+    setNewParishOption(parishes[0] ?? muni.name);
+    setNewParishCustom('');
+    if (newMatrixOption !== CUSTOM_USER_INPUT_VALUE) {
+      const mOpts = buildMatrixArticleOptions({
+        landClass: newLandClass,
+        dico: muni.dico,
+        municipalityName: muni.name,
+        existingParcels: parcels,
+      });
+      setNewMatrixOption(mOpts[0]?.value ?? 'Rústico — Art.º 204, Secção D');
+    }
+    if (newBupiOption !== CUSTOM_USER_INPUT_VALUE) {
+      const bOpts = buildBupiCodeOptions({
+        dico: muni.dico,
+        municipalityName: muni.name,
+        existingParcels: parcels,
+      });
+      setNewBupiOption(bOpts[0]?.value ?? '');
+    }
+  };
+
+  const handleEditDistrictChange = (nextDistrict: string) => {
+    setEditDistrict(nextDistrict);
+    const munis = getMunicipalitiesByDistrict(nextDistrict, allMunicipalities);
+    const firstMuni = munis[0] ?? allMunicipalities[0];
+    setEditDico(firstMuni.dico);
+    const parishes = getParishesByMunicipality({
+      dico: firstMuni.dico,
+      municipalityName: firstMuni.name,
+    });
+    setEditParishOption(parishes[0] ?? firstMuni.name);
+    setEditParishCustom('');
+    if (!editVerticesTouched) {
+      setEditVerticesRaw(
+        formatVerticesMultiline(buildDefaultRectangleAroundCenter(firstMuni.defaultCenter))
+      );
+    }
+  };
+
+  const handleEditDicoChange = (nextDico: string) => {
+    const muni = findMunicipalityByDico(nextDico, allMunicipalities);
+    setEditDistrict(muni.district);
+    setEditDico(muni.dico);
+    const parishes = getParishesByMunicipality({
+      dico: muni.dico,
+      municipalityName: muni.name,
+    });
+    setEditParishOption(parishes[0] ?? muni.name);
+    setEditParishCustom('');
+    if (!editVerticesTouched) {
+      setEditVerticesRaw(
+        formatVerticesMultiline(buildDefaultRectangleAroundCenter(muni.defaultCenter))
+      );
+    }
+  };
+
   const filteredParcels = useMemo(() => {
     const q = parcelSearch.trim().toLowerCase();
     if (!q) return parcels;
     return parcels.filter(
       (p) =>
         p.label.toLowerCase().includes(q) ||
+        (p.district ?? '').toLowerCase().includes(q) ||
         p.municipality.toLowerCase().includes(q) ||
         p.parish.toLowerCase().includes(q) ||
         p.bupiRggId.toLowerCase().includes(q) ||
-        p.matrixArticle.toLowerCase().includes(q)
+        p.matrixArticle.toLowerCase().includes(q) ||
+        (p.userNotes ?? '').toLowerCase().includes(q)
     );
   }, [parcels, parcelSearch]);
 
@@ -265,10 +539,19 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       setAddParcelError('Cole um excerto da Caderneta Predial para preencher automaticamente os campos.');
       return;
     }
-    const extracted = extractCadernetaOffline(newCadernetaRaw, municipalities);
+    const extracted = extractCadernetaOffline(newCadernetaRaw, allMunicipalities);
+    const muni = findMunicipalityByDico(extracted.dico, allMunicipalities);
+    const parishes = getParishesByMunicipality({
+      dico: muni.dico,
+      municipalityName: muni.name,
+    });
     setNewLabel(extracted.suggestedLabel);
-    setNewDico(extracted.dico);
-    setNewMatrixArticle(extracted.matrixArticle);
+    setNewDistrict(muni.district);
+    setNewDico(muni.dico);
+    setNewParishOption(parishes[0] ?? muni.name);
+    setNewParishCustom('');
+    setNewMatrixOption(extracted.matrixArticle);
+    setNewMatrixCustom('');
     setNewHasOaks(extracted.hasProtectedOaks);
     setNewVerticesRaw(formatVerticesMultiline(extracted.vertices));
     setAddParcelError(null);
@@ -288,7 +571,20 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
-    const muni = municipalities.find((m) => m.dico === newDico) ?? municipalities[0];
+    if (newParishOption === CUSTOM_USER_INPUT_VALUE && !newParishCustom.trim()) {
+      setAddParcelError('Indique o nome da freguesia no campo personalizado.');
+      return;
+    }
+    if (newMatrixOption === CUSTOM_USER_INPUT_VALUE && !newMatrixCustom.trim()) {
+      setAddParcelError('Indique o Artigo Matricial personalizado ou selecione uma opção da lista.');
+      return;
+    }
+    if (newBupiOption === CUSTOM_USER_INPUT_VALUE && !newBupiCustom.trim()) {
+      setAddParcelError('Indique o código BUPi personalizado ou selecione uma opção da lista.');
+      return;
+    }
+
+    const muni = findMunicipalityByDico(newDico, allMunicipalities);
     let vertices = buildDefaultRectangleAroundCenter(muni.defaultCenter);
     if (newVerticesRaw.trim()) {
       const parsed = parseVerticesMultiline(newVerticesRaw);
@@ -299,47 +595,97 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       vertices = parsed.vertices;
     }
 
+    const resolvedParish = resolveDropdownOrCustomValue({
+      selectedOption: newParishOption,
+      customInput: newParishCustom,
+      fallbackValue: muni.name,
+    });
+    const resolvedMatrix = resolveDropdownOrCustomValue({
+      selectedOption: newMatrixOption,
+      customInput: newMatrixCustom,
+      fallbackValue: 'Rústico — Art.º 204, Secção D',
+    });
+    const resolvedBupi = resolveDropdownOrCustomValue({
+      selectedOption: newBupiOption,
+      customInput: newBupiCustom,
+      fallbackValue: '',
+    });
+
     const created = buildLocalParcelRecord({
       label: newLabel.trim(),
+      district: newDistrict || muni.district,
       dico: muni.dico,
-      parish: newParish.trim() || muni.name,
-      matrixArticle: newMatrixArticle.trim() || 'Rústico — Art.º 204, Secção D',
-      bupiRggId: newBupiRggId.trim() || undefined,
+      parish: resolvedParish,
+      matrixArticle: resolvedMatrix,
+      bupiRggId: resolvedBupi || undefined,
       landClass: newLandClass,
       avgSlopePct: newAvgSlope,
       hasEredesLine: newHasEredes,
       hasProtectedOaks: newHasOaks,
+      userNotes: newUserNotes.trim() || undefined,
       vertices,
-      municipalities,
+      municipalities: allMunicipalities,
     });
 
     await onCreateParcel(created);
     setNewLabel('');
-    setNewParish('');
-    setNewMatrixArticle('');
-    setNewBupiRggId('');
+    setNewParishCustom('');
+    setNewMatrixCustom('');
+    setNewBupiCustom('');
+    setNewUserNotes('');
     setNewCadernetaRaw('');
     setNewVerticesRaw('');
     setShowAddParcelForm(false);
-    setParcelFeedback(`Propriedade "${created.label}" adicionada com sucesso (${created.spatial.mandatoryCleanAreaM2.toFixed(0)} m² exigíveis).`);
+    setParcelFeedback(
+      `Propriedade "${created.label}" adicionada em ${created.district} · ${created.municipality} (${created.spatial.mandatoryCleanAreaM2.toFixed(0)} m² exigíveis).`
+    );
   };
 
   const startEditingParcel = (p: ParcelRecord) => {
+    const muni = findMunicipalityByDico(p.dico, allMunicipalities);
+    const resolvedDistrict = p.district?.trim() || muni.district;
+    const parishes = getParishesByMunicipality({
+      dico: muni.dico,
+      municipalityName: muni.name,
+      currentParish: p.parish,
+    });
+    const matrixOpts = buildMatrixArticleOptions({
+      landClass: p.landClass,
+      dico: muni.dico,
+      municipalityName: muni.name,
+      existingParcels: parcels,
+      currentValue: p.matrixArticle,
+    });
+    const bupiOpts = buildBupiCodeOptions({
+      dico: muni.dico,
+      municipalityName: muni.name,
+      existingParcels: parcels,
+      currentValue: p.bupiRggId,
+    });
+
     setEditingParcelId(p.id);
     setConfirmDeleteParcelId(null);
     setDeleteParcelError(null);
     setEditParcelError(null);
     setEditLabel(p.label);
-    setEditDico(p.dico);
-    setEditParish(p.parish);
-    setEditMatrix(p.matrixArticle);
-    setEditBupi(p.bupiRggId);
+    setEditDistrict(resolvedDistrict);
+    setEditDico(muni.dico);
+    setEditParishOption(p.parish?.trim() || parishes[0] || muni.name);
+    setEditParishCustom('');
+    setEditMatrixOption(
+      p.matrixArticle?.trim() || matrixOpts[0]?.value || 'Rústico — Art.º 204, Secção D'
+    );
+    setEditMatrixCustom('');
+    setEditBupiOption(p.bupiRggId?.trim() || bupiOpts[0]?.value || '');
+    setEditBupiCustom('');
     setEditLandClass(p.landClass);
     setEditSlope(p.avgSlopePct);
     setEditHasEredes(p.hasEredesLine);
     setEditHasOaks(p.hasProtectedOaks);
+    setEditUserNotes(p.userNotes ?? '');
     setEditVerticesRaw(formatVerticesMultiline(p.vertices));
-    setShowEditVertices(false);
+    setEditVerticesTouched(false);
+    setShowEditVertices(true);
   };
 
   const handleSaveEditedParcel = async (e: React.FormEvent, existing: ParcelRecord) => {
@@ -356,40 +702,76 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
       return;
     }
 
-    let nextVertices = existing.vertices;
-    let recenterOnMuniChange = true;
-    if (showEditVertices && editVerticesRaw.trim()) {
+    if (editParishOption === CUSTOM_USER_INPUT_VALUE && !editParishCustom.trim()) {
+      setEditParcelError('Indique o nome da freguesia no campo personalizado.');
+      return;
+    }
+    if (editMatrixOption === CUSTOM_USER_INPUT_VALUE && !editMatrixCustom.trim()) {
+      setEditParcelError(
+        'Indique o Artigo Matricial personalizado ou selecione uma opção da lista.'
+      );
+      return;
+    }
+    if (editBupiOption === CUSTOM_USER_INPUT_VALUE && !editBupiCustom.trim()) {
+      setEditParcelError('Indique o código BUPi personalizado ou selecione uma opção da lista.');
+      return;
+    }
+
+    const muni = findMunicipalityByDico(editDico, allMunicipalities);
+    const resolvedParish = resolveDropdownOrCustomValue({
+      selectedOption: editParishOption,
+      customInput: editParishCustom,
+      fallbackValue: existing.parish || muni.name,
+    });
+    const resolvedMatrix = resolveDropdownOrCustomValue({
+      selectedOption: editMatrixOption,
+      customInput: editMatrixCustom,
+      fallbackValue: existing.matrixArticle,
+    });
+    const resolvedBupi = resolveDropdownOrCustomValue({
+      selectedOption: editBupiOption,
+      customInput: editBupiCustom,
+      fallbackValue: existing.bupiRggId,
+    });
+
+    let nextVertices: LatLon[] | undefined = undefined;
+    const recenterOnMuniChange = !editVerticesTouched;
+
+    if (editVerticesTouched || (showEditVertices && editVerticesRaw.trim())) {
       const parsed = parseVerticesMultiline(editVerticesRaw);
       if (!parsed.valid) {
         setEditParcelError(parsed.error || 'Vértices geográficos inválidos.');
         return;
       }
-      nextVertices = parsed.vertices;
-      recenterOnMuniChange = false;
+      if (editVerticesTouched || editDico === existing.dico) {
+        nextVertices = parsed.vertices;
+      }
     }
 
     const updated = applyParcelUpdate(
       existing,
       {
         label: editLabel,
-        dico: editDico,
-        parish: editParish,
-        matrixArticle: editMatrix,
-        bupiRggId: editBupi,
+        district: editDistrict || muni.district,
+        dico: muni.dico,
+        parish: resolvedParish,
+        matrixArticle: resolvedMatrix,
+        bupiRggId: resolvedBupi,
         landClass: editLandClass,
         avgSlopePct: editSlope,
         hasEredesLine: editHasEredes,
         hasProtectedOaks: editHasOaks,
-        vertices: showEditVertices ? nextVertices : undefined,
+        userNotes: editUserNotes,
+        vertices: nextVertices,
         recenterVerticesOnMunicipalityChange: recenterOnMuniChange,
       },
-      municipalities
+      allMunicipalities
     );
 
     await onUpdateParcel(updated);
     setEditingParcelId(null);
     setParcelFeedback(
-      `Propriedade "${updated.label}" atualizada · Faixa obrigatória recalculada: ${updated.spatial.mandatoryCleanAreaM2.toFixed(0)} m².`
+      `Propriedade "${updated.label}" atualizada (${updated.district} · ${updated.municipality}) · Faixa obrigatória recalculada: ${updated.spatial.mandatoryCleanAreaM2.toFixed(0)} m².`
     );
   };
 
@@ -515,31 +897,92 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
     }
   };
 
+  const galleryItems = useMemo(
+    () =>
+      buildUserGalleryCatalog({
+        parcelCount: parcels.length,
+        documentCount: parcelDocuments.length,
+        favoriteProviderCount: favoriteProviders.length,
+        darkMode,
+        historyCount: historyItems.length,
+        certificateCount: certificates.length,
+        displayName: profile.displayName,
+        isCloudSession,
+      }),
+    [
+      parcels.length,
+      parcelDocuments.length,
+      favoriteProviders.length,
+      darkMode,
+      historyItems.length,
+      certificates.length,
+      profile.displayName,
+      isCloudSession,
+    ]
+  );
+
+  const renderGalleryThumbnailIcon = (id: UserGalleryItemId) => {
+    switch (id) {
+      case 'properties':
+        return <MapPin className="w-6 h-6 sm:w-7 sm:h-7 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />;
+      case 'favorites':
+        return <Star className="w-6 h-6 sm:w-7 sm:h-7 text-[#D97706] dark:text-[#FACC15]" aria-hidden="true" />;
+      case 'settings':
+        return <Settings className="w-6 h-6 sm:w-7 sm:h-7 text-slate-700 dark:text-slate-200" aria-hidden="true" />;
+      case 'theme':
+        return darkMode ? (
+          <Moon className="w-6 h-6 sm:w-7 sm:h-7 text-sky-400" aria-hidden="true" />
+        ) : (
+          <Sun className="w-6 h-6 sm:w-7 sm:h-7 text-amber-500" aria-hidden="true" />
+        );
+      case 'history':
+        return <History className="w-6 h-6 sm:w-7 sm:h-7 text-[#14532D] dark:text-[#4ADE80]" aria-hidden="true" />;
+      case 'docs':
+        return <BookOpen className="w-6 h-6 sm:w-7 sm:h-7 text-sky-700 dark:text-sky-400" aria-hidden="true" />;
+      case 'logout':
+        return <LogOut className="w-6 h-6 sm:w-7 sm:h-7 text-[#DC2626] dark:text-rose-400" aria-hidden="true" />;
+    }
+  };
+
   return (
-    <div data-testid="user-management-view" className="space-y-6">
-      {/* Workspace Header & Segmented Sub-Navigation */}
-      <section className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-5 space-y-4">
-        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4">
-          <div className="space-y-1">
-            <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-              <span>{isCloudSession ? 'Conta Google Cloud Sincronizada' : 'Sessão Local no Dispositivo'}</span>
-              <span aria-hidden="true"> · </span>
-              <span>{parcels.length} propriedades</span>
-              <span aria-hidden="true"> · </span>
-              <span>{parcelDocuments.length} documentos carregados</span>
-              <span aria-hidden="true"> · </span>
-              <span>{favoriteProviders.length} prestadores favoritos</span>
+    <div data-testid="user-management-view" className="space-y-5 sm:space-y-6">
+      {/* Workspace Header & Contextual Breadcrumb */}
+      <section className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-4 sm:p-5 space-y-3.5">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3.5">
+          <div className="flex items-center gap-3.5 min-w-0">
+            <div className="w-11 h-11 sm:w-12 sm:h-12 rounded-2xl bg-[#14532D] border border-slate-300 dark:border-[#263248] overflow-hidden flex items-center justify-center shrink-0">
+              <img
+                src={faixaSeguraLogoImg}
+                alt="Logótipo FaixaSegura"
+                data-testid="faixasegura-user-pwa-logo"
+                referrerPolicy="no-referrer"
+                className="w-full h-full object-cover"
+                onError={(e) => {
+                  e.currentTarget.classList.add('hidden');
+                }}
+              />
             </div>
-            <h1 className="text-xl sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight">
-              Área do Utilizador · {profile.displayName}
-            </h1>
+            <div className="space-y-0.5 min-w-0">
+              <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums truncate">
+                <span>{isCloudSession ? 'Conta Google Cloud Sincronizada' : 'Sessão Local no Dispositivo'}</span>
+                <span aria-hidden="true"> · </span>
+                <span>{parcels.length} propriedades</span>
+                <span aria-hidden="true"> · </span>
+                <span>{parcelDocuments.length} documentos carregados</span>
+                <span aria-hidden="true"> · </span>
+                <span>{favoriteProviders.length} prestadores favoritos</span>
+              </div>
+              <h1 className="text-lg sm:text-2xl font-bold text-slate-900 dark:text-white tracking-tight truncate">
+                Área do Utilizador · {profile.displayName}
+              </h1>
+            </div>
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
             <button
               type="button"
               onClick={() => onNavigateTab('certify', 'certificate')}
-              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              className="min-h-[42px] px-3 sm:px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
             >
               <FileCheck2 className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />
               Emitir Auto SHA-256
@@ -547,99 +990,149 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             <button
               type="button"
               onClick={() => onNavigateTab('map')}
-              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              className="min-h-[42px] px-3 sm:px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
             >
               <MapPin className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />
-              Ver Terreno no Mapa
+              <span className="sm:hidden">Ver Mapa</span>
+              <span className="hidden sm:inline">Ver Terreno no Mapa</span>
             </button>
           </div>
         </div>
 
-        <div
-          role="tablist"
-          aria-label="Secções da Área do Utilizador"
-          className="grid grid-cols-2 sm:grid-cols-3 lg:flex items-center gap-1.5 p-1.5 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
-        >
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subTab === 'properties'}
-            onClick={() => setSubTab('properties')}
-            className={`min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 inline-flex items-center justify-center lg:justify-start gap-1.5 tabular-nums ${
-              subTab === 'properties'
-                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
-            }`}
-          >
-            <MapPin className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">Terrenos & Documentos ({parcels.length})</span>
-            <span className="sm:hidden">Terrenos ({parcels.length})</span>
-          </button>
-
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subTab === 'favorites'}
-            onClick={() => setSubTab('favorites')}
-            className={`min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 inline-flex items-center justify-center lg:justify-start gap-1.5 tabular-nums ${
-              subTab === 'favorites'
-                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
-            }`}
-          >
-            <Star className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">Prestadores Favoritos ({favoriteProviders.length})</span>
-            <span className="sm:hidden">Favoritos ({favoriteProviders.length})</span>
-          </button>
-
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subTab === 'settings'}
-            onClick={() => setSubTab('settings')}
-            className={`min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 inline-flex items-center justify-center lg:justify-start gap-1.5 ${
-              subTab === 'settings'
-                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
-            }`}
-          >
-            <Settings className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">Perfil & Configurações</span>
-            <span className="sm:hidden">Configurações</span>
-          </button>
-
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subTab === 'history'}
-            onClick={() => setSubTab('history')}
-            className={`min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 inline-flex items-center justify-center lg:justify-start gap-1.5 tabular-nums ${
-              subTab === 'history'
-                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
-            }`}
-          >
-            <History className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span className="hidden sm:inline">Histórico & Autos ({historyItems.length})</span>
-            <span className="sm:hidden">Histórico ({historyItems.length})</span>
-          </button>
-
-          <button
-            type="button"
-            role="tab"
-            aria-selected={subTab === 'docs'}
-            onClick={() => setSubTab('docs')}
-            className={`col-span-2 sm:col-span-1 min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors whitespace-nowrap shrink-0 inline-flex items-center justify-center lg:justify-start gap-1.5 ${
-              subTab === 'docs'
-                ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
-                : 'border-transparent bg-transparent text-slate-700 dark:text-slate-300 hover:text-slate-950 dark:hover:text-white'
-            }`}
-          >
-            <BookOpen className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            <span>Documentação</span>
-          </button>
-        </div>
+        {subTab !== 'gallery' && (
+          <div className="pt-3 border-t border-slate-200 dark:border-[#263248] flex flex-wrap items-center justify-between gap-3">
+            <button
+              type="button"
+              data-testid="back-to-user-gallery-btn"
+              onClick={() => setSubTab('gallery')}
+              className="min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-900 dark:text-white hover:bg-slate-200/70 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            >
+              <ArrowLeft className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />
+              Voltar à Galeria User
+            </button>
+            <div className="text-xs text-slate-500 dark:text-slate-400">
+              <span>Galeria User</span>
+              <span aria-hidden="true"> / </span>
+              <span className="font-semibold text-slate-900 dark:text-white">
+                {USER_SECTION_LABELS[subTab]}
+              </span>
+            </div>
+          </div>
+        )}
       </section>
+
+      {/* ==================== GALERIA DE ÍCONES (3/LINHA EM WEB & TABLET HORIZONTAL · 2/LINHA EM MOBILE & TABLET VERTICAL) ==================== */}
+      {subTab === 'gallery' && (
+        <section
+          aria-label="Galeria da Área do Utilizador"
+          data-testid="user-thumbnail-gallery"
+          className="grid grid-cols-2 md:landscape:grid-cols-3 xl:grid-cols-3 gap-3 sm:gap-5"
+        >
+          {galleryItems.map((item) => {
+            const isLogout = item.actionKind === 'LOGOUT';
+            return (
+              <button
+                key={item.id}
+                type="button"
+                data-testid={`user-gallery-card-${item.id}`}
+                onClick={() => {
+                  if (isLogout) {
+                    void onSignOut();
+                  } else if (item.id !== 'logout') {
+                    setSubTab(item.id);
+                  }
+                }}
+                className={`group text-left rounded-2xl bg-white dark:bg-[#161E2E] border overflow-hidden flex flex-col focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#14532D] dark:focus-visible:outline-[#22C55E] ${
+                  isLogout
+                    ? 'border-slate-300 dark:border-[#263248] hover:border-rose-400 dark:hover:border-rose-700'
+                    : 'border-slate-300 dark:border-[#263248] hover:border-[#14532D] dark:hover:border-[#22C55E]'
+                }`}
+              >
+                <div
+                  data-testid={`user-gallery-icon-stage-${item.id}`}
+                  className={`relative h-24 sm:h-28 w-full overflow-hidden border-b flex items-center justify-center ${
+                    isLogout
+                      ? 'bg-rose-50/60 dark:bg-[#191118] border-rose-200/80 dark:border-rose-950/60'
+                      : 'bg-slate-100/80 dark:bg-[#0B0F17] border-slate-200 dark:border-[#263248]'
+                  }`}
+                >
+                  <svg
+                    viewBox="0 0 160 100"
+                    fill="none"
+                    aria-hidden="true"
+                    className="absolute inset-0 w-full h-full opacity-35 dark:opacity-25 pointer-events-none"
+                  >
+                    <polygon
+                      points="58,10 102,10 130,38 130,62 102,90 58,90 30,62 30,38"
+                      stroke="currentColor"
+                      strokeWidth="1"
+                      className={
+                        isLogout
+                          ? 'text-rose-400 dark:text-rose-600'
+                          : 'text-slate-300 dark:text-slate-600'
+                      }
+                    />
+                    <polygon
+                      points="64,20 96,20 118,42 118,58 96,80 64,80 42,58 42,42"
+                      stroke="currentColor"
+                      strokeWidth="1"
+                      className={
+                        isLogout
+                          ? 'text-rose-300 dark:text-rose-700'
+                          : 'text-[#14532D]/30 dark:text-[#22C55E]/35'
+                      }
+                    />
+                  </svg>
+
+                  <div
+                    className={`relative z-10 w-12 h-12 sm:w-14 sm:h-14 rounded-2xl border flex items-center justify-center group-hover:scale-105 transition-transform duration-150 ${
+                      isLogout
+                        ? 'bg-white dark:bg-[#161E2E] border-rose-300 dark:border-rose-800/70'
+                        : 'bg-white dark:bg-[#161E2E] border-slate-300 dark:border-[#263248] group-hover:border-[#14532D] dark:group-hover:border-[#22C55E]'
+                    }`}
+                  >
+                    {renderGalleryThumbnailIcon(item.id)}
+                  </div>
+                </div>
+
+                <div className="p-3 sm:p-4 flex-1 flex flex-col justify-between gap-1.5">
+                  <div className="space-y-1 min-w-0">
+                    <div className="text-[11px] sm:text-xs text-slate-500 dark:text-slate-400 tabular-nums truncate">
+                      {item.kicker}
+                    </div>
+                    <div className="flex items-center justify-between gap-2">
+                      <span
+                        className={`text-sm sm:text-base font-bold tracking-tight truncate ${
+                          isLogout
+                            ? 'text-[#DC2626] dark:text-rose-400'
+                            : 'text-slate-900 dark:text-white'
+                        }`}
+                      >
+                        <span className="sm:hidden">{item.shortTitle}</span>
+                        <span className="hidden sm:inline">{item.title}</span>
+                      </span>
+                      {isLogout ? (
+                        <LogOut
+                          className="w-4 h-4 shrink-0 text-[#DC2626] dark:text-rose-400"
+                          aria-hidden="true"
+                        />
+                      ) : (
+                        <ArrowRight
+                          className="w-4 h-4 shrink-0 text-slate-400 group-hover:text-[#14532D] dark:group-hover:text-[#22C55E]"
+                          aria-hidden="true"
+                        />
+                      )}
+                    </div>
+                  </div>
+                  <p className="hidden sm:block text-xs text-slate-600 dark:text-slate-300 line-clamp-2 leading-relaxed">
+                    {item.description}
+                  </p>
+                </div>
+              </button>
+            );
+          })}
+        </section>
+      )}
 
       {/* ==================== TAB 1: GESTÃO DE TERRENOS & DOCUMENTOS UPLOADED ==================== */}
       {subTab === 'properties' && (
@@ -667,9 +1160,22 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             <div className="flex flex-wrap items-center gap-2">
               <button
                 type="button"
-                onClick={() => onNavigateTab('map')}
-                className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0"
+                data-testid="toolbar-draw-polygon-map-btn"
+                onClick={() => {
+                  const currentEditParcel = editingParcelId
+                    ? parcels.find((p) => p.id === editingParcelId)
+                    : null;
+                  if (currentEditParcel) {
+                    setPolygonMapTarget({ mode: 'edit', parcel: currentEditParcel });
+                  } else {
+                    setShowAddParcelForm(true);
+                    setAddParcelError(null);
+                    setPolygonMapTarget({ mode: 'new' });
+                  }
+                }}
+                className="min-h-[44px] px-3.5 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 transition-colors whitespace-nowrap shrink-0"
               >
+                <PenTool className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />
                 Desenhar Polígono no Mapa
               </button>
               <button
@@ -718,7 +1224,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     Registar Nova Propriedade (BUPi / Matriz Predial)
                   </h2>
                   <p className="text-xs text-slate-500 dark:text-slate-400">
-                    Calcula automaticamente as faixas regulamentares EPSG:3763 (Despacho n.º 675/2026) e guarda localmente e na Cloud.
+                    Calcula automaticamente as faixas regulamentares EPSG:3763 (Despacho n.º 675/2026) com sincronização offline/online automática.
                   </p>
                 </div>
               </div>
@@ -770,20 +1276,20 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
                 <div>
                   <label
-                    htmlFor="new-parcel-dico"
+                    htmlFor="new-parcel-district"
                     className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
                   >
-                    Concelho (DICO)
+                    Distrito
                   </label>
                   <select
-                    id="new-parcel-dico"
-                    value={newDico}
-                    onChange={(e) => setNewDico(e.target.value)}
+                    id="new-parcel-district"
+                    value={newDistrict}
+                    onChange={(e) => handleNewDistrictChange(e.target.value)}
                     className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
                   >
-                    {municipalities.map((m) => (
-                      <option key={m.dico} value={m.dico}>
-                        {m.name} ({m.dico})
+                    {districtsList.map((dist) => (
+                      <option key={dist} value={dist}>
+                        {dist}
                       </option>
                     ))}
                   </select>
@@ -791,53 +1297,149 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
                 <div>
                   <label
-                    htmlFor="new-parcel-parish"
+                    htmlFor="new-parcel-dico"
                     className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
                   >
-                    Freguesia
+                    Concelho (DICO · {newMunicipalitiesForDistrict.length} no distrito)
                   </label>
-                  <input
-                    id="new-parcel-parish"
-                    type="text"
-                    value={newParish}
-                    onChange={(e) => setNewParish(e.target.value)}
-                    placeholder="Ex.: Colares"
+                  <select
+                    id="new-parcel-dico"
+                    value={newDico}
+                    onChange={(e) => handleNewDicoChange(e.target.value)}
                     className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
-                  />
+                  >
+                    {newMunicipalitiesForDistrict.map((m) => (
+                      <option key={m.dico} value={m.dico}>
+                        {m.name} ({m.dico})
+                      </option>
+                    ))}
+                  </select>
                 </div>
 
-                <div>
-                  <label
-                    htmlFor="new-parcel-matrix"
-                    className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
-                  >
-                    Artigo Matricial
-                  </label>
-                  <input
-                    id="new-parcel-matrix"
-                    type="text"
-                    value={newMatrixArticle}
-                    onChange={(e) => setNewMatrixArticle(e.target.value)}
-                    placeholder="Ex.: Rústico — Art.º 204, Secção D"
-                    className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
-                  />
+                <div className="space-y-2">
+                  <div>
+                    <label
+                      htmlFor="new-parcel-parish"
+                      className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                    >
+                      Freguesia ({selectedNewMuni.name} · {newParishesForMuni.length} no concelho)
+                    </label>
+                    <select
+                      id="new-parcel-parish"
+                      value={newParishOption}
+                      onChange={(e) => setNewParishOption(e.target.value)}
+                      className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
+                    >
+                      {newParishesForMuni.map((parishName) => (
+                        <option key={parishName} value={parishName}>
+                          {parishName}
+                        </option>
+                      ))}
+                      <option value={CUSTOM_USER_INPUT_VALUE}>
+                        Input do utilizador (inserir manualmente)
+                      </option>
+                    </select>
+                  </div>
+                  {newParishOption === CUSTOM_USER_INPUT_VALUE && (
+                    <div>
+                      <label
+                        htmlFor="new-parcel-parish-custom"
+                        className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                      >
+                        Freguesia (Input do utilizador)
+                      </label>
+                      <input
+                        id="new-parcel-parish-custom"
+                        type="text"
+                        value={newParishCustom}
+                        onChange={(e) => setNewParishCustom(e.target.value)}
+                        placeholder={`Ex.: Freguesia em ${selectedNewMuni.name}`}
+                        className="w-full min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
+                      />
+                    </div>
+                  )}
                 </div>
 
-                <div>
-                  <label
-                    htmlFor="new-parcel-bupi"
-                    className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
-                  >
-                    Código BUPi (RGG)
-                  </label>
-                  <input
-                    id="new-parcel-bupi"
-                    type="text"
-                    value={newBupiRggId}
-                    onChange={(e) => setNewBupiRggId(e.target.value)}
-                    placeholder="Ex.: RGG-2026-41290"
-                    className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm font-mono text-slate-900 dark:text-white"
-                  />
+                <div className="space-y-2">
+                  <div>
+                    <label
+                      htmlFor="new-parcel-matrix"
+                      className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                    >
+                      Artigo Matricial
+                    </label>
+                    <select
+                      id="new-parcel-matrix"
+                      value={newMatrixOption}
+                      onChange={(e) => setNewMatrixOption(e.target.value)}
+                      className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
+                    >
+                      {newMatrixOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {newMatrixOption === CUSTOM_USER_INPUT_VALUE && (
+                    <div>
+                      <label
+                        htmlFor="new-parcel-matrix-custom"
+                        className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                      >
+                        Artigo Matricial (Input do utilizador)
+                      </label>
+                      <input
+                        id="new-parcel-matrix-custom"
+                        type="text"
+                        value={newMatrixCustom}
+                        onChange={(e) => setNewMatrixCustom(e.target.value)}
+                        placeholder="Ex.: Rústico — Art.º 508, Secção E"
+                        className="w-full min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
+                      />
+                    </div>
+                  )}
+                </div>
+
+                <div className="space-y-2">
+                  <div>
+                    <label
+                      htmlFor="new-parcel-bupi"
+                      className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                    >
+                      Código BUPi (RGG)
+                    </label>
+                    <select
+                      id="new-parcel-bupi"
+                      value={newBupiOption}
+                      onChange={(e) => setNewBupiOption(e.target.value)}
+                      className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm font-mono text-slate-900 dark:text-white"
+                    >
+                      {newBupiOptions.map((opt) => (
+                        <option key={opt.value} value={opt.value}>
+                          {opt.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  {newBupiOption === CUSTOM_USER_INPUT_VALUE && (
+                    <div>
+                      <label
+                        htmlFor="new-parcel-bupi-custom"
+                        className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                      >
+                        Código BUPi (Input do utilizador)
+                      </label>
+                      <input
+                        id="new-parcel-bupi-custom"
+                        type="text"
+                        value={newBupiCustom}
+                        onChange={(e) => setNewBupiCustom(e.target.value)}
+                        placeholder="Ex.: RGG-2026-41290"
+                        className="w-full min-h-[42px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm font-mono text-slate-900 dark:text-white"
+                      />
+                    </div>
+                  )}
                 </div>
 
                 <div>
@@ -871,15 +1473,15 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     type="number"
                     min={0}
                     max={100}
-                    step={0.5}
+                    step={0.1}
                     value={newAvgSlope}
                     onChange={(e) => setNewAvgSlope(Number(e.target.value))}
                     className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm font-mono tabular-nums text-slate-900 dark:text-white"
                   />
                 </div>
 
-                <div className="sm:col-span-2 flex flex-wrap items-center gap-5 pt-5">
-                  <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer min-h-[40px]">
+                <div className="flex flex-col justify-center gap-2 pt-2">
+                  <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer min-h-[36px]">
                     <input
                       type="checkbox"
                       checked={newHasEredes}
@@ -888,7 +1490,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     />
                     Linha aérea E-REDES atravessa o lote (deduz servidão)
                   </label>
-                  <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer min-h-[40px]">
+                  <label className="inline-flex items-center gap-2 text-xs font-medium text-slate-800 dark:text-slate-200 cursor-pointer min-h-[36px]">
                     <input
                       type="checkbox"
                       checked={newHasOaks}
@@ -900,21 +1502,63 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                 </div>
               </div>
 
-              <div>
-                <label
-                  htmlFor="new-parcel-vertices"
-                  className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
-                >
-                  Vértices Geográficos WGS84 (Opcional — 1 par latitude, longitude por linha; se vazio gera polígono padrão no concelho)
-                </label>
+              {/* Vertices WGS84 + Interactive Map Polygon Drawer */}
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label
+                    htmlFor="new-parcel-vertices"
+                    className="block text-xs font-semibold text-slate-700 dark:text-slate-300"
+                  >
+                    Vértices WGS84 (latitude, longitude por linha)
+                  </label>
+                  <button
+                    type="button"
+                    data-testid="open-new-polygon-map-btn"
+                    onClick={() => setPolygonMapTarget({ mode: 'new' })}
+                    className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#14532D]/10 dark:bg-[#22C55E]/15 border border-[#14532D] dark:border-[#22C55E] text-xs font-semibold text-[#14532D] dark:text-[#4ADE80] hover:bg-[#14532D]/20 dark:hover:bg-[#22C55E]/25 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                  >
+                    <PenTool className="w-3.5 h-3.5" aria-hidden="true" />
+                    Desenhar Propriedade no Mapa
+                  </button>
+                </div>
                 <textarea
                   id="new-parcel-vertices"
-                  rows={3}
+                  rows={4}
                   value={newVerticesRaw}
                   onChange={(e) => setNewVerticesRaw(e.target.value)}
                   placeholder={'38.798050, -9.462580\n38.798760, -9.462520\n38.798790, -9.461640'}
-                  className="w-full px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono tabular-nums text-slate-900 dark:text-white"
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono tabular-nums text-slate-900 dark:text-white"
                 />
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Pode introduzir coordenadas manualmente ou abrir o mapa interativo para clicar e arrastar os vértices da propriedade (se ficar vazio gera polígono padrão em {selectedNewMuni.name}).
+                </p>
+              </div>
+
+              {/* User Notes for Downstream Local LLM Extraction & Processing */}
+              <div className="space-y-1.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <label
+                    htmlFor="new-parcel-user-notes"
+                    className="block text-xs font-semibold text-slate-700 dark:text-slate-300"
+                  >
+                    Notas do Utilizador (Extração & Tratamento por Local LLM)
+                  </label>
+                  <span className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                    {newUserNotes.length} / 2000 carateres
+                  </span>
+                </div>
+                <textarea
+                  id="new-parcel-user-notes"
+                  rows={3}
+                  maxLength={2000}
+                  value={newUserNotes}
+                  onChange={(e) => setNewUserNotes(e.target.value)}
+                  placeholder="Registe confrontações, acessos de trator, muros de pedra, marcos cadastrais, espécies observadas ou condicionantes no terreno para extração estruturada por modelo local (Local LLM)..."
+                  className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white leading-relaxed"
+                />
+                <p className="text-[11px] text-slate-500 dark:text-slate-400">
+                  Guardado localmente (IndexedDB) e sincronizado automaticamente para posterior extração estruturada por Local LLM no dispositivo, sem envio para chatbots externos.
+                </p>
               </div>
 
               {addParcelError && (
@@ -975,6 +1619,10 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                       <div className="space-y-1 min-w-0">
                         <div className="text-xs text-slate-500 dark:text-slate-400 tabular-nums flex flex-wrap items-center gap-x-2 gap-y-0.5">
                           <span>
+                            Distrito: {parcel.district || findMunicipalityByDico(parcel.dico, allMunicipalities).district}
+                          </span>
+                          <span aria-hidden="true">·</span>
+                          <span>
                             {parcel.municipality} (DICO {parcel.dico})
                           </span>
                           <span aria-hidden="true">·</span>
@@ -1026,6 +1674,21 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                             </>
                           )}
                         </div>
+                        {parcel.userNotes?.trim() && (
+                          <div
+                            data-testid={`parcel-llm-notes-${parcel.id}`}
+                            className="pt-2 text-xs text-slate-600 dark:text-slate-300 leading-relaxed"
+                          >
+                            <span className="font-semibold text-slate-800 dark:text-slate-200">
+                              Notas de Campo (Local LLM ·{' '}
+                              <span className="font-mono">
+                                {buildParcelLocalLlmNotePayload(parcel).schemaVersion}
+                              </span>
+                              ):
+                            </span>{' '}
+                            <span>{parcel.userNotes}</span>
+                          </div>
+                        )}
                       </div>
 
                       {/* Property CRUD Action Buttons */}
@@ -1156,20 +1819,20 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
                           <div>
                             <label
-                              htmlFor={`edit-dico-${parcel.id}`}
+                              htmlFor={`edit-district-${parcel.id}`}
                               className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
                             >
-                              Concelho (DICO)
+                              Distrito
                             </label>
                             <select
-                              id={`edit-dico-${parcel.id}`}
-                              value={editDico}
-                              onChange={(e) => setEditDico(e.target.value)}
+                              id={`edit-district-${parcel.id}`}
+                              value={editDistrict}
+                              onChange={(e) => handleEditDistrictChange(e.target.value)}
                               className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
                             >
-                              {municipalities.map((m) => (
-                                <option key={m.dico} value={m.dico}>
-                                  {m.name} ({m.dico})
+                              {districtsList.map((dist) => (
+                                <option key={dist} value={dist}>
+                                  {dist}
                                 </option>
                               ))}
                             </select>
@@ -1177,50 +1840,149 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
                           <div>
                             <label
-                              htmlFor={`edit-parish-${parcel.id}`}
+                              htmlFor={`edit-dico-${parcel.id}`}
                               className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
                             >
-                              Freguesia
+                              Concelho (DICO · {editMunicipalitiesForDistrict.length} no distrito)
                             </label>
-                            <input
-                              id={`edit-parish-${parcel.id}`}
-                              type="text"
-                              value={editParish}
-                              onChange={(e) => setEditParish(e.target.value)}
+                            <select
+                              id={`edit-dico-${parcel.id}`}
+                              value={editDico}
+                              onChange={(e) => handleEditDicoChange(e.target.value)}
                               className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
-                            />
+                            >
+                              {editMunicipalitiesForDistrict.map((m) => (
+                                <option key={m.dico} value={m.dico}>
+                                  {m.name} ({m.dico})
+                                </option>
+                              ))}
+                            </select>
                           </div>
 
-                          <div>
-                            <label
-                              htmlFor={`edit-matrix-${parcel.id}`}
-                              className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
-                            >
-                              Artigo Matricial
-                            </label>
-                            <input
-                              id={`edit-matrix-${parcel.id}`}
-                              type="text"
-                              value={editMatrix}
-                              onChange={(e) => setEditMatrix(e.target.value)}
-                              className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
-                            />
+                          <div className="space-y-2">
+                            <div>
+                              <label
+                                htmlFor={`edit-parish-${parcel.id}`}
+                                className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                              >
+                                Freguesia ({selectedEditMuni.name} · {editParishesForMuni.length} no concelho)
+                              </label>
+                              <select
+                                id={`edit-parish-${parcel.id}`}
+                                value={editParishOption}
+                                onChange={(e) => setEditParishOption(e.target.value)}
+                                className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
+                              >
+                                {editParishesForMuni.map((parishName) => (
+                                  <option key={parishName} value={parishName}>
+                                    {parishName}
+                                  </option>
+                                ))}
+                                <option value={CUSTOM_USER_INPUT_VALUE}>
+                                  Input do utilizador (inserir manualmente)
+                                </option>
+                              </select>
+                            </div>
+                            {editParishOption === CUSTOM_USER_INPUT_VALUE && (
+                              <div>
+                                <label
+                                  htmlFor={`edit-parish-custom-${parcel.id}`}
+                                  className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                                >
+                                  Freguesia (Input do utilizador)
+                                </label>
+                                <input
+                                  id={`edit-parish-custom-${parcel.id}`}
+                                  type="text"
+                                  value={editParishCustom}
+                                  onChange={(e) => setEditParishCustom(e.target.value)}
+                                  placeholder={`Ex.: Freguesia em ${selectedEditMuni.name}`}
+                                  className="w-full min-h-[40px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
+                                />
+                              </div>
+                            )}
                           </div>
 
-                          <div>
-                            <label
-                              htmlFor={`edit-bupi-${parcel.id}`}
-                              className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
-                            >
-                              Código BUPi (RGG)
-                            </label>
-                            <input
-                              id={`edit-bupi-${parcel.id}`}
-                              type="text"
-                              value={editBupi}
-                              onChange={(e) => setEditBupi(e.target.value)}
-                              className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono text-slate-900 dark:text-white"
-                            />
+                          <div className="space-y-2">
+                            <div>
+                              <label
+                                htmlFor={`edit-matrix-${parcel.id}`}
+                                className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                              >
+                                Artigo Matricial
+                              </label>
+                              <select
+                                id={`edit-matrix-${parcel.id}`}
+                                value={editMatrixOption}
+                                onChange={(e) => setEditMatrixOption(e.target.value)}
+                                className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
+                              >
+                                {editMatrixOptions.map((opt) => (
+                                  <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            {editMatrixOption === CUSTOM_USER_INPUT_VALUE && (
+                              <div>
+                                <label
+                                  htmlFor={`edit-matrix-custom-${parcel.id}`}
+                                  className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                                >
+                                  Artigo Matricial (Input do utilizador)
+                                </label>
+                                <input
+                                  id={`edit-matrix-custom-${parcel.id}`}
+                                  type="text"
+                                  value={editMatrixCustom}
+                                  onChange={(e) => setEditMatrixCustom(e.target.value)}
+                                  placeholder="Ex.: Rústico — Art.º 508, Secção E"
+                                  className="w-full min-h-[40px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white"
+                                />
+                              </div>
+                            )}
+                          </div>
+
+                          <div className="space-y-2">
+                            <div>
+                              <label
+                                htmlFor={`edit-bupi-${parcel.id}`}
+                                className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                              >
+                                Código BUPi (RGG)
+                              </label>
+                              <select
+                                id={`edit-bupi-${parcel.id}`}
+                                value={editBupiOption}
+                                onChange={(e) => setEditBupiOption(e.target.value)}
+                                className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono text-slate-900 dark:text-white"
+                              >
+                                {editBupiOptions.map((opt) => (
+                                  <option key={opt.value} value={opt.value}>
+                                    {opt.label}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            {editBupiOption === CUSTOM_USER_INPUT_VALUE && (
+                              <div>
+                                <label
+                                  htmlFor={`edit-bupi-custom-${parcel.id}`}
+                                  className="block text-[11px] font-semibold text-slate-600 dark:text-slate-400 mb-1"
+                                >
+                                  Código BUPi (Input do utilizador)
+                                </label>
+                                <input
+                                  id={`edit-bupi-custom-${parcel.id}`}
+                                  type="text"
+                                  value={editBupiCustom}
+                                  onChange={(e) => setEditBupiCustom(e.target.value)}
+                                  placeholder="Ex.: RGG-2026-41290"
+                                  className="w-full min-h-[40px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono text-slate-900 dark:text-white"
+                                />
+                              </div>
+                            )}
                           </div>
 
                           <div>
@@ -1254,15 +2016,15 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                               type="number"
                               min={0}
                               max={100}
-                              step={0.5}
+                              step={0.1}
                               value={editSlope}
                               onChange={(e) => setEditSlope(Number(e.target.value))}
                               className="w-full min-h-[42px] px-3 py-1.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono tabular-nums text-slate-900 dark:text-white"
                             />
                           </div>
 
-                          <div className="sm:col-span-2 flex flex-wrap items-center gap-5 pt-4">
-                            <label className="inline-flex items-center gap-2 text-xs text-slate-800 dark:text-slate-200 cursor-pointer min-h-[38px]">
+                          <div className="flex flex-col justify-center gap-1.5 pt-2">
+                            <label className="inline-flex items-center gap-2 text-xs text-slate-800 dark:text-slate-200 cursor-pointer min-h-[34px]">
                               <input
                                 type="checkbox"
                                 checked={editHasEredes}
@@ -1271,7 +2033,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                               />
                               Linha aérea E-REDES presente
                             </label>
-                            <label className="inline-flex items-center gap-2 text-xs text-slate-800 dark:text-slate-200 cursor-pointer min-h-[38px]">
+                            <label className="inline-flex items-center gap-2 text-xs text-slate-800 dark:text-slate-200 cursor-pointer min-h-[34px]">
                               <input
                                 type="checkbox"
                                 checked={editHasOaks}
@@ -1280,35 +2042,74 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                               />
                               Sobreiros / Azinheiras protegidos
                             </label>
-                            <button
-                              type="button"
-                              onClick={() => setShowEditVertices((v) => !v)}
-                              className="text-xs font-semibold text-[#14532D] dark:text-[#4ADE80] underline whitespace-nowrap"
-                            >
-                              {showEditVertices
-                                ? 'Ocultar Coordenadas dos Vértices'
-                                : `Editar Vértices Geográficos (${parcel.vertices.length})`}
-                            </button>
                           </div>
                         </div>
 
-                        {showEditVertices && (
-                          <div>
+                        {/* Vértices WGS84 + Desenhar / Editar Propriedade no Mapa */}
+                        <div className="space-y-1.5">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
                             <label
                               htmlFor={`edit-vertices-${parcel.id}`}
-                              className="block text-xs font-semibold text-slate-700 dark:text-slate-300 mb-1"
+                              className="block text-xs font-semibold text-slate-700 dark:text-slate-300"
                             >
                               Vértices WGS84 (latitude, longitude por linha)
                             </label>
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                data-testid={`open-edit-polygon-map-${parcel.id}`}
+                                onClick={() => setPolygonMapTarget({ mode: 'edit', parcel })}
+                                className="min-h-[38px] px-3 py-1.5 rounded-xl bg-[#14532D]/10 dark:bg-[#22C55E]/15 border border-[#14532D] dark:border-[#22C55E] text-xs font-semibold text-[#14532D] dark:text-[#4ADE80] hover:bg-[#14532D]/20 dark:hover:bg-[#22C55E]/25 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                              >
+                                <PenTool className="w-3.5 h-3.5" aria-hidden="true" />
+                                Desenhar / Editar Propriedade no Mapa
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setShowEditVertices((v) => !v)}
+                                className="text-xs font-semibold text-slate-600 dark:text-slate-400 underline whitespace-nowrap"
+                              >
+                                {showEditVertices ? 'Ocultar lista' : 'Mostrar lista'}
+                              </button>
+                            </div>
+                          </div>
+                          {showEditVertices && (
                             <textarea
                               id={`edit-vertices-${parcel.id}`}
                               rows={4}
                               value={editVerticesRaw}
-                              onChange={(e) => setEditVerticesRaw(e.target.value)}
-                              className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono tabular-nums text-slate-900 dark:text-white"
+                              onChange={(e) => {
+                                setEditVerticesRaw(e.target.value);
+                                setEditVerticesTouched(true);
+                              }}
+                              className="w-full px-3.5 py-2.5 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs font-mono tabular-nums text-slate-900 dark:text-white"
                             />
+                          )}
+                        </div>
+
+                        {/* User Notes for Downstream Local LLM Extraction & Processing */}
+                        <div className="space-y-1.5">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <label
+                              htmlFor={`edit-user-notes-${parcel.id}`}
+                              className="block text-xs font-semibold text-slate-700 dark:text-slate-300"
+                            >
+                              Notas do Utilizador (Extração & Tratamento por Local LLM)
+                            </label>
+                            <span className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-slate-400">
+                              {editUserNotes.length} / 2000 carateres
+                            </span>
                           </div>
-                        )}
+                          <textarea
+                            id={`edit-user-notes-${parcel.id}`}
+                            rows={3}
+                            maxLength={2000}
+                            value={editUserNotes}
+                            onChange={(e) => setEditUserNotes(e.target.value)}
+                            placeholder="Registe notas de terreno, confrontações, marcos BUPi, obstáculos de acesso ou vegetação para extração e tratamento posterior por Local LLM..."
+                            className="w-full px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-xs text-slate-900 dark:text-white leading-relaxed"
+                          />
+                        </div>
 
                         {editParcelError && (
                           <p role="alert" className="text-xs font-semibold text-[#DC2626]">
@@ -1753,9 +2554,9 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                     onChange={(e) => setProfDico(e.target.value)}
                     className="w-full min-h-[44px] px-3.5 py-2 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248] text-sm text-slate-900 dark:text-white"
                   >
-                    {municipalities.map((m) => (
+                    {allMunicipalities.map((m) => (
                       <option key={m.dico} value={m.dico}>
-                        {m.name} ({m.dico})
+                        {m.name} ({m.district} · {m.dico})
                       </option>
                     ))}
                   </select>
@@ -1787,7 +2588,7 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
             {/* Cloud Sync & Session Security Card */}
             <section className="rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-5 space-y-3">
               <h2 className="text-sm font-bold text-slate-900 dark:text-white">
-                Sessão, Armazenamento Offline & Sincronização Cloud
+                Sessão, Armazenamento Offline & Sincronização Automática
               </h2>
               <div className="text-xs text-slate-600 dark:text-slate-300 space-y-1 tabular-nums">
                 <p>
@@ -1795,15 +2596,15 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
                   <strong className="font-mono text-slate-900 dark:text-white">
                     {storageBackend === 'indexeddb' ? 'IndexedDB' : 'localStorage'}
                   </strong>{' '}
-                  · Ligação: <strong>{isOnline ? 'Online' : 'Offline no Terreno'}</strong>
+                  · Ligação: <strong>{isOnline ? 'Online (Sincronia Automática Ativa)' : 'Offline no Terreno (Fila Automática)'}</strong>
                 </p>
                 <p>
-                  Operações pendentes na fila Firestore:{' '}
+                  Operações pendentes na fila de sincronia:{' '}
                   <strong className="font-mono text-slate-900 dark:text-white">
                     {pendingSyncCount}
                   </strong>
                   {lastSyncedAtIso
-                    ? ` · Última sincronização: ${new Date(lastSyncedAtIso).toLocaleTimeString('pt-PT')}`
+                    ? ` · Última sincronização automática: ${new Date(lastSyncedAtIso).toLocaleTimeString('pt-PT')}`
                     : ''}
                 </p>
               </div>
@@ -1872,37 +2673,28 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
               </div>
             </div>
 
-            {/* Visual Theme Setting */}
-            <div className="space-y-2">
-              <div className="text-xs font-semibold text-slate-800 dark:text-slate-200">
-                Tema Visual de Leitura no Terreno
+            {/* Quick Link to Dedicated Theme & Dark Mode Setting */}
+            <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl bg-slate-50 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248] p-3.5">
+              <div className="space-y-0.5">
+                <div className="text-xs font-semibold text-slate-900 dark:text-white">
+                  Tema Visual · {darkMode ? 'Modo Escuro ativo' : 'Modo Solar (Claro) ativo'}
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Configure o Modo Escuro na definição dedicada de Tema da Galeria User.
+                </p>
               </div>
-              <div className="grid grid-cols-2 gap-2 p-1 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]">
-                <button
-                  type="button"
-                  onClick={() => onToggleDarkMode(false)}
-                  className={`min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
-                    !darkMode
-                      ? 'bg-white text-slate-900 border-slate-300'
-                      : 'bg-transparent border-transparent text-slate-600 dark:text-slate-300'
-                  }`}
-                >
-                  <Sun className="w-3.5 h-3.5 text-amber-500" aria-hidden="true" />
-                  Modo Solar (Claro)
-                </button>
-                <button
-                  type="button"
-                  onClick={() => onToggleDarkMode(true)}
-                  className={`min-h-[42px] px-3 py-2 rounded-lg border text-xs font-semibold inline-flex items-center justify-center gap-1.5 transition-colors whitespace-nowrap ${
-                    darkMode
-                      ? 'bg-[#161E2E] text-white border-[#263248]'
-                      : 'bg-transparent border-transparent text-slate-600 dark:text-slate-300'
-                  }`}
-                >
+              <button
+                type="button"
+                onClick={() => setSubTab('theme')}
+                className="min-h-[40px] px-3.5 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-xs font-semibold text-slate-800 dark:text-slate-100 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+              >
+                {darkMode ? (
                   <Moon className="w-3.5 h-3.5 text-sky-400" aria-hidden="true" />
-                  Modo Noite (Escuro)
-                </button>
-              </div>
+                ) : (
+                  <Sun className="w-3.5 h-3.5 text-amber-500" aria-hidden="true" />
+                )}
+                Abrir Definição de Tema
+              </button>
             </div>
 
             {/* PIR Alert Threshold */}
@@ -1984,17 +2776,12 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
             {/* Boolean Operational Switches */}
             <div className="space-y-2.5 pt-3 border-t border-slate-200 dark:border-[#263248]">
-              <label className="flex items-center justify-between gap-3 min-h-[40px] cursor-pointer text-xs text-slate-800 dark:text-slate-200">
-                <span>Sincronizar automaticamente terrenos e histórico quando a rede regressa</span>
-                <input
-                  type="checkbox"
-                  checked={userSettings.offlineAutoSync}
-                  onChange={(e) =>
-                    onUpdateSettings({ ...userSettings, offlineAutoSync: e.target.checked })
-                  }
-                  className="w-4 h-4 rounded accent-[#14532D] shrink-0"
-                />
-              </label>
+              <div className="flex items-center justify-between gap-3 min-h-[40px] text-xs text-slate-800 dark:text-slate-200">
+                <span>Sincronia offline/online automática (IndexedDB, API & Cloud)</span>
+                <span className="font-mono font-semibold text-[#14532D] dark:text-[#4ADE80] shrink-0">
+                  Permanente
+                </span>
+              </div>
 
               <label className="flex items-center justify-between gap-3 min-h-[40px] cursor-pointer text-xs text-slate-800 dark:text-slate-200">
                 <span>Transferir automaticamente o PDF A4 ao emitir um Auto SHA-256</span>
@@ -2035,6 +2822,171 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
               >
                 Repor Predefinições
               </button>
+            </div>
+          </section>
+        </div>
+      )}
+
+      {/* ==================== SETTING DEDICADO: TEMA & MODO ESCURO ==================== */}
+      {subTab === 'theme' && (
+        <div
+          data-testid="user-theme-settings-panel"
+          className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start"
+        >
+          <section className="lg:col-span-7 rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] p-5 space-y-5">
+            <div className="pb-3 border-b border-slate-200 dark:border-[#263248] space-y-1">
+              <div className="text-xs text-slate-500 dark:text-slate-400">
+                Preferência guardada automaticamente neste dispositivo ·{' '}
+                <span className="font-semibold text-slate-900 dark:text-white">
+                  {darkMode ? 'Modo Escuro ativo' : 'Modo Solar (Claro) ativo'}
+                </span>
+              </div>
+              <h2 className="text-base sm:text-lg font-bold text-slate-900 dark:text-white">
+                Tema da Aplicação & Modo Escuro
+              </h2>
+              <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                Escolha entre o Modo Escuro para trabalho em gabinete, vigia noturna e menor fadiga
+                ocular, ou o Modo Solar de alto contraste para leitura direta no terreno sob sol intenso.
+              </p>
+            </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3.5">
+              <button
+                type="button"
+                data-testid="theme-select-light-btn"
+                aria-pressed={!darkMode}
+                onClick={() => onToggleDarkMode(false)}
+                className={`text-left rounded-xl p-4 border space-y-2.5 min-h-[124px] flex flex-col justify-between ${
+                  !darkMode
+                    ? 'border-[#14532D] dark:border-[#22C55E] bg-slate-50 dark:bg-[#0B0F17]'
+                    : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] hover:border-slate-400 dark:hover:border-slate-600'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                    <Sun className="w-4 h-4 text-amber-500 shrink-0" aria-hidden="true" />
+                    Modo Solar (Claro)
+                  </span>
+                  <span
+                    className={`inline-flex items-center gap-1 text-xs font-semibold ${
+                      !darkMode
+                        ? 'text-[#14532D] dark:text-[#22C55E]'
+                        : 'text-slate-500 dark:text-slate-400'
+                    }`}
+                  >
+                    {!darkMode && <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />}
+                    {!darkMode ? 'Ativo' : 'Selecionar'}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                  Fundo claro de elevada luminância otimizado para inspeção de faixas no exterior sob
+                  luz solar direta.
+                </p>
+              </button>
+
+              <button
+                type="button"
+                data-testid="theme-select-dark-btn"
+                aria-pressed={darkMode}
+                onClick={() => onToggleDarkMode(true)}
+                className={`text-left rounded-xl p-4 border space-y-2.5 min-h-[124px] flex flex-col justify-between ${
+                  darkMode
+                    ? 'border-[#14532D] dark:border-[#22C55E] bg-slate-50 dark:bg-[#0B0F17]'
+                    : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] hover:border-slate-400 dark:hover:border-slate-600'
+                }`}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="inline-flex items-center gap-2 text-sm font-bold text-slate-900 dark:text-white">
+                    <Moon className="w-4 h-4 text-sky-400 shrink-0" aria-hidden="true" />
+                    Modo Escuro (Noite)
+                  </span>
+                  <span
+                    className={`inline-flex items-center gap-1 text-xs font-semibold ${
+                      darkMode
+                        ? 'text-[#14532D] dark:text-[#22C55E]'
+                        : 'text-slate-500 dark:text-slate-400'
+                    }`}
+                  >
+                    {darkMode && <CheckCircle2 className="w-3.5 h-3.5" aria-hidden="true" />}
+                    {darkMode ? 'Ativo' : 'Selecionar'}
+                  </span>
+                </div>
+                <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                  Superfícies ardósia escura (#0B0F17 / #161E2E) com compensação ótica para conforto
+                  noturno e autonomia em ecrãs OLED.
+                </p>
+              </button>
+            </div>
+
+            <div className="pt-4 border-t border-slate-200 dark:border-[#263248] flex flex-wrap items-center justify-between gap-3">
+              <div className="space-y-0.5">
+                <div className="text-xs font-semibold text-slate-900 dark:text-white">
+                  Alternar Modo Escuro Imediatamente
+                </div>
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  Aplica-se a todas as vistas (Hoje, Mapa & Faixas, Prestadores e Área do Utilizador).
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  data-testid="toggle-dark-mode-setting-btn"
+                  onClick={() => onToggleDarkMode(!darkMode)}
+                  className="min-h-[42px] px-4 py-2 rounded-xl bg-[#14532D] dark:bg-[#22C55E] text-white dark:text-slate-950 text-xs font-semibold inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                >
+                  {darkMode ? (
+                    <>
+                      <Sun className="w-3.5 h-3.5" aria-hidden="true" />
+                      Mudar para Modo Solar
+                    </>
+                  ) : (
+                    <>
+                      <Moon className="w-3.5 h-3.5" aria-hidden="true" />
+                      Ativar Modo Escuro
+                    </>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (typeof window !== 'undefined' && typeof window.matchMedia === 'function') {
+                      onToggleDarkMode(window.matchMedia('(prefers-color-scheme: dark)').matches);
+                    }
+                  }}
+                  className="min-h-[42px] px-3.5 py-2 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-700 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 whitespace-nowrap shrink-0"
+                >
+                  Sincronizar com Sistema
+                </button>
+              </div>
+            </div>
+          </section>
+
+          <section className="lg:col-span-5 rounded-2xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] overflow-hidden">
+            <div className="h-44 w-full bg-slate-100 dark:bg-[#0B0F17] border-b border-slate-200 dark:border-[#263248] flex flex-col items-center justify-center gap-2.5 p-4">
+              <div className="w-20 h-20 rounded-2xl bg-[#14532D] border border-[#22C55E]/40 overflow-hidden flex items-center justify-center">
+                <img
+                  src={faixaSeguraLogoImg}
+                  alt="Ícone PWA FaixaSegura com perímetros geométricos"
+                  referrerPolicy="no-referrer"
+                  className="w-full h-full object-cover"
+                  onError={(e) => {
+                    e.currentTarget.classList.add('hidden');
+                  }}
+                />
+              </div>
+              <span className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+                Ícone PWA FaixaSegura · Limites Geométricos SGIFR
+              </span>
+            </div>
+            <div className="p-5 space-y-3">
+              <h3 className="text-sm font-bold text-slate-900 dark:text-white">
+                Identidade Visual & Calibração Cromática (WCAG AA)
+              </h3>
+              <p className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed">
+                As cores semânticas oficiais do semáforo IPMA (RCM 1–5) e as faixas concêntricas de
+                0–2 m, 2–10 m e 10–50 m/100 m mantêm contraste mínimo de 4.5:1 tanto em Modo Solar
+                como em Modo Escuro.
+              </p>
             </div>
           </section>
         </div>
@@ -2200,6 +3152,54 @@ export const UserManagementView: React.FC<UserManagementViewProps> = ({
 
       {/* ==================== TAB 5: DOCUMENTAÇÃO TÉCNICA & PRD ==================== */}
       {subTab === 'docs' && <DocsArchitectureView />}
+
+      {/* Interactive Leaflet Map Modal for Drawing & Editing Parcel Polygon Vertices */}
+      {polygonMapTarget && (
+        <ParcelPolygonMapModal
+          isOpen={Boolean(polygonMapTarget)}
+          parcelId={
+            polygonMapTarget.mode === 'edit' ? polygonMapTarget.parcel.id : 'new-parcel-draft'
+          }
+          parcelLabel={
+            polygonMapTarget.mode === 'edit'
+              ? editLabel.trim() || polygonMapTarget.parcel.label
+              : newLabel.trim() || 'Nova Propriedade em Registo'
+          }
+          municipality={
+            polygonMapTarget.mode === 'edit' ? selectedEditMuni : selectedNewMuni
+          }
+          landClass={polygonMapTarget.mode === 'edit' ? editLandClass : newLandClass}
+          hasEredesLine={polygonMapTarget.mode === 'edit' ? editHasEredes : newHasEredes}
+          initialVertices={(() => {
+            if (polygonMapTarget.mode === 'edit') {
+              if (editVerticesRaw.trim()) {
+                const parsed = parseVerticesMultiline(editVerticesRaw);
+                if (parsed.valid) return parsed.vertices;
+              }
+              return polygonMapTarget.parcel.vertices;
+            }
+            if (newVerticesRaw.trim()) {
+              const parsed = parseVerticesMultiline(newVerticesRaw);
+              if (parsed.valid) return parsed.vertices;
+            }
+            return buildDefaultRectangleAroundCenter(selectedNewMuni.defaultCenter);
+          })()}
+          onClose={() => setPolygonMapTarget(null)}
+          onApplyVertices={(appliedVertices) => {
+            const formatted = formatVerticesMultiline(appliedVertices);
+            if (polygonMapTarget.mode === 'edit') {
+              setEditVerticesRaw(formatted);
+              setEditVerticesTouched(true);
+              setShowEditVertices(true);
+              setEditParcelError(null);
+            } else {
+              setNewVerticesRaw(formatted);
+              setAddParcelError(null);
+            }
+            setPolygonMapTarget(null);
+          }}
+        />
+      )}
     </div>
   );
 };

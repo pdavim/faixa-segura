@@ -58,11 +58,29 @@ export interface FirestoreSyncTransport {
 
 export interface SyncFlushResult {
   syncedCount: number;
+  backendSyncedCount?: number;
   remainingCount: number;
   offlineSkipped: boolean;
   awaitingAuthCount: number;
   lastSyncedAtIso?: string;
   errorMessage?: string;
+}
+
+/**
+ * Computes the effective pending network synchronization count for the active session:
+ * - Cloud session (isCloudSession === true): all remaining outbox operations awaiting Firestore commit.
+ * - Local session (isCloudSession === false): parcel mutations not yet synchronized to the online backend (/api/parcels).
+ */
+export function computeEffectivePendingSyncCount(
+  outbox: OfflineSyncOperation[],
+  isCloudSession: boolean
+): number {
+  if (isCloudSession) {
+    return outbox.length;
+  }
+  return outbox.filter(
+    (op) => (op.type === 'SAVE_PARCEL' || op.type === 'DELETE_PARCEL') && !op.backendSynced
+  ).length;
 }
 
 const DB_NAME = 'faixasegura_offline_v1';
@@ -155,7 +173,7 @@ export function coalesceOutboxOperations(ops: OfflineSyncOperation[]): OfflineSy
         result[existingIdx] = {
           ...result[existingIdx],
           ...op,
-          backendSynced: false,
+          backendSynced: Boolean(op.backendSynced),
           createdAtMs: result[existingIdx].createdAtMs,
         };
       } else {
@@ -865,6 +883,7 @@ export class OfflineSyncCoordinator {
       await this.storage.saveOutbox(queue);
       return {
         syncedCount: 0,
+        backendSyncedCount: 0,
         remainingCount: queue.length,
         offlineSkipped: true,
         awaitingAuthCount: activeUid ? 0 : queue.length,
@@ -872,6 +891,7 @@ export class OfflineSyncCoordinator {
     }
 
     let syncedCount = 0;
+    let backendSyncedCount = 0;
     let awaitingAuthCount = 0;
     let errorMessage: string | undefined;
     const remaining: OfflineSyncOperation[] = [];
@@ -886,6 +906,7 @@ export class OfflineSyncCoordinator {
             try {
               await this.transport.syncParcelToBackend(op.parcel);
               op.backendSynced = true;
+              backendSyncedCount += 1;
             } catch {
               // Non-fatal if Express in-memory endpoint is unreachable while Firestore is up
             }
@@ -907,6 +928,7 @@ export class OfflineSyncCoordinator {
             try {
               await this.transport.deleteParcelFromBackend(op.targetId);
               op.backendSynced = true;
+              backendSyncedCount += 1;
             } catch {
               // Non-fatal if Express in-memory endpoint is unreachable
             }
@@ -975,10 +997,12 @@ export class OfflineSyncCoordinator {
 
     return {
       syncedCount,
+      backendSyncedCount,
       remainingCount: remaining.length,
       offlineSkipped: false,
       awaitingAuthCount,
-      lastSyncedAtIso: syncedCount > 0 ? new Date().toISOString() : undefined,
+      lastSyncedAtIso:
+        syncedCount > 0 || backendSyncedCount > 0 ? new Date().toISOString() : undefined,
       errorMessage,
     };
   }

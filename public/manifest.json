@@ -6,7 +6,7 @@
   "theme_color": "#14532D",
   "background_color": "#F8FAFC",
   "display": "standalone",
-  "start_url": "/",
+  "start_url": "/?mode=webapp",
   "scope": "/",
   "icons": [
     {

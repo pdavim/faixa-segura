@@ -1,7 +1,32 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
   <rect width="512" height="512" rx="112" fill="#14532D"/>
-  <path d="M256 84L124 140V248C124 335.4 180.3 416.8 256 444C331.7 416.8 388 335.4 388 248V140L256 84Z" fill="#0F3F22" stroke="#FACC15" stroke-width="20" stroke-linejoin="round"/>
-  <path d="M256 146L194 242H234L208 318H304L278 242H318L256 146Z" fill="#4ADE80"/>
-  <rect x="242" y="318" width="28" height="44" rx="6" fill="#D97706"/>
-  <circle cx="372" cy="144" r="26" fill="#E11D48" stroke="#FFFFFF" stroke-width="8"/>
+  <!-- Outer 100m Geometric Fuel-Management Boundary -->
+  <polygon
+    points="183,76 329,76 436,183 436,329 329,436 183,436 76,329 76,183"
+    stroke="#F59E0B"
+    stroke-width="14"
+    stroke-linejoin="miter"
+  />
+  <!-- Middle 50m Geometric Fuel-Management Boundary -->
+  <polygon
+    points="197,110 315,110 402,197 402,315 315,402 197,402 110,315 110,197"
+    stroke="#FACC15"
+    stroke-width="12"
+    stroke-linejoin="miter"
+  />
+  <!-- Inner 10m Protective Interface Boundary -->
+  <polygon
+    points="211,144 301,144 368,211 368,301 301,368 211,368 144,301 144,211"
+    stroke="#4ADE80"
+    stroke-width="12"
+    stroke-linejoin="miter"
+  />
+  <!-- Minimalist Geometric Forest Core -->
+  <path
+    d="M256 182L214 236H240L204 282H236L198 326H314L276 282H308L272 236H298L256 182Z"
+    stroke="#4ADE80"
+    stroke-width="12"
+    stroke-linejoin="miter"
+  />
+  <line x1="256" y1="196" x2="256" y2="356" stroke="#4ADE80" stroke-width="12" stroke-linecap="square"/>
 </svg>

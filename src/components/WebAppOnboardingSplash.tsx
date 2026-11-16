@@ -10,6 +10,7 @@ import {
   UserCheck,
 } from 'lucide-react';
 import webappPerimeterImg from '../assets/images/webapp_forestry_perimeter_1794766504028.jpg';
+import faixaSeguraLogoImg from '../assets/images/faixasegura_pwa_logo_1794821062754.jpg';
 import { ONBOARDING_SLIDES, validateLocalSessionInput } from '../lib/appShellMode.ts';
 
 interface WebAppOnboardingSplashProps {
@@ -47,6 +48,7 @@ export const WebAppOnboardingSplash: React.FC<WebAppOnboardingSplashProps> = ({
   const [splashProgress, setSplashProgress] = useState(false);
   const [slideIndex, setSlideIndex] = useState(0);
   const [imgFailed, setImgFailed] = useState(false);
+  const [logoFailed, setLogoFailed] = useState(false);
 
   const [signingInGoogle, setSigningInGoogle] = useState(false);
   const [googleError, setGoogleError] = useState<string | null>(null);
@@ -122,8 +124,18 @@ export const WebAppOnboardingSplash: React.FC<WebAppOnboardingSplashProps> = ({
         </div>
 
         <div className="my-auto flex flex-col items-center text-center max-w-md space-y-5">
-          <div className="w-20 h-20 rounded-3xl bg-[#14532D] border border-[#22C55E]/40 flex items-center justify-center shadow-lg">
-            <ShieldCheck className="w-10 h-10 text-[#4ADE80]" aria-hidden="true" />
+          <div className="w-24 h-24 rounded-3xl bg-[#14532D] border border-[#22C55E]/40 overflow-hidden flex items-center justify-center shadow-lg">
+            {!logoFailed ? (
+              <img
+                src={faixaSeguraLogoImg}
+                alt="Logótipo geométrico FaixaSegura"
+                referrerPolicy="no-referrer"
+                onError={() => setLogoFailed(true)}
+                className="w-full h-full object-cover"
+              />
+            ) : (
+              <ShieldCheck className="w-10 h-10 text-[#4ADE80]" aria-hidden="true" />
+            )}
           </div>
 
           <div className="space-y-2">
@@ -168,7 +180,19 @@ export const WebAppOnboardingSplash: React.FC<WebAppOnboardingSplashProps> = ({
       <header className="sticky top-0 z-30 h-14 bg-white/90 dark:bg-[#161E2E]/90 backdrop-blur-md border-b border-slate-200 dark:border-[#263248]">
         <div className="max-w-6xl mx-auto h-full px-4 sm:px-6 flex items-center justify-between gap-4">
           <div className="flex items-center gap-2.5 min-w-0">
-            <ShieldCheck className="w-5 h-5 text-[#14532D] dark:text-[#22C55E] shrink-0" aria-hidden="true" />
+            <div className="w-7 h-7 rounded-lg bg-[#14532D] overflow-hidden flex items-center justify-center shrink-0">
+              {!logoFailed ? (
+                <img
+                  src={faixaSeguraLogoImg}
+                  alt="Ícone FaixaSegura"
+                  referrerPolicy="no-referrer"
+                  onError={() => setLogoFailed(true)}
+                  className="w-full h-full object-cover"
+                />
+              ) : (
+                <ShieldCheck className="w-4 h-4 text-[#4ADE80]" aria-hidden="true" />
+              )}
+            </div>
             <span className="font-display text-base sm:text-lg font-bold tracking-tight text-slate-950 dark:text-white truncate">
               FaixaSegura
             </span>

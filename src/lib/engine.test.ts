@@ -1114,3 +1114,771 @@ test('OfflineTileCacheManager enumerates Web Mercator XYZ tiles, pre-downloads O
   assert.equal(emptyStats.tileCount, 0);
   assert.equal(emptyStats.snapshotCount, 0);
 });
+
+test('userWorkspaceStore persists Dark Mode theme preference and builds the 7-item User thumbnail gallery catalog', async () => {
+  const {
+    LS_KEY_THEME_DARK,
+    buildUserGalleryCatalog,
+    loadThemeDarkPreference,
+    saveThemeDarkPreference,
+  } = await import('./userWorkspaceStore.ts');
+
+  const storeMap = new Map<string, string>();
+  const kv = {
+    getItem: (k: string) => storeMap.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      storeMap.set(k, v);
+    },
+    removeItem: (k: string) => {
+      storeMap.delete(k);
+    },
+  };
+
+  assert.equal(loadThemeDarkPreference(kv), false);
+  assert.equal(saveThemeDarkPreference(true, kv), true);
+  assert.equal(storeMap.get(LS_KEY_THEME_DARK), 'true');
+  assert.equal(loadThemeDarkPreference(kv), true);
+  assert.equal(saveThemeDarkPreference(false, kv), false);
+  assert.equal(loadThemeDarkPreference(kv), false);
+
+  const lightCatalog = buildUserGalleryCatalog({
+    parcelCount: 3,
+    documentCount: 4,
+    favoriteProviderCount: 2,
+    darkMode: false,
+    historyCount: 6,
+    certificateCount: 2,
+    displayName: 'António Ferreira',
+    isCloudSession: false,
+  });
+
+  assert.deepEqual(
+    lightCatalog.map((item) => item.id),
+    ['properties', 'favorites', 'settings', 'theme', 'history', 'docs', 'logout']
+  );
+
+  const themeLight = lightCatalog.find((i) => i.id === 'theme');
+  assert.ok(themeLight);
+  assert.equal(themeLight.actionKind, 'SECTION');
+  assert.ok(themeLight.kicker.includes('Modo Solar'));
+
+  const historyCard = lightCatalog.find((i) => i.id === 'history');
+  assert.ok(historyCard);
+  assert.equal(historyCard.actionKind, 'SECTION');
+  assert.equal(historyCard.kicker, '6 registos · 2 autos SHA-256');
+
+  const logoutCard = lightCatalog.find((i) => i.id === 'logout');
+  assert.ok(logoutCard);
+  assert.equal(logoutCard.actionKind, 'LOGOUT');
+  assert.equal(logoutCard.kicker, 'Sessão local ativa');
+
+  const darkCatalog = buildUserGalleryCatalog({
+    parcelCount: 3,
+    documentCount: 4,
+    favoriteProviderCount: 2,
+    darkMode: true,
+    historyCount: 6,
+    certificateCount: 2,
+    displayName: 'António Ferreira',
+    isCloudSession: true,
+  });
+  assert.equal(darkCatalog.find((i) => i.id === 'theme')?.kicker, 'Modo Escuro ativo');
+  assert.equal(darkCatalog.find((i) => i.id === 'logout')?.kicker, 'Sessão Google Cloud ativa');
+});
+
+test('FaixaSegura PWA logo icons meet exact PNG/SVG manifest specs and User gallery resolves 3 vs 2 columns across viewports', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { resolveExpectedUserGalleryColumns } = await import('./userWorkspaceStore.ts');
+
+  // 1. Responsive User gallery column rules:
+  // Web & Tablet horizontal -> 3 per row; Mobile & Tablet vertical -> 2 per row
+  assert.equal(resolveExpectedUserGalleryColumns(1440, 900), 3); // Web desktop
+  assert.equal(resolveExpectedUserGalleryColumns(1280, 800), 3); // Web laptop
+  assert.equal(resolveExpectedUserGalleryColumns(1024, 768), 3); // Tablet horizontal (iPad landscape)
+  assert.equal(resolveExpectedUserGalleryColumns(1180, 820), 3); // Tablet horizontal (iPad Air landscape)
+  assert.equal(resolveExpectedUserGalleryColumns(960, 600), 3);  // Compact tablet horizontal
+  assert.equal(resolveExpectedUserGalleryColumns(768, 1024), 2); // Tablet vertical (iPad portrait)
+  assert.equal(resolveExpectedUserGalleryColumns(820, 1180), 2); // Tablet vertical (iPad Air portrait)
+  assert.equal(resolveExpectedUserGalleryColumns(1024, 1366), 2); // Tablet vertical (iPad Pro portrait)
+  assert.equal(resolveExpectedUserGalleryColumns(390, 844), 2);  // Mobile portrait
+  assert.equal(resolveExpectedUserGalleryColumns(667, 375), 2);  // Mobile landscape
+
+  // 2. PWA icon binaries & SVG verification
+  const rootDir = path.resolve(import.meta.dirname, '../..');
+  const svgContent = fs.readFileSync(path.join(rootDir, 'public/icon.svg'), 'utf8');
+  assert.ok(svgContent.includes('<polygon'), 'Expected geometric boundary polygons in public/icon.svg');
+  assert.ok(svgContent.includes('#14532D'), 'Expected brand forest green #14532D in public/icon.svg');
+
+  const pngExpectations: Array<{ file: string; width: number; height: number }> = [
+    { file: 'public/pwa-192x192.png', width: 192, height: 192 },
+    { file: 'public/pwa-512x512.png', width: 512, height: 512 },
+    { file: 'public/pwa-maskable-512x512.png', width: 512, height: 512 },
+    { file: 'public/apple-touch-icon.png', width: 180, height: 180 },
+  ];
+
+  for (const spec of pngExpectations) {
+    const buf = fs.readFileSync(path.join(rootDir, spec.file));
+    // PNG magic signature: 89 50 4E 47 0D 0A 1A 0A
+    assert.equal(buf[0], 0x89, `${spec.file} must start with PNG magic byte`);
+    assert.equal(buf.toString('ascii', 1, 4), 'PNG', `${spec.file} must be a valid PNG`);
+    const width = buf.readUInt32BE(16);
+    const height = buf.readUInt32BE(20);
+    assert.equal(width, spec.width, `${spec.file} width must be ${spec.width}`);
+    assert.equal(height, spec.height, `${spec.height} height must be ${spec.height}`);
+  }
+
+  const manifest = JSON.parse(
+    fs.readFileSync(path.join(rootDir, 'public/manifest.json'), 'utf8')
+  ) as {
+    short_name: string;
+    display: string;
+    icons: Array<{ src: string; sizes: string; purpose: string }>;
+  };
+  assert.ok(manifest.short_name.length <= 12);
+  assert.equal(manifest.display, 'standalone');
+  assert.ok(manifest.icons.some((i) => i.sizes === '192x192' && i.purpose === 'any'));
+  assert.ok(manifest.icons.some((i) => i.sizes === '512x512' && i.purpose === 'any'));
+  assert.ok(manifest.icons.some((i) => i.sizes === '512x512' && i.purpose === 'maskable'));
+});
+
+test('Public QR certificate scanner decodes real QR RGBA frames, parses ?verify= URLs and hashes, and resolves certificates', async () => {
+  const QRCode = (await import('qrcode')).default;
+  const { INITIAL_CERTIFICATES } = await import('../data/seedCatalog.ts');
+  const {
+    decodeQrRgbaFrame,
+    describeCameraAccessErrorPt,
+    findCertificateByScannedPayload,
+    parseCertificateVerifyPayload,
+    resolveCertificateFromPayload,
+  } = await import('./qrVerification.ts');
+
+  const demoCert = INITIAL_CERTIFICATES[0];
+
+  // 1. Parse diverse QR & manual payload formats
+  assert.deepEqual(
+    parseCertificateVerifyPayload(`https://faixasegura.pt/?verify=${demoCert.shortCode}`),
+    {
+      candidateCode: demoCert.shortCode,
+      sourceKind: 'VERIFY_QUERY',
+      rawTrimmed: `https://faixasegura.pt/?verify=${demoCert.shortCode}`,
+    }
+  );
+  assert.equal(
+    parseCertificateVerifyPayload(`https://faixasegura.pt/verify/${demoCert.shortCode}`).candidateCode,
+    demoCert.shortCode
+  );
+  assert.equal(
+    parseCertificateVerifyPayload(`#${demoCert.shortCode.toLowerCase()}`).candidateCode,
+    demoCert.shortCode
+  );
+  assert.equal(
+    parseCertificateVerifyPayload(demoCert.sha256Hash).sourceKind,
+    'SHA256_HASH'
+  );
+  assert.equal(
+    parseCertificateVerifyPayload('https://menu.restaurante-exemplo.pt/carta').sourceKind,
+    'UNRELATED_URL'
+  );
+  assert.equal(
+    parseCertificateVerifyPayload('https://menu.restaurante-exemplo.pt/carta').candidateCode,
+    null
+  );
+
+  // 2. Real end-to-end QR generation -> RGBA frame -> jsQR decode -> certificate match
+  const verifyUrl = `http://localhost:3000/?verify=${encodeURIComponent(demoCert.shortCode)}`;
+  const qrMatrix = QRCode.create(verifyUrl, { errorCorrectionLevel: 'M' });
+  const moduleCount = qrMatrix.modules.size;
+  const scale = 6;
+  const margin = 4;
+  const imgSize = (moduleCount + margin * 2) * scale;
+  const rgba = new Uint8ClampedArray(imgSize * imgSize * 4);
+  rgba.fill(255);
+
+  for (let row = 0; row < moduleCount; row++) {
+    for (let col = 0; col < moduleCount; col++) {
+      const isDark = qrMatrix.modules.get(row, col) !== 0;
+      if (!isDark) continue;
+      for (let dy = 0; dy < scale; dy++) {
+        for (let dx = 0; dx < scale; dx++) {
+          const px = (col + margin) * scale + dx;
+          const py = (row + margin) * scale + dy;
+          const idx = (py * imgSize + px) * 4;
+          rgba[idx] = 0;
+          rgba[idx + 1] = 0;
+          rgba[idx + 2] = 0;
+          rgba[idx + 3] = 255;
+        }
+      }
+    }
+  }
+
+  const decodedUrl = decodeQrRgbaFrame(rgba, imgSize, imgSize);
+  assert.equal(decodedUrl, verifyUrl);
+
+  const matchedLocal = findCertificateByScannedPayload(INITIAL_CERTIFICATES, decodedUrl ?? '');
+  assert.ok(matchedLocal.certificate);
+  assert.equal(matchedLocal.certificate.shortCode, demoCert.shortCode);
+
+  // 3. Remote fallback & unmatched error reporting
+  const remoteResolved = await resolveCertificateFromPayload({
+    certificates: [],
+    rawPayload: verifyUrl,
+    fetchRemoteByCode: async (code) => (code === demoCert.shortCode ? demoCert : null),
+  });
+  assert.equal(remoteResolved.certificate?.id, demoCert.id);
+  assert.equal(remoteResolved.errorPt, null);
+
+  const missingResolved = await resolveCertificateFromPayload({
+    certificates: INITIAL_CERTIFICATES,
+    rawPayload: 'FS-20990101-DEAD',
+    fetchRemoteByCode: async () => null,
+  });
+  assert.equal(missingResolved.certificate, null);
+  assert.ok(missingResolved.errorPt?.includes('FS-20990101-DEAD'));
+
+  // 4. Camera error descriptions in Portuguese
+  assert.ok(
+    describeCameraAccessErrorPt({ name: 'NotAllowedError' }, true).includes('recusado')
+  );
+  assert.ok(
+    describeCameraAccessErrorPt(null, false).includes('câmara')
+  );
+});
+
+test('High Contrast sunlight mode persists preference and resolves orthogonal dark + high-contrast root classes', async () => {
+  const {
+    LS_KEY_THEME_HIGH_CONTRAST,
+    loadHighContrastPreference,
+    resolveDocumentThemeClasses,
+    saveHighContrastPreference,
+  } = await import('./userWorkspaceStore.ts');
+
+  const mem = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      mem.set(k, v);
+    },
+    removeItem: (k: string) => {
+      mem.delete(k);
+    },
+  };
+
+  assert.equal(loadHighContrastPreference(mockStorage), false);
+  assert.equal(saveHighContrastPreference(true, mockStorage), true);
+  assert.equal(mem.get(LS_KEY_THEME_HIGH_CONTRAST), 'true');
+  assert.equal(loadHighContrastPreference(mockStorage), true);
+
+  assert.equal(saveHighContrastPreference(false, mockStorage), false);
+  assert.equal(loadHighContrastPreference(mockStorage), false);
+
+  // Verify all 4 combinations of (darkMode x highContrastMode)
+  assert.deepEqual(resolveDocumentThemeClasses({ darkMode: false, highContrastMode: false }), {
+    activeClasses: [],
+    inactiveClasses: ['dark', 'high-contrast'],
+    dataHighContrast: 'false',
+  });
+  assert.deepEqual(resolveDocumentThemeClasses({ darkMode: false, highContrastMode: true }), {
+    activeClasses: ['high-contrast'],
+    inactiveClasses: ['dark'],
+    dataHighContrast: 'true',
+  });
+  assert.deepEqual(resolveDocumentThemeClasses({ darkMode: true, highContrastMode: false }), {
+    activeClasses: ['dark'],
+    inactiveClasses: ['high-contrast'],
+    dataHighContrast: 'false',
+  });
+  assert.deepEqual(resolveDocumentThemeClasses({ darkMode: true, highContrastMode: true }), {
+    activeClasses: ['dark', 'high-contrast'],
+    inactiveClasses: [],
+    dataHighContrast: 'true',
+  });
+});
+
+test('QR Scan History retains the last 5 validated certificates, deduplicates re-scans, and wires #public-verify-code-input High Contrast indicator', async () => {
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+  const { INITIAL_CERTIFICATES, INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const {
+    LS_KEY_QR_SCAN_HISTORY,
+    MAX_QR_SCAN_HISTORY_ITEMS,
+    appendQrScanHistory,
+    clearQrScanHistory,
+    loadQrScanHistory,
+    recordScannedCertificateInHistory,
+  } = await import('./qrVerification.ts');
+
+  assert.equal(MAX_QR_SCAN_HISTORY_ITEMS, 5);
+
+  const mem = new Map<string, string>();
+  const mockStorage = {
+    getItem: (k: string) => mem.get(k) ?? null,
+    setItem: (k: string, v: string) => {
+      mem.set(k, v);
+    },
+    removeItem: (k: string) => {
+      mem.delete(k);
+    },
+  };
+
+  // 1. Empty and corrupted storage resilience
+  assert.deepEqual(loadQrScanHistory(mockStorage), []);
+  mem.set(LS_KEY_QR_SCAN_HISTORY, '{invalid-json');
+  assert.deepEqual(loadQrScanHistory(mockStorage), []);
+  mem.set(LS_KEY_QR_SCAN_HISTORY, JSON.stringify([{ bad: true }]));
+  assert.deepEqual(loadQrScanHistory(mockStorage), []);
+
+  // 2. Build 6 distinct ComplianceCertificates and verify strict last-5 cap + newest-first order
+  const baseCert = INITIAL_CERTIFICATES[0];
+  const sixCerts = Array.from({ length: 6 }, (_, idx) => {
+    const parcel = INITIAL_PARCELS[idx % INITIAL_PARCELS.length];
+    const num = idx + 1;
+    return {
+      ...baseCert,
+      id: `cert-hist-${num}`,
+      shortCode: `FS-2026110${num}-A00${num}`,
+      parcelId: parcel.id,
+      parcelLabel: parcel.label,
+      municipality: parcel.municipality,
+      parish: parcel.parish,
+      sha256Hash: `${String(num).repeat(64)}`.slice(0, 64),
+    };
+  });
+
+  for (let i = 0; i < sixCerts.length; i++) {
+    appendQrScanHistory(sixCerts[i], {
+      scannedAtIso: `2026-11-16T10:0${i}:00.000Z`,
+      source: i % 2 === 0 ? 'CAMERA' : 'IMAGE',
+      storage: mockStorage,
+    });
+  }
+
+  const afterSix = loadQrScanHistory(mockStorage);
+  assert.equal(afterSix.length, 5, 'Scan History must cap strictly at the last 5 scanned certificates');
+  assert.deepEqual(
+    afterSix.map((e) => e.certificate.shortCode),
+    [
+      'FS-20261106-A006',
+      'FS-20261105-A005',
+      'FS-20261104-A004',
+      'FS-20261103-A003',
+      'FS-20261102-A002',
+    ]
+  );
+
+  // 3. Re-scanning an existing certificate moves it to index 0 without duplicating
+  const rescanned = recordScannedCertificateInHistory(afterSix, sixCerts[2], {
+    scannedAtIso: '2026-11-16T10:30:00.000Z',
+    source: 'MANUAL_CODE',
+  });
+  assert.equal(rescanned.length, 5);
+  assert.equal(rescanned[0].certificate.shortCode, 'FS-20261103-A003');
+  assert.equal(rescanned[0].source, 'MANUAL_CODE');
+  assert.deepEqual(
+    rescanned.map((e) => e.certificate.shortCode),
+    [
+      'FS-20261103-A003',
+      'FS-20261106-A006',
+      'FS-20261105-A005',
+      'FS-20261104-A004',
+      'FS-20261102-A002',
+    ]
+  );
+
+  // 4. Clearing scan history empties persisted state
+  clearQrScanHistory(mockStorage);
+  assert.deepEqual(loadQrScanHistory(mockStorage), []);
+
+  // 5. Verify #public-verify-code-input High Contrast indicator wiring in PublicWebviewHomepage.tsx
+  const homepageSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../components/PublicWebviewHomepage.tsx'),
+    'utf8'
+  );
+  assert.ok(homepageSrc.includes('id="public-verify-code-input"'));
+  assert.ok(homepageSrc.includes('id="public-verify-hc-indicator"'));
+  assert.ok(homepageSrc.includes('data-testid="public-verify-hc-badge"'));
+  assert.ok(
+    homepageSrc.includes("'public-verify-hc-indicator public-verify-code-feedback'")
+  );
+});
+
+test('Portugal administrative catalog covers all 20 districts, 308 municipalities, cascading parishes, Matrix Article & BUPi custom options, Local LLM notes, and automatic offline/online sync', async () => {
+  const {
+    CUSTOM_USER_INPUT_VALUE,
+    FULL_PORTUGAL_MUNICIPALITIES,
+    PORTUGAL_DISTRICTS,
+    PORTUGAL_PARISHES_BY_DICO,
+    buildBupiCodeOptions,
+    buildMatrixArticleOptions,
+    findMunicipalityByDico,
+    getDistrictsList,
+    getMunicipalitiesByDistrict,
+    getParishesByMunicipality,
+    getTotalPortugalParishesCount,
+    resolveDropdownOrCustomValue,
+  } = await import('../data/portugalAdminCatalog.ts');
+  const { buildLocalParcelRecord } = await import('./offlineParcelBuilder.ts');
+  const { applyParcelUpdate, buildParcelLocalLlmNotePayload } = await import('./userWorkspaceStore.ts');
+  const {
+    OfflineSyncCoordinator,
+    computeEffectivePendingSyncCount,
+    createMemoryOfflineStorageAdapter,
+  } = await import('./offlineStorage.ts');
+
+  // 1. All 20 official districts + 308 Portuguese municipalities with unique 4-digit DICOs
+  const districts = getDistrictsList();
+  assert.equal(districts.length, 20);
+  assert.equal(PORTUGAL_DISTRICTS.length, 20);
+  assert.equal(FULL_PORTUGAL_MUNICIPALITIES.length, 308);
+  const uniqueDicos = new Set(FULL_PORTUGAL_MUNICIPALITIES.map((m) => m.dico));
+  assert.equal(uniqueDicos.size, 308, 'Every Portuguese municipality must have a unique DICO');
+  assert.equal(FULL_PORTUGAL_MUNICIPALITIES[0].dico, '1111', 'Sintra remains primary index 0');
+
+  // 2. Strictly filtered municipalities by district & parishes by municipality
+  const portoMunis = getMunicipalitiesByDistrict('Porto');
+  assert.equal(portoMunis.length, 18);
+  assert.ok(portoMunis.every((m) => m.district === 'Porto'));
+
+  const leiriaMunis = getMunicipalitiesByDistrict('Leiria');
+  assert.equal(leiriaMunis.length, 16);
+  assert.ok(leiriaMunis.every((m) => m.district === 'Leiria'));
+
+  const sintraParishes = getParishesByMunicipality({ dico: '1111', municipalityName: 'Sintra' });
+  assert.ok(sintraParishes.includes('Colares'));
+  assert.equal(sintraParishes.length, 15, 'Sintra must return all 15 official CAOP parishes');
+
+  const lisboaParishes = getParishesByMunicipality({ dico: '1106', municipalityName: 'Lisboa' });
+  assert.equal(lisboaParishes.length, 24, 'Lisboa must return all 24 official CAOP parishes');
+
+  const barcelosParishes = getParishesByMunicipality({ dico: '0302', municipalityName: 'Barcelos' });
+  assert.equal(barcelosParishes.length, 65, 'Barcelos must return all 65 official CAOP parishes');
+
+  const pontaDelgadaParishes = getParishesByMunicipality({
+    dico: '4203',
+    municipalityName: 'Ponta Delgada',
+  });
+  assert.equal(pontaDelgadaParishes.length, 24, 'Ponta Delgada (Açores) must return all 24 parishes');
+
+  const funchalParishes = getParishesByMunicipality({ dico: '3103', municipalityName: 'Funchal' });
+  assert.equal(funchalParishes.length, 10, 'Funchal (Madeira) must return all 10 parishes');
+
+  // Exhaustively verify EVERY SINGLE ONE of the 308 municipalities has complete official CAOP parishes and zero synthetic placeholders
+  assert.equal(Object.keys(PORTUGAL_PARISHES_BY_DICO).length, 308);
+  assert.equal(getTotalPortugalParishesCount(), 3259);
+  for (const muni of FULL_PORTUGAL_MUNICIPALITIES) {
+    const list = getParishesByMunicipality({ dico: muni.dico, municipalityName: muni.name });
+    assert.ok(list.length >= 1, `Municipality ${muni.name} (${muni.dico}) must have >= 1 parish`);
+    assert.ok(
+      list.every(
+        (p) =>
+          !p.includes('(Sede de Concelho)') &&
+          !p.includes('Zona Rural Norte') &&
+          !p.includes('Zona Florestal Sul')
+      ),
+      `Municipality ${muni.name} (${muni.dico}) must not contain synthetic fallback placeholders`
+    );
+  }
+
+  const arouca = findMunicipalityByDico('0104');
+  assert.equal(arouca.name, 'Arouca');
+  assert.equal(arouca.district, 'Aveiro');
+  const aroucaParishes = getParishesByMunicipality({
+    dico: arouca.dico,
+    municipalityName: arouca.name,
+  });
+  assert.equal(aroucaParishes.length, 16);
+  assert.ok(aroucaParishes.some((p) => p.includes('Arouca')));
+
+  // 3. Artigo Matricial & Código BUPi options include CUSTOM_USER_INPUT_VALUE and resolve custom inputs
+  const matrixOpts = buildMatrixArticleOptions({
+    landClass: 'FOREST_SCRUB',
+    dico: '1009',
+    municipalityName: 'Leiria',
+  });
+  assert.ok(matrixOpts.length >= 5);
+  assert.equal(matrixOpts[matrixOpts.length - 1].value, CUSTOM_USER_INPUT_VALUE);
+  assert.equal(
+    resolveDropdownOrCustomValue({
+      selectedOption: CUSTOM_USER_INPUT_VALUE,
+      customInput: '  Rústico — Art.º 999, Secção Z  ',
+      fallbackValue: 'Fallback',
+    }),
+    'Rústico — Art.º 999, Secção Z'
+  );
+
+  const bupiOpts = buildBupiCodeOptions({
+    dico: '1009',
+    municipalityName: 'Leiria',
+  });
+  assert.ok(bupiOpts.length >= 5);
+  assert.equal(bupiOpts[bupiOpts.length - 1].value, CUSTOM_USER_INPUT_VALUE);
+  assert.equal(
+    resolveDropdownOrCustomValue({
+      selectedOption: CUSTOM_USER_INPUT_VALUE,
+      customInput: '  RGG-CUSTOM-2026-LEI  ',
+      fallbackValue: 'Fallback',
+    }),
+    'RGG-CUSTOM-2026-LEI'
+  );
+
+  // 4. Local LLM structured notes envelope + polygon vertex update recalculation
+  const created = buildLocalParcelRecord({
+    label: 'Pinhal da Barosa Norte',
+    district: 'Leiria',
+    dico: '1009',
+    parish: 'Marrazes e Barosa',
+    matrixArticle: 'Rústico — Art.º 999, Secção Z',
+    bupiRggId: 'RGG-CUSTOM-2026-LEI',
+    landClass: 'FOREST_SCRUB',
+    avgSlopePct: 14,
+    hasEredesLine: false,
+    hasProtectedOaks: true,
+    userNotes: 'Acesso por estradão florestal norte; muro de pedra junto ao marco BUPi n.º 4; 3 sobreiros adultos na faixa.',
+  });
+  assert.equal(created.district, 'Leiria');
+  assert.equal(created.municipality, 'Leiria');
+  assert.ok(created.userNotes?.includes('marco BUPi'));
+
+  const drawnPolygon = [
+    { lat: 39.744, lon: -8.808 },
+    { lat: 39.7452, lon: -8.808 },
+    { lat: 39.7452, lon: -8.8062 },
+    { lat: 39.744, lon: -8.8062 },
+  ];
+  const updated = applyParcelUpdate(created, {
+    vertices: drawnPolygon,
+    userNotes: 'Polígono redesenhado no mapa com 4 vértices; entrada de trator a este.',
+    recenterVerticesOnMunicipalityChange: false,
+  });
+  assert.equal(updated.vertices.length, 4);
+  assert.notEqual(updated.spatial.totalAreaM2, created.spatial.totalAreaM2);
+
+  const llmEnvelope = buildParcelLocalLlmNotePayload(updated);
+  assert.equal(llmEnvelope.schemaVersion, 'faixasegura.local-llm-notes.v1');
+  assert.equal(llmEnvelope.district, 'Leiria');
+  assert.equal(llmEnvelope.municipality, 'Leiria');
+  assert.equal(llmEnvelope.parish, 'Marrazes e Barosa');
+  assert.equal(llmEnvelope.bupiRggId, 'RGG-CUSTOM-2026-LEI');
+  assert.equal(llmEnvelope.readyForExtraction, true);
+  assert.ok(llmEnvelope.userNotes.includes('Polígono redesenhado'));
+
+  // 5. Automatic offline -> online synchronization in both Local and Cloud sessions
+  let online = false;
+  const backendSaved: string[] = [];
+  const cloudSaved: string[] = [];
+  const coordinator = new OfflineSyncCoordinator({
+    storage: createMemoryOfflineStorageAdapter(),
+    isOnline: () => online,
+    transport: {
+      saveParcel: async (_uid, p) => {
+        if (!online) throw new Error('Network offline');
+        cloudSaved.push(p.id);
+      },
+      deleteParcel: async () => {},
+      createHistory: async () => {},
+      archiveHistory: async () => {},
+      deleteHistory: async () => {},
+      syncParcelToBackend: async (p) => {
+        if (!online) throw new Error('Network offline');
+        backendSaved.push(p.id);
+      },
+    },
+  });
+
+  const offlineRes = await coordinator.recordParcel(updated, null);
+  assert.equal(offlineRes.syncResult.offlineSkipped, true);
+  let hydrated = await coordinator.hydrateState();
+  assert.equal(computeEffectivePendingSyncCount(hydrated.outbox, false), 1);
+  assert.equal(computeEffectivePendingSyncCount(hydrated.outbox, true), 1);
+
+  // Reconnect in Local session -> backend syncs automatically, local pending drops to 0 while Firestore op remains queued for future Cloud sign-in
+  online = true;
+  const localReconnectFlush = await coordinator.flushOutbox(null);
+  assert.equal(localReconnectFlush.backendSyncedCount, 1);
+  assert.ok(localReconnectFlush.lastSyncedAtIso);
+  assert.deepEqual(backendSaved, [updated.id]);
+  hydrated = await coordinator.hydrateState();
+  assert.equal(computeEffectivePendingSyncCount(hydrated.outbox, false), 0);
+  assert.equal(computeEffectivePendingSyncCount(hydrated.outbox, true), 1);
+
+  // Subsequent Cloud sign-in flushes remaining Firestore op automatically -> cloud pending drops to 0
+  const cloudFlush = await coordinator.flushOutbox('cloud-user-123');
+  assert.equal(cloudFlush.syncedCount, 1);
+  assert.deepEqual(cloudSaved, [updated.id]);
+  hydrated = await coordinator.hydrateState();
+  assert.equal(computeEffectivePendingSyncCount(hydrated.outbox, true), 0);
+});
+
+test('polygon vertex helpers support individual vertex deletion, clear all, coordinate normalization, selection transitions, and EPSG:3763 recalculation', async () => {
+  const {
+    appendPolygonVertex,
+    clearAllPolygonVertices,
+    removePolygonVertexAt,
+    resolveNextSelectedVertexIndexAfterRemoval,
+    updatePolygonVertexAt,
+  } = await import('./userWorkspaceStore.ts');
+  const { computePolygonMetrics3763 } = await import('./spatialEngine.ts');
+
+  let vertices = clearAllPolygonVertices();
+  assert.deepEqual(vertices, []);
+
+  vertices = appendPolygonVertex(vertices, { lat: 38.7984004, lon: -9.4621004 });
+  vertices = appendPolygonVertex(vertices, { lat: 38.7992, lon: -9.4621 });
+  vertices = appendPolygonVertex(vertices, { lat: 38.7996, lon: -9.4612 });
+  vertices = appendPolygonVertex(vertices, { lat: 38.7992, lon: -9.4603 });
+  vertices = appendPolygonVertex(vertices, { lat: 38.7984, lon: -9.4603 });
+  assert.equal(vertices.length, 5);
+  assert.deepEqual(vertices[0], { lat: 38.7984, lon: -9.4621 });
+
+  const fiveVertexArea = computePolygonMetrics3763(vertices).areaM2;
+  assert.ok(fiveVertexArea > 0);
+
+  // Update vertex V3 (index 2)
+  const movedVertices = updatePolygonVertexAt(vertices, 2, { lat: 38.7999, lon: -9.4612 });
+  assert.equal(movedVertices.length, 5);
+  assert.equal(movedVertices[2].lat, 38.7999);
+  assert.equal(vertices[2].lat, 38.7996); // Immutability preserved
+  assert.ok(computePolygonMetrics3763(movedVertices).areaM2 > fiveVertexArea);
+
+  // Out-of-bounds removal is a safe no-op copy
+  assert.equal(removePolygonVertexAt(movedVertices, -1).length, 5);
+  assert.equal(removePolygonVertexAt(movedVertices, 99).length, 5);
+
+  // Remove middle vertex V3 (index 2) individually -> remaining 4 vertices form exact rectangle
+  const afterRemoveMiddle = removePolygonVertexAt(movedVertices, 2);
+  assert.equal(afterRemoveMiddle.length, 4);
+  assert.deepEqual(afterRemoveMiddle[2], { lat: 38.7992, lon: -9.4603 });
+  assert.ok(computePolygonMetrics3763(afterRemoveMiddle).areaM2 < fiveVertexArea);
+
+  // Selection index transition rules after individual removal
+  assert.equal(resolveNextSelectedVertexIndexAfterRemoval(3, 1, 4), 2);
+  assert.equal(resolveNextSelectedVertexIndexAfterRemoval(1, 3, 4), 1);
+  assert.equal(resolveNextSelectedVertexIndexAfterRemoval(3, 3, 3), 2);
+  assert.equal(resolveNextSelectedVertexIndexAfterRemoval(0, 0, 0), null);
+  assert.equal(resolveNextSelectedVertexIndexAfterRemoval(null, 0, 3), null);
+
+  // Remove first vertex V1 (index 0) and last vertex individually
+  const afterRemoveFirst = removePolygonVertexAt(afterRemoveMiddle, 0);
+  assert.equal(afterRemoveFirst.length, 3);
+  assert.deepEqual(afterRemoveFirst[0], { lat: 38.7992, lon: -9.4621 });
+
+  // Clear all vertices at once
+  const cleared = clearAllPolygonVertices();
+  assert.equal(cleared.length, 0);
+  assert.equal(computePolygonMetrics3763(cleared).areaM2, 0);
+});
+
+test('evaluatePublicVerifyCodeInput provides live character length feedback, FS-YYYYMMDD-XXXX format preview, and prominent High Contrast badge styling', async () => {
+  const {
+    CANONICAL_SHA256_LENGTH,
+    CANONICAL_SHORT_CODE_LENGTH,
+    CANONICAL_SHORT_CODE_TEMPLATE,
+    evaluatePublicVerifyCodeInput,
+  } = await import('./qrVerification.ts');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  // 1. Empty / whitespace input -> IDLE with full template mask and 0/16 counter
+  const idle = evaluatePublicVerifyCodeInput('   ');
+  assert.equal(idle.status, 'IDLE');
+  assert.equal(idle.mode, 'SHORT_CODE');
+  assert.equal(idle.isValidToSubmit, false);
+  assert.equal(idle.currentLength, 0);
+  assert.equal(idle.targetLength, CANONICAL_SHORT_CODE_LENGTH);
+  assert.equal(idle.typedPreview, '');
+  assert.equal(idle.remainingMask, CANONICAL_SHORT_CODE_TEMPLATE);
+  assert.equal(idle.lengthBadgeText, '0/16 carateres');
+
+  // 2. Progressive valid typing -> INCOMPLETE with slot-aligned remaining mask
+  const partialPrefix = evaluatePublicVerifyCodeInput('fs');
+  assert.equal(partialPrefix.status, 'INCOMPLETE');
+  assert.equal(partialPrefix.typedPreview, 'FS');
+  assert.equal(partialPrefix.remainingMask, '-YYYYMMDD-XXXX');
+  assert.equal(partialPrefix.lengthBadgeText, '2/16 carateres');
+  assert.equal(partialPrefix.isValidToSubmit, false);
+
+  const partialDate = evaluatePublicVerifyCodeInput('fs-202605');
+  assert.equal(partialDate.status, 'INCOMPLETE');
+  assert.equal(partialDate.typedPreview, 'FS-202605');
+  assert.equal(partialDate.remainingMask, 'DD-XXXX');
+  assert.equal(partialDate.lengthBadgeText, '9/16 carateres');
+  assert.equal(partialDate.isValidToSubmit, false);
+
+  // 3. Structural format errors detected immediately as the user types
+  const badPrefix = evaluatePublicVerifyCodeInput('AB-20260524-7D9E');
+  assert.equal(badPrefix.status, 'INVALID');
+  assert.equal(badPrefix.isValidToSubmit, false);
+  assert.ok(badPrefix.helperMessagePt.includes('FS-'));
+
+  const missingFirstHyphen = evaluatePublicVerifyCodeInput('FS20260524');
+  assert.equal(missingFirstHyphen.status, 'INVALID');
+  assert.ok(missingFirstHyphen.helperMessagePt.includes('hífen'));
+
+  const nonDigitDate = evaluatePublicVerifyCodeInput('FS-2026AB');
+  assert.equal(nonDigitDate.status, 'INVALID');
+  assert.ok(nonDigitDate.helperMessagePt.includes('algarismos'));
+
+  const badMonth = evaluatePublicVerifyCodeInput('FS-20261324-7D9E');
+  assert.equal(badMonth.status, 'INVALID');
+  assert.ok(badMonth.helperMessagePt.includes('Mês inválido'));
+
+  const badDay = evaluatePublicVerifyCodeInput('FS-20260532-7D9E');
+  assert.equal(badDay.status, 'INVALID');
+  assert.ok(badDay.helperMessagePt.includes('Dia inválido'));
+
+  const missingSecondHyphen = evaluatePublicVerifyCodeInput('FS-202605247D9E');
+  assert.equal(missingSecondHyphen.status, 'INVALID');
+  assert.ok(missingSecondHyphen.helperMessagePt.includes('segundo hífen'));
+
+  const overlong = evaluatePublicVerifyCodeInput('FS-20260524-7D9E99');
+  assert.equal(overlong.status, 'INVALID');
+  assert.equal(overlong.lengthBadgeText, '18/16 carateres');
+  assert.equal(overlong.isValidToSubmit, false);
+
+  // 4. Complete valid canonical short code (case-insensitive + optional leading #)
+  const validShort = evaluatePublicVerifyCodeInput(' #fs-20260524-7d9e ');
+  assert.equal(validShort.status, 'VALID');
+  assert.equal(validShort.mode, 'SHORT_CODE');
+  assert.equal(validShort.isValidToSubmit, true);
+  assert.equal(validShort.normalizedCode, 'FS-20260524-7D9E');
+  assert.equal(validShort.typedPreview, 'FS-20260524-7D9E');
+  assert.equal(validShort.remainingMask, '');
+  assert.equal(validShort.lengthBadgeText, '16/16 carateres');
+  assert.equal(validShort.submitErrorPt, null);
+
+  // 5. SHA-256 hex digest (partial vs complete 64 hex chars) + URL payload
+  const partialSha = evaluatePublicVerifyCodeInput('9f86d081884c7d659a2feaa0');
+  assert.equal(partialSha.status, 'INCOMPLETE');
+  assert.equal(partialSha.mode, 'SHA256_HASH');
+  assert.equal(partialSha.targetLength, CANONICAL_SHA256_LENGTH);
+  assert.equal(partialSha.lengthBadgeText, '24/64 hex');
+  assert.equal(partialSha.isValidToSubmit, false);
+
+  const validSha = evaluatePublicVerifyCodeInput('a'.repeat(64));
+  assert.equal(validSha.status, 'VALID');
+  assert.equal(validSha.mode, 'SHA256_HASH');
+  assert.equal(validSha.lengthBadgeText, '64/64 hex');
+  assert.equal(validSha.isValidToSubmit, true);
+
+  const validUrl = evaluatePublicVerifyCodeInput(
+    'https://faixasegura.gov.pt/?verify=FS-20260524-7D9E'
+  );
+  assert.equal(validUrl.status, 'VALID');
+  assert.equal(validUrl.mode, 'URL_PAYLOAD');
+  assert.equal(validUrl.normalizedCode, 'FS-20260524-7D9E');
+  assert.equal(validUrl.isValidToSubmit, true);
+
+  // 6. Verify prominent High Contrast badge classes and live preview test IDs in PublicWebviewHomepage.tsx
+  const homepageSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../components/PublicWebviewHomepage.tsx'),
+    'utf8'
+  );
+  assert.ok(homepageSrc.includes('font-extrabold'));
+  assert.ok(homepageSrc.includes('motion-safe:animate-pulse'));
+  assert.ok(homepageSrc.includes('border-[3px]'));
+  assert.ok(homepageSrc.includes('Alto Contraste Ativo'));
+  assert.ok(homepageSrc.includes('data-testid="public-verify-format-preview"'));
+  assert.ok(homepageSrc.includes('data-testid="public-verify-length-counter"'));
+});
+

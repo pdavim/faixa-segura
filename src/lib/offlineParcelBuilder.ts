@@ -7,11 +7,16 @@ import type {
   QuoteLead,
 } from '../types/domain.ts';
 import { MUNICIPALITIES } from '../data/seedCatalog.ts';
+import {
+  findMunicipalityByDico,
+  resolveMergedMunicipalityCatalog,
+} from '../data/portugalAdminCatalog.ts';
 import { computeParcelFgc, wgs84ToPtTm06 } from './spatialEngine.ts';
 
 export function buildLocalParcelRecord(params: {
   label: string;
-  vertices: LatLon[];
+  vertices?: LatLon[];
+  district?: string;
   dico?: string;
   parish?: string;
   matrixArticle?: string;
@@ -20,31 +25,43 @@ export function buildLocalParcelRecord(params: {
   avgSlopePct?: number;
   hasEredesLine?: boolean;
   hasProtectedOaks?: boolean;
+  userNotes?: string;
   municipalities?: MunicipalityInfo[];
   nowMs?: number;
 }): ParcelRecord {
-  const catalog = params.municipalities?.length ? params.municipalities : MUNICIPALITIES;
-  const muni = catalog.find((m) => m.dico === params.dico) ?? catalog[0];
+  const catalog = resolveMergedMunicipalityCatalog(params.municipalities ?? MUNICIPALITIES);
+  const muni = params.dico ? findMunicipalityByDico(params.dico, catalog) : catalog[0];
   const landClass: LandClass = params.landClass ?? 'FOREST_SCRUB';
   const hasEredesLine = Boolean(params.hasEredesLine);
   const hasProtectedOaks = Boolean(params.hasProtectedOaks);
   const ts = params.nowMs ?? Date.now();
+  const c = muni.defaultCenter;
+  const resolvedVertices: LatLon[] =
+    params.vertices && params.vertices.length >= 3
+      ? params.vertices
+      : [
+          { lat: Number((c.lat - 0.00035).toFixed(6)), lon: Number((c.lon - 0.00045).toFixed(6)) },
+          { lat: Number((c.lat + 0.00035).toFixed(6)), lon: Number((c.lon - 0.00045).toFixed(6)) },
+          { lat: Number((c.lat + 0.00035).toFixed(6)), lon: Number((c.lon + 0.00045).toFixed(6)) },
+          { lat: Number((c.lat - 0.00035).toFixed(6)), lon: Number((c.lon + 0.00045).toFixed(6)) },
+        ];
 
   const spatial = computeParcelFgc({
-    vertices: params.vertices,
+    vertices: resolvedVertices,
     landClass,
     hasEredesLine,
     neighborDistanceOverrideM: 4.6,
   });
 
   const deterministicSuffix = String((ts % 899999) + 100000);
+  const cleanNotes = (params.userNotes ?? '').trim().slice(0, 2000);
 
   return {
     id: `parcel-${ts}`,
     label: params.label.trim(),
     parish: params.parish?.trim() || muni.name,
     municipality: muni.name,
-    district: muni.district,
+    district: params.district?.trim() || muni.district,
     dico: muni.dico,
     dicofre: muni.dicofreDefault,
     matrixArticle: params.matrixArticle?.trim() || 'Rústico — Art.º 204, Secção D',
@@ -59,7 +76,8 @@ export function buildLocalParcelRecord(params: {
     protectedOakNotes: hasProtectedOaks
       ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
       : 'Sem quercíneas protegidas assinaladas no polígono.',
-    vertices: params.vertices,
+    userNotes: cleanNotes,
+    vertices: resolvedVertices,
     buildingCenter: spatial.centroidWgs84,
     hasEredesLine,
     eredesType: hasEredesLine ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea',
@@ -84,6 +102,7 @@ export function extractCadernetaOffline(
   rawText: string,
   municipalities: MunicipalityInfo[] = MUNICIPALITIES
 ): {
+  district: string;
   municipality: string;
   dico: string;
   matrixArticle: string;
@@ -91,15 +110,17 @@ export function extractCadernetaOffline(
   hasProtectedOaks: boolean;
   vertices: LatLon[];
 } {
+  const catalog = resolveMergedMunicipalityCatalog(municipalities);
   const lower = rawText.toLowerCase();
   const matchedMuni =
-    municipalities.find((m) => lower.includes(m.name.toLowerCase())) ?? municipalities[0];
+    catalog.find((m) => lower.includes(m.name.toLowerCase())) ?? catalog[0];
 
   const artMatch = rawText.match(/artigo\s*(?:matricial)?\s*[:n.º]*\s*([0-9A-Za-z-]+)/i);
   const secMatch = rawText.match(/sec[çc][ãa]o\s*[:]*\s*([A-Z0-9]+)/i);
   const center = matchedMuni.defaultCenter;
 
   return {
+    district: matchedMuni.district,
     municipality: matchedMuni.name,
     dico: matchedMuni.dico,
     matrixArticle: `Rústico — Art.º ${artMatch?.[1] || '218'}, Secção ${secMatch?.[1] || 'F'}`,
