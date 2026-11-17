@@ -3113,6 +3113,137 @@ test('External Geo Connectors, .env.example catalog, and ServerInfra/Notificatio
   assert.equal(emailReceipt.delivered, true);
 });
 
+test('QR scanner hardware live connection status & #public-verify-code-input #15803D border-color transition animation', async () => {
+  const {
+    PUBLIC_VERIFY_SUCCESS_BORDER_HEX,
+    detectHidQrScannerBurst,
+    evaluatePublicVerifyCodeInput,
+    evaluateQrScannerHardwareStatus,
+  } = await import('./qrVerification.ts');
+  const fs = await import('node:fs');
+  const path = await import('node:path');
+
+  assert.equal(PUBLIC_VERIFY_SUCCESS_BORDER_HEX, '#15803D');
+
+  // 1. Progressive borderState transitions as the user types FS-YYYYMMDD-XXXX
+  const idle = evaluatePublicVerifyCodeInput('');
+  assert.equal(idle.borderState, 'DEFAULT');
+  assert.equal(idle.isShortCodeFormatSatisfied, false);
+
+  const early = evaluatePublicVerifyCodeInput('FS-20');
+  assert.equal(early.borderState, 'TYPING_EARLY');
+  assert.equal(early.isShortCodeFormatSatisfied, false);
+
+  const near = evaluatePublicVerifyCodeInput('FS-20260524-7');
+  assert.equal(near.borderState, 'TYPING_NEAR');
+  assert.equal(near.isShortCodeFormatSatisfied, false);
+
+  const satisfied = evaluatePublicVerifyCodeInput('FS-20260524-7D9E');
+  assert.equal(satisfied.borderState, 'VALID_GREEN');
+  assert.equal(satisfied.isShortCodeFormatSatisfied, true);
+
+  const invalidCode = evaluatePublicVerifyCodeInput('FS-20261324-7D9E');
+  assert.equal(invalidCode.borderState, 'INVALID_RED');
+  assert.equal(invalidCode.isShortCodeFormatSatisfied, false);
+
+  // SHA-256 hex valid input does NOT falsely claim FS-YYYYMMDD-XXXX short-code satisfaction
+  const validHex = evaluatePublicVerifyCodeInput('b'.repeat(64));
+  assert.equal(validHex.isShortCodeFormatSatisfied, false);
+  assert.equal(validHex.borderState, 'TYPING_NEAR');
+
+  // 2. Live QR scanner hardware connection evaluator across outdoor field states
+  const probing = evaluateQrScannerHardwareStatus({
+    isProbing: true,
+    hasMediaDevicesApi: true,
+    videoInputCount: 0,
+    cameraPermission: 'unknown',
+    hasNativeBarcodeDetector: true,
+    modalCameraPhase: 'CLOSED',
+    hidScannerDetected: false,
+    isOnline: true,
+  });
+  assert.equal(probing.state, 'PROBING');
+  assert.equal(probing.isReadyForFieldUse, false);
+
+  const cameraReady = evaluateQrScannerHardwareStatus({
+    isProbing: false,
+    hasMediaDevicesApi: true,
+    videoInputCount: 2,
+    cameraPermission: 'granted',
+    hasNativeBarcodeDetector: true,
+    modalCameraPhase: 'CLOSED',
+    hidScannerDetected: false,
+    isOnline: true,
+  });
+  assert.equal(cameraReady.state, 'CAMERA_READY');
+  assert.equal(cameraReady.isReadyForFieldUse, true);
+  assert.ok(cameraReady.statusTextPt.includes('2 câmaras detetadas'));
+  assert.ok(cameraReady.statusTextPt.includes('pronto para uso no terreno'));
+
+  const scanningLive = evaluateQrScannerHardwareStatus({
+    isProbing: false,
+    hasMediaDevicesApi: true,
+    videoInputCount: 1,
+    cameraPermission: 'granted',
+    hasNativeBarcodeDetector: false,
+    modalCameraPhase: 'SCANNING',
+    hidScannerDetected: false,
+    isOnline: true,
+  });
+  assert.equal(scanningLive.state, 'SCANNING_LIVE');
+  assert.equal(scanningLive.isReadyForFieldUse, true);
+  assert.ok(scanningLive.statusTextPt.includes('pronta para uso no terreno'));
+
+  const blocked = evaluateQrScannerHardwareStatus({
+    isProbing: false,
+    hasMediaDevicesApi: true,
+    videoInputCount: 1,
+    cameraPermission: 'denied',
+    hasNativeBarcodeDetector: true,
+    modalCameraPhase: 'CLOSED',
+    hidScannerDetected: false,
+    isOnline: true,
+  });
+  assert.equal(blocked.state, 'CAMERA_BLOCKED');
+  assert.equal(blocked.isReadyForFieldUse, false);
+
+  const hidActive = evaluateQrScannerHardwareStatus({
+    isProbing: false,
+    hasMediaDevicesApi: true,
+    videoInputCount: 0,
+    cameraPermission: 'unknown',
+    hasNativeBarcodeDetector: false,
+    modalCameraPhase: 'CLOSED',
+    hidScannerDetected: true,
+    isOnline: false,
+  });
+  assert.equal(hidActive.state, 'HID_SCANNER_READY');
+  assert.equal(hidActive.isReadyForFieldUse, true);
+  assert.ok(hidActive.statusTextPt.includes('HID'));
+
+  // 3. HID QR scanner burst detector distinguishes hardware scanner (<35ms/char) from human typing
+  assert.equal(detectHidQrScannerBurst([100, 112, 123, 135, 146, 158], 10), true);
+  assert.equal(detectHidQrScannerBurst([100, 240, 390, 510, 680, 830], 10), false);
+  assert.equal(detectHidQrScannerBurst([100, 110, 120], 3), false);
+
+  // 4. Verify DOM & CSS contract in PublicWebviewHomepage.tsx and src/index.css
+  const homepageSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../components/PublicWebviewHomepage.tsx'),
+    'utf8'
+  );
+  const indexCssSrc = fs.readFileSync(
+    path.resolve(import.meta.dirname, '../index.css'),
+    'utf8'
+  );
+  assert.ok(homepageSrc.includes('id="public-verify-qr-hardware-status"'));
+  assert.ok(homepageSrc.includes('data-testid="public-verify-qr-hardware-status"'));
+  assert.ok(homepageSrc.includes('data-border-state={effectiveBorderState}'));
+  assert.ok(homepageSrc.includes('verify-code-input'));
+  assert.ok(indexCssSrc.includes('.verify-code-input[data-border-state="VALID_GREEN"]'));
+  assert.ok(indexCssSrc.includes('border-color: #15803D;'));
+  assert.ok(indexCssSrc.includes('@keyframes verify-input-success-border'));
+});
+
 
 
 

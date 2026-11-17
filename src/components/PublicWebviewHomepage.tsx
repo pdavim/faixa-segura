@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertCircle,
   ArrowRight,
@@ -21,8 +21,12 @@ import type { ComplianceCertificate } from '../types/domain.ts';
 import { validateLocalSessionInput } from '../lib/appShellMode.ts';
 import {
   appendQrScanHistory,
+  detectHidQrScannerBurst,
   evaluatePublicVerifyCodeInput,
+  evaluateQrScannerHardwareStatus,
+  probeQrScannerHardwareBrowser,
   resolveCertificateFromPayload,
+  type QrScannerCameraModalPhase,
 } from '../lib/qrVerification.ts';
 import { QrCertificateScannerModal } from './QrCertificateScannerModal.tsx';
 
@@ -80,6 +84,81 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
   const [publicVerifyError, setPublicVerifyError] = useState<string | null>(null);
   const [isCheckingPublicCode, setIsCheckingPublicCode] = useState(false);
 
+  const [isProbingQrHardware, setIsProbingQrHardware] = useState(true);
+  const [qrBrowserProbe, setQrBrowserProbe] = useState<{
+    hasMediaDevicesApi: boolean;
+    videoInputCount: number;
+    cameraPermission: 'granted' | 'prompt' | 'denied' | 'unknown';
+    hasNativeBarcodeDetector: boolean;
+  }>(() => ({
+    hasMediaDevicesApi:
+      typeof navigator !== 'undefined' &&
+      Boolean(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function'),
+    videoInputCount: 0,
+    cameraPermission: 'unknown',
+    hasNativeBarcodeDetector:
+      typeof window !== 'undefined' &&
+      typeof (window as unknown as { BarcodeDetector?: unknown }).BarcodeDetector === 'function',
+  }));
+  const [modalCameraPhase, setModalCameraPhase] =
+    useState<QrScannerCameraModalPhase>('CLOSED');
+  const [hidScannerDetected, setHidScannerDetected] = useState(false);
+  const keystrokeTimesRef = useRef<number[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let permissionObj: PermissionStatus | null = null;
+
+    const refreshHardware = async () => {
+      const probed = await probeQrScannerHardwareBrowser();
+      if (!cancelled) {
+        setQrBrowserProbe(probed);
+        setIsProbingQrHardware(false);
+      }
+    };
+
+    void refreshHardware();
+
+    const onDeviceChange = () => {
+      void refreshHardware();
+    };
+
+    if (
+      typeof navigator !== 'undefined' &&
+      navigator.mediaDevices &&
+      typeof navigator.mediaDevices.addEventListener === 'function'
+    ) {
+      navigator.mediaDevices.addEventListener('devicechange', onDeviceChange);
+    }
+
+    if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
+      navigator.permissions
+        .query({ name: 'camera' as PermissionName })
+        .then((perm) => {
+          if (cancelled) return;
+          permissionObj = perm;
+          perm.addEventListener('change', onDeviceChange);
+        })
+        .catch(() => {
+          // Permissions API camera query is optional across browsers
+        });
+    }
+
+    return () => {
+      cancelled = true;
+      if (
+        typeof navigator !== 'undefined' &&
+        navigator.mediaDevices &&
+        typeof navigator.mediaDevices.removeEventListener === 'function'
+      ) {
+        navigator.mediaDevices.removeEventListener('devicechange', onDeviceChange);
+      }
+      if (permissionObj) {
+        permissionObj.removeEventListener('change', onDeviceChange);
+      }
+    };
+  }, []);
+
   const scrollToLogin = () => {
     const target = document.getElementById('acesso');
     if (target) {
@@ -88,6 +167,20 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
   };
 
   const verifyCodeFeedback = evaluatePublicVerifyCodeInput(publicVerifyCode);
+  const effectiveBorderState = publicVerifyError
+    ? 'INVALID_RED'
+    : verifyCodeFeedback.borderState;
+
+  const qrHardwareStatus = evaluateQrScannerHardwareStatus({
+    isProbing: isProbingQrHardware,
+    hasMediaDevicesApi: qrBrowserProbe.hasMediaDevicesApi,
+    videoInputCount: qrBrowserProbe.videoInputCount,
+    cameraPermission: qrBrowserProbe.cameraPermission,
+    hasNativeBarcodeDetector: qrBrowserProbe.hasNativeBarcodeDetector,
+    modalCameraPhase,
+    hidScannerDetected,
+    isOnline,
+  });
 
   const handlePublicVerifySubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -554,6 +647,7 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
                       value={publicVerifyCode}
                       autoComplete="off"
                       spellCheck={false}
+                      data-border-state={effectiveBorderState}
                       aria-invalid={
                         verifyCodeFeedback.status === 'INVALID' || Boolean(publicVerifyError)
                       }
@@ -562,18 +656,33 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
                           ? 'public-verify-hc-indicator public-verify-code-feedback'
                           : 'public-verify-code-feedback'
                       }
+                      onKeyDown={(e) => {
+                        if (e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                          const now = performance.now();
+                          keystrokeTimesRef.current = [
+                            ...keystrokeTimesRef.current.slice(-15),
+                            now,
+                          ];
+                        }
+                      }}
                       onChange={(e) => {
-                        setPublicVerifyCode(e.target.value);
+                        const nextVal = e.target.value;
+                        setPublicVerifyCode(nextVal);
+                        if (
+                          detectHidQrScannerBurst(
+                            keystrokeTimesRef.current,
+                            nextVal.trim().length
+                          )
+                        ) {
+                          setHidScannerDetected(true);
+                        }
+                        if (!nextVal) {
+                          keystrokeTimesRef.current = [];
+                        }
                         if (publicVerifyError) setPublicVerifyError(null);
                       }}
                       placeholder="FS-YYYYMMDD-XXXX (ex.: FS-20260524-7D9E)"
-                      className={`flex-1 min-w-0 min-h-[44px] px-3.5 py-2 rounded-xl bg-[#F8FAFC] dark:bg-[#0B0F17] hc:bg-white hc:dark:bg-black hc:border-2 text-xs font-mono tabular-nums text-slate-900 dark:text-white hc:text-black hc:dark:text-white hc:font-bold hc:placeholder:text-slate-700 hc:dark:placeholder:text-slate-300 ${
-                        verifyCodeFeedback.status === 'INVALID' || Boolean(publicVerifyError)
-                          ? 'border-2 border-[#DC2626] dark:border-red-400 hc:border-[#B91C1C] hc:dark:border-red-400'
-                          : verifyCodeFeedback.status === 'VALID'
-                          ? 'border-2 border-[#15803D] dark:border-[#22C55E] hc:border-black hc:dark:border-[#4ADE80]'
-                          : 'border border-slate-300 dark:border-[#263248] hc:border-black hc:dark:border-[#FACC15]'
-                      }`}
+                      className="verify-code-input flex-1 min-w-0 min-h-[44px] px-3.5 py-2 rounded-xl border-2 bg-[#F8FAFC] dark:bg-[#0B0F17] hc:bg-white hc:dark:bg-black text-xs font-mono tabular-nums text-slate-900 dark:text-white hc:text-black hc:dark:text-white hc:font-bold hc:placeholder:text-slate-700 hc:dark:placeholder:text-slate-300 focus:outline-none"
                     />
                     {highContrastMode && (
                       <span
@@ -602,8 +711,31 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
                   id="public-verify-code-feedback"
                   data-testid="public-verify-code-feedback"
                   aria-live="polite"
-                  className="pt-0.5 space-y-1 text-xs"
+                  className="pt-0.5 space-y-1.5 text-xs"
                 >
+                  <p
+                    id="public-verify-qr-hardware-status"
+                    data-testid="public-verify-qr-hardware-status"
+                    data-hardware-state={qrHardwareStatus.state}
+                    data-field-ready={qrHardwareStatus.isReadyForFieldUse ? 'true' : 'false'}
+                    className={`flex items-start gap-1.5 leading-snug ${
+                      qrHardwareStatus.state === 'CAMERA_BLOCKED'
+                        ? 'font-semibold hc:font-bold text-[#B45309] dark:text-[#FBBF24] hc:text-[#92400E] hc:dark:text-[#FACC15]'
+                        : qrHardwareStatus.isReadyForFieldUse
+                        ? 'font-semibold hc:font-bold text-[#15803D] dark:text-[#4ADE80] hc:text-[#0A3619] hc:dark:text-[#4ADE80]'
+                        : 'font-medium hc:font-bold text-slate-600 dark:text-slate-300 hc:text-black hc:dark:text-white'
+                    }`}
+                  >
+                    {qrHardwareStatus.state === 'CAMERA_BLOCKED' ? (
+                      <AlertCircle className="w-3.5 h-3.5 mt-[2px] shrink-0" aria-hidden="true" />
+                    ) : qrHardwareStatus.isReadyForFieldUse ? (
+                      <CheckCircle2 className="w-3.5 h-3.5 mt-[2px] shrink-0" aria-hidden="true" />
+                    ) : (
+                      <Camera className="w-3.5 h-3.5 mt-[2px] shrink-0" aria-hidden="true" />
+                    )}
+                    <span>{qrHardwareStatus.statusTextPt}</span>
+                  </p>
+
                   <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 text-slate-600 dark:text-slate-400 hc:text-black hc:dark:text-white">
                     <div className="inline-flex items-center gap-1.5 min-w-0">
                       <span className="font-medium hc:font-bold">Máscara:</span>
@@ -969,6 +1101,7 @@ export const PublicWebviewHomepage: React.FC<PublicWebviewHomepageProps> = ({
         certificates={certificates}
         onClose={() => setIsQrScannerOpen(false)}
         onCertificateVerified={onVerifyCertificate}
+        onCameraPhaseChange={setModalCameraPhase}
       />
     </div>
   );

@@ -24,6 +24,7 @@ import {
   resolveCertificateFromPayload,
   type QrScanSource,
   type QrScannedCertificateEntry,
+  type QrScannerCameraModalPhase,
 } from '../lib/qrVerification.ts';
 
 interface NativeBarcodeResult {
@@ -39,6 +40,7 @@ interface QrCertificateScannerModalProps {
   certificates: ComplianceCertificate[];
   onClose: () => void;
   onCertificateVerified: (certificate: ComplianceCertificate) => void;
+  onCameraPhaseChange?: (phase: QrScannerCameraModalPhase) => void;
 }
 
 type CameraPhase = 'STARTING' | 'SCANNING' | 'UNAVAILABLE' | 'PAUSED_AFTER_MISMATCH';
@@ -66,6 +68,7 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
   certificates,
   onClose,
   onCertificateVerified,
+  onCameraPhaseChange,
 }) => {
   const [activeTab, setActiveTab] = useState<ScannerModalTab>('scanner');
   const [scanHistory, setScanHistory] = useState<QrScannedCertificateEntry[]>(() =>
@@ -91,6 +94,15 @@ export const QrCertificateScannerModal: React.FC<QrCertificateScannerModalProps>
   useEffect(() => {
     certificatesRef.current = certificates;
   }, [certificates]);
+
+  useEffect(() => {
+    if (!onCameraPhaseChange) return;
+    if (!isOpen || activeTab !== 'scanner') {
+      onCameraPhaseChange('CLOSED');
+      return;
+    }
+    onCameraPhaseChange(cameraPhase);
+  }, [isOpen, activeTab, cameraPhase, onCameraPhaseChange]);
 
   const stopCameraResources = useCallback(() => {
     if (rafIdRef.current !== null) {

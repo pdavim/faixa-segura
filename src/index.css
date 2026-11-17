@@ -125,6 +125,116 @@
   border-color: #FACC15;
 }
 
+/* Subtle border-color transition animation for #public-verify-code-input as the user types,
+   turning the border from the default state to clear success green (#15803D) once
+   FS-YYYYMMDD-XXXX is satisfied. */
+@keyframes verify-input-success-border {
+  0% {
+    border-color: #4D7C5F;
+    box-shadow: 0 0 0 0 rgba(21, 128, 61, 0);
+  }
+  55% {
+    border-color: #15803D;
+    box-shadow: 0 0 0 4px rgba(21, 128, 61, 0.22);
+  }
+  100% {
+    border-color: #15803D;
+    box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.15);
+  }
+}
+
+.verify-code-input {
+  transition:
+    border-color 180ms cubic-bezier(0.16, 1, 0.3, 1),
+    box-shadow 180ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.verify-code-input[data-border-state="DEFAULT"] {
+  border-color: #CBD5E1;
+}
+
+.dark .verify-code-input[data-border-state="DEFAULT"] {
+  border-color: #263248;
+}
+
+.high-contrast .verify-code-input[data-border-state="DEFAULT"] {
+  border-color: #000000;
+}
+
+.dark.high-contrast .verify-code-input[data-border-state="DEFAULT"] {
+  border-color: #FACC15;
+}
+
+.verify-code-input[data-border-state="TYPING_EARLY"] {
+  border-color: #64748B;
+}
+
+.dark .verify-code-input[data-border-state="TYPING_EARLY"] {
+  border-color: #475569;
+}
+
+.high-contrast .verify-code-input[data-border-state="TYPING_EARLY"] {
+  border-color: #0F172A;
+}
+
+.dark.high-contrast .verify-code-input[data-border-state="TYPING_EARLY"] {
+  border-color: #FDE047;
+}
+
+.verify-code-input[data-border-state="TYPING_NEAR"] {
+  border-color: #4D7C5F;
+}
+
+.dark .verify-code-input[data-border-state="TYPING_NEAR"] {
+  border-color: #2E6F47;
+}
+
+.high-contrast .verify-code-input[data-border-state="TYPING_NEAR"] {
+  border-color: #14532D;
+}
+
+.dark.high-contrast .verify-code-input[data-border-state="TYPING_NEAR"] {
+  border-color: #86EFAC;
+}
+
+.verify-code-input[data-border-state="VALID_GREEN"] {
+  border-color: #15803D;
+  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.15);
+  animation: verify-input-success-border 200ms cubic-bezier(0.16, 1, 0.3, 1) 1;
+}
+
+.dark .verify-code-input[data-border-state="VALID_GREEN"] {
+  border-color: #15803D;
+  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.3);
+}
+
+.high-contrast .verify-code-input[data-border-state="VALID_GREEN"] {
+  border-color: #15803D;
+  box-shadow: 0 0 0 3px rgba(21, 128, 61, 0.28);
+}
+
+.dark.high-contrast .verify-code-input[data-border-state="VALID_GREEN"] {
+  border-color: #15803D;
+  box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.45);
+}
+
+.verify-code-input[data-border-state="INVALID_RED"] {
+  border-color: #DC2626;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.14);
+}
+
+.dark .verify-code-input[data-border-state="INVALID_RED"] {
+  border-color: #F87171;
+}
+
+.high-contrast .verify-code-input[data-border-state="INVALID_RED"] {
+  border-color: #B91C1C;
+}
+
+.dark.high-contrast .verify-code-input[data-border-state="INVALID_RED"] {
+  border-color: #F87171;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .hc-badge-subtle-pulse,
   .hc-badge-subtle-pulse::after {
@@ -135,6 +245,11 @@
 
   .hc-badge-subtle-pulse::after {
     display: none;
+  }
+
+  .verify-code-input {
+    transition: none !important;
+    animation: none !important;
   }
 }
 

@@ -479,13 +479,22 @@ export function clearQrScanHistory(storage?: QrHistoryStorageLike): void {
 export const CANONICAL_SHORT_CODE_TEMPLATE = 'FS-YYYYMMDD-XXXX';
 export const CANONICAL_SHORT_CODE_LENGTH = 16;
 export const CANONICAL_SHA256_LENGTH = 64;
+export const PUBLIC_VERIFY_SUCCESS_BORDER_HEX = '#15803D';
 
 export type PublicVerifyCodeStatus = 'IDLE' | 'INCOMPLETE' | 'VALID' | 'INVALID';
 export type PublicVerifyCodeInputMode = 'SHORT_CODE' | 'SHA256_HASH' | 'URL_PAYLOAD';
+export type PublicVerifyInputBorderState =
+  | 'DEFAULT'
+  | 'TYPING_EARLY'
+  | 'TYPING_NEAR'
+  | 'VALID_GREEN'
+  | 'INVALID_RED';
 
 export interface PublicVerifyCodeLiveFeedback {
   status: PublicVerifyCodeStatus;
   mode: PublicVerifyCodeInputMode;
+  borderState: PublicVerifyInputBorderState;
+  isShortCodeFormatSatisfied: boolean;
   isValidToSubmit: boolean;
   normalizedCode: string;
   currentLength: number;
@@ -503,7 +512,8 @@ const STRICT_SHORT_CODE_FULL_REGEX =
 /**
  * Evaluates manual input in `#public-verify-code-input` on every keystroke, providing
  * immediate character length feedback (`N/16 carateres` or `N/64 hex`), a live slot-aligned
- * format preview (`FS-YYYYMMDD-XXXX`), and early structural error detection for field workers.
+ * format preview (`FS-YYYYMMDD-XXXX`), progressive border-color transition states culminating
+ * in success green (`#15803D`) once `FS-YYYYMMDD-XXXX` is satisfied, and early error detection.
  */
 export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCodeLiveFeedback {
   const trimmed = rawInput.trim();
@@ -512,6 +522,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'IDLE',
       mode: 'SHORT_CODE',
+      borderState: 'DEFAULT',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: '',
       currentLength: 0,
@@ -531,9 +543,12 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
   if (urlExtracted) {
     if (urlExtracted.candidateCode) {
       const codeUpper = urlExtracted.candidateCode.toUpperCase();
+      const satisfiesCanonicalShort = STRICT_SHORT_CODE_FULL_REGEX.test(codeUpper);
       return {
         status: 'VALID',
         mode: 'URL_PAYLOAD',
+        borderState: satisfiesCanonicalShort ? 'VALID_GREEN' : 'TYPING_NEAR',
+        isShortCodeFormatSatisfied: satisfiesCanonicalShort,
         isValidToSubmit: true,
         normalizedCode: codeUpper,
         currentLength: codeUpper.length,
@@ -549,6 +564,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'INVALID',
       mode: 'URL_PAYLOAD',
+      borderState: 'INVALID_RED',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: trimmed,
       currentLength: trimmed.length,
@@ -573,6 +590,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
       return {
         status: 'VALID',
         mode: 'SHA256_HASH',
+        borderState: 'TYPING_NEAR',
+        isShortCodeFormatSatisfied: false,
         isValidToSubmit: true,
         normalizedCode: upper.toLowerCase(),
         currentLength: upper.length,
@@ -589,6 +608,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'INCOMPLETE',
       mode: 'SHA256_HASH',
+      borderState: upper.length >= 32 ? 'TYPING_NEAR' : 'TYPING_EARLY',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: upper.toLowerCase(),
       currentLength: upper.length,
@@ -612,6 +633,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'INVALID',
       mode: 'SHORT_CODE',
+      borderState: 'INVALID_RED',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: upper,
       currentLength: len,
@@ -637,6 +660,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'INVALID',
       mode: 'SHORT_CODE',
+      borderState: 'INVALID_RED',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: upper,
       currentLength: len,
@@ -658,6 +683,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
       return {
         status: 'INVALID',
         mode: 'SHORT_CODE',
+        borderState: 'INVALID_RED',
+        isShortCodeFormatSatisfied: false,
         isValidToSubmit: false,
         normalizedCode: upper,
         currentLength: len,
@@ -677,6 +704,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
         return {
           status: 'INVALID',
           mode: 'SHORT_CODE',
+          borderState: 'INVALID_RED',
+          isShortCodeFormatSatisfied: false,
           isValidToSubmit: false,
           normalizedCode: upper,
           currentLength: len,
@@ -697,6 +726,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
         return {
           status: 'INVALID',
           mode: 'SHORT_CODE',
+          borderState: 'INVALID_RED',
+          isShortCodeFormatSatisfied: false,
           isValidToSubmit: false,
           normalizedCode: upper,
           currentLength: len,
@@ -718,6 +749,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'INVALID',
       mode: 'SHORT_CODE',
+      borderState: 'INVALID_RED',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: upper,
       currentLength: len,
@@ -739,6 +772,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     return {
       status: 'INVALID',
       mode: 'SHORT_CODE',
+      borderState: 'INVALID_RED',
+      isShortCodeFormatSatisfied: false,
       isValidToSubmit: false,
       normalizedCode: upper,
       currentLength: len,
@@ -760,6 +795,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
       return {
         status: 'INVALID',
         mode: 'SHORT_CODE',
+        borderState: 'INVALID_RED',
+        isShortCodeFormatSatisfied: false,
         isValidToSubmit: false,
         normalizedCode: upper,
         currentLength: len,
@@ -773,11 +810,13 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     }
   }
 
-  // Exact 16-char canonical match!
+  // Exact 16-char canonical match -> border transitions to clear success green (#15803D)!
   if (len === CANONICAL_SHORT_CODE_LENGTH && STRICT_SHORT_CODE_FULL_REGEX.test(upper)) {
     return {
       status: 'VALID',
       mode: 'SHORT_CODE',
+      borderState: 'VALID_GREEN',
+      isShortCodeFormatSatisfied: true,
       isValidToSubmit: true,
       normalizedCode: upper,
       currentLength: len,
@@ -806,6 +845,8 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
   return {
     status: 'INCOMPLETE',
     mode: 'SHORT_CODE',
+    borderState: len >= 8 ? 'TYPING_NEAR' : 'TYPING_EARLY',
+    isShortCodeFormatSatisfied: false,
     isValidToSubmit: false,
     normalizedCode: upper,
     currentLength: len,
@@ -817,5 +858,200 @@ export function evaluatePublicVerifyCodeInput(rawInput: string): PublicVerifyCod
     submitErrorPt: `Código incompleto (${len}/${CANONICAL_SHORT_CODE_LENGTH} carateres). Complete o formato FS-YYYYMMDD-XXXX antes de verificar.`,
   };
 }
+
+export type QrScannerCameraModalPhase =
+  | 'CLOSED'
+  | 'STARTING'
+  | 'SCANNING'
+  | 'UNAVAILABLE'
+  | 'PAUSED_AFTER_MISMATCH';
+
+export type QrScannerHardwareState =
+  | 'PROBING'
+  | 'SCANNING_LIVE'
+  | 'HID_SCANNER_READY'
+  | 'CAMERA_READY'
+  | 'OPTICAL_FALLBACK_READY'
+  | 'CAMERA_BLOCKED';
+
+export interface QrScannerHardwareSnapshot {
+  isProbing: boolean;
+  hasMediaDevicesApi: boolean;
+  videoInputCount: number;
+  cameraPermission: 'granted' | 'prompt' | 'denied' | 'unknown';
+  hasNativeBarcodeDetector: boolean;
+  modalCameraPhase: QrScannerCameraModalPhase;
+  hidScannerDetected: boolean;
+  isOnline: boolean;
+}
+
+export interface QrScannerHardwareLiveStatus {
+  state: QrScannerHardwareState;
+  isReadyForFieldUse: boolean;
+  statusTextPt: string;
+}
+
+/**
+ * Detects whether a rapid burst of keystrokes into `#public-verify-code-input` originated
+ * from a physical USB/Bluetooth HID 2D QR scanner (typically <= 35 ms per character).
+ */
+export function detectHidQrScannerBurst(
+  keystrokeTimestampsMs: number[],
+  currentValueLength: number
+): boolean {
+  if (currentValueLength < 6 || keystrokeTimestampsMs.length < 6) {
+    return false;
+  }
+  const recent = keystrokeTimestampsMs.slice(-6);
+  let totalDeltaMs = 0;
+  for (let i = 1; i < recent.length; i += 1) {
+    const delta = recent[i] - recent[i - 1];
+    if (delta < 0 || delta > 65) {
+      return false;
+    }
+    totalDeltaMs += delta;
+  }
+  const avgDeltaMs = totalDeltaMs / (recent.length - 1);
+  return avgDeltaMs <= 35;
+}
+
+/**
+ * Pure evaluator producing a live QR scanner hardware readiness status line for outdoor field use.
+ */
+export function evaluateQrScannerHardwareStatus(
+  snapshot: QrScannerHardwareSnapshot
+): QrScannerHardwareLiveStatus {
+  if (snapshot.modalCameraPhase === 'SCANNING') {
+    return {
+      state: 'SCANNING_LIVE',
+      isReadyForFieldUse: true,
+      statusTextPt:
+        'Hardware QR ligado em direto — câmara ativa e pronta para uso no terreno sob luz solar.',
+    };
+  }
+
+  if (snapshot.modalCameraPhase === 'STARTING') {
+    return {
+      state: 'PROBING',
+      isReadyForFieldUse: false,
+      statusTextPt:
+        'A estabelecer ligação com o hardware ótico QR para leitura no terreno…',
+    };
+  }
+
+  if (snapshot.hidScannerDetected) {
+    return {
+      state: 'HID_SCANNER_READY',
+      isReadyForFieldUse: true,
+      statusTextPt:
+        'Leitor físico QR (USB/Bluetooth HID) ligado — pronto para uso imediato no terreno sob luz solar.',
+    };
+  }
+
+  if (snapshot.isProbing) {
+    return {
+      state: 'PROBING',
+      isReadyForFieldUse: false,
+      statusTextPt: 'A verificar ligação do hardware de leitura QR para uso no terreno…',
+    };
+  }
+
+  if (
+    snapshot.cameraPermission === 'denied' ||
+    (snapshot.modalCameraPhase === 'UNAVAILABLE' &&
+      snapshot.hasMediaDevicesApi &&
+      snapshot.videoInputCount > 0)
+  ) {
+    return {
+      state: 'CAMERA_BLOCKED',
+      isReadyForFieldUse: false,
+      statusTextPt:
+        'Câmara ótica bloqueada nas permissões — autorize a câmara ou use leitor externo / código manual no terreno.',
+    };
+  }
+
+  const offlineSuffix = snapshot.isOnline ? '' : ' · Validação local offline ativa.';
+
+  if (snapshot.hasMediaDevicesApi && snapshot.videoInputCount > 0) {
+    const camLabel =
+      snapshot.videoInputCount > 1
+        ? `${snapshot.videoInputCount} câmaras detetadas`
+        : 'câmara ótica detetada';
+    const engineLabel = snapshot.hasNativeBarcodeDetector ? ' · motor QR nativo' : '';
+    return {
+      state: 'CAMERA_READY',
+      isReadyForFieldUse: true,
+      statusTextPt: `Hardware QR ligado (${camLabel}${engineLabel}) — pronto para uso no terreno sob luz solar.${offlineSuffix}`,
+    };
+  }
+
+  if (snapshot.hasMediaDevicesApi) {
+    return {
+      state: 'OPTICAL_FALLBACK_READY',
+      isReadyForFieldUse: true,
+      statusTextPt: `Hardware QR pronto para uso no terreno — entrada para leitor externo HID e imagem QR ativa.${offlineSuffix}`,
+    };
+  }
+
+  return {
+    state: 'OPTICAL_FALLBACK_READY',
+    isReadyForFieldUse: true,
+    statusTextPt: `Leitor QR em modo externo HID / código manual pronto para uso no terreno.${offlineSuffix}`,
+  };
+}
+
+/**
+ * Probes browser MediaDevices, videoinput hardware enumeration, camera Permissions API,
+ * and native BarcodeDetector support without opening the camera shutter prematurely.
+ */
+export async function probeQrScannerHardwareBrowser(): Promise<
+  Pick<
+    QrScannerHardwareSnapshot,
+    'hasMediaDevicesApi' | 'videoInputCount' | 'cameraPermission' | 'hasNativeBarcodeDetector'
+  >
+> {
+  const hasMediaDevicesApi =
+    typeof navigator !== 'undefined' &&
+    Boolean(navigator.mediaDevices && typeof navigator.mediaDevices.getUserMedia === 'function');
+
+  const hasNativeBarcodeDetector =
+    typeof window !== 'undefined' &&
+    typeof (window as unknown as { BarcodeDetector?: unknown }).BarcodeDetector === 'function';
+
+  let videoInputCount = 0;
+  if (
+    hasMediaDevicesApi &&
+    typeof navigator.mediaDevices.enumerateDevices === 'function'
+  ) {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      videoInputCount = devices.filter((d) => d.kind === 'videoinput').length;
+    } catch {
+      videoInputCount = 0;
+    }
+  }
+
+  let cameraPermission: QrScannerHardwareSnapshot['cameraPermission'] = 'unknown';
+  if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
+    try {
+      const perm = await navigator.permissions.query({
+        name: 'camera' as PermissionName,
+      });
+      if (perm.state === 'granted' || perm.state === 'prompt' || perm.state === 'denied') {
+        cameraPermission = perm.state;
+      }
+    } catch {
+      cameraPermission = 'unknown';
+    }
+  }
+
+  return {
+    hasMediaDevicesApi,
+    videoInputCount,
+    cameraPermission,
+    hasNativeBarcodeDetector,
+  };
+}
+
 
 
