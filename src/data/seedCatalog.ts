@@ -8,6 +8,7 @@ import type {
   StormAlertIncident,
 } from '../types/domain.ts';
 import { computeParcelFgc } from '../lib/spatialEngine.ts';
+import { synthesizeDeterministicCadastreContext } from '../lib/vectorContextIngestor.ts';
 
 import { FULL_PORTUGAL_MUNICIPALITIES } from './portugalAdminCatalog.ts';
 
@@ -33,6 +34,33 @@ const valongoVertices = [
   { lat: 41.18651, lon: -8.49952 },
   { lat: 41.18583, lon: -8.49958 },
 ];
+
+const sintraVectorContext = synthesizeDeterministicCadastreContext({
+  parcelVertices: sintraVertices,
+  buildingCenter: { lat: 38.79836, lon: -9.46224 },
+  hasEredesLine: true,
+  eredesType: 'MT 15kV (Faixa 7m)',
+  hasProtectedOaks: true,
+  detectedAtIso: '2026-05-20T09:00:00Z',
+});
+
+const leiriaVectorContext = synthesizeDeterministicCadastreContext({
+  parcelVertices: leiriaVertices,
+  buildingCenter: { lat: 39.74376, lon: -8.80724 },
+  hasEredesLine: true,
+  eredesType: 'AT 60kV (Faixa 10m)',
+  hasProtectedOaks: false,
+  detectedAtIso: '2026-05-20T09:00:00Z',
+});
+
+const valongoVectorContext = synthesizeDeterministicCadastreContext({
+  parcelVertices: valongoVertices,
+  buildingCenter: { lat: 41.18612, lon: -8.50008 },
+  hasEredesLine: false,
+  eredesType: 'Sem linha aérea',
+  hasProtectedOaks: true,
+  detectedAtIso: '2026-05-20T09:00:00Z',
+});
 
 export const INITIAL_PARCELS: ParcelRecord[] = [
   {
@@ -70,12 +98,14 @@ export const INITIAL_PARCELS: ParcelRecord[] = [
       dominantSpecies: 'Eucalipto (Eucalyptus globulus), Acácia e Silvado denso',
       ndvi: 0.74,
     },
+    vectorContext: sintraVectorContext,
     spatial: computeParcelFgc({
       vertices: sintraVertices,
       buildingCenter: { lat: 38.79836, lon: -9.46224 },
       landClass: 'FOREST_SCRUB',
       hasEredesLine: true,
-      neighborDistanceOverrideM: 4.2,
+      eredesType: 'MT 15kV (Faixa 7m)',
+      vectorContext: sintraVectorContext,
     }),
   },
   {
@@ -113,12 +143,14 @@ export const INITIAL_PARCELS: ParcelRecord[] = [
       dominantSpecies: 'Pinheiro-bravo (Pinus pinaster) e Mato de Carqueja',
       ndvi: 0.78,
     },
+    vectorContext: leiriaVectorContext,
     spatial: computeParcelFgc({
       vertices: leiriaVertices,
       buildingCenter: { lat: 39.74376, lon: -8.80724 },
       landClass: 'FOREST_SCRUB',
       hasEredesLine: true,
-      neighborDistanceOverrideM: 3.8,
+      eredesType: 'AT 60kV (Faixa 10m)',
+      vectorContext: leiriaVectorContext,
     }),
   },
   {
@@ -156,12 +188,14 @@ export const INITIAL_PARCELS: ParcelRecord[] = [
       dominantSpecies: 'Eucalipto e Tojo bravo',
       ndvi: 0.69,
     },
+    vectorContext: valongoVectorContext,
     spatial: computeParcelFgc({
       vertices: valongoVertices,
       buildingCenter: { lat: 41.18612, lon: -8.50008 },
       landClass: 'FOREST_SCRUB',
       hasEredesLine: false,
-      neighborDistanceOverrideM: 5.4,
+      eredesType: 'Sem linha aérea',
+      vectorContext: valongoVectorContext,
     }),
   },
 ];
@@ -213,7 +247,7 @@ export const INITIAL_CERTIFICATES: ComplianceCertificate[] = [
       },
     ],
     protectedSpeciesCheck: '2 exemplares de Sobreiro (Quercus suber) preservados sem mutilação (DL n.º 169/2001).',
-    sha256Hash: '1e446e6c251fb1ead92cd113d1df7235d428d600690d5d1b7429261c375b92bb',
+    sha256Hash: 'fdb1ac623bfb484a1f912ccca1910263705905efcc1dffdabaf69bcef46dfeeb',
     issuedAt: '2026-05-24T17:05:00Z',
     spatialSnapshot: INITIAL_PARCELS[0].spatial,
   },

@@ -12,6 +12,7 @@ import {
   resolveMergedMunicipalityCatalog,
 } from '../data/portugalAdminCatalog.ts';
 import { computeParcelFgc, wgs84ToPtTm06 } from './spatialEngine.ts';
+import { synthesizeDeterministicCadastreContext } from './vectorContextIngestor.ts';
 
 export function buildLocalParcelRecord(params: {
   label: string;
@@ -46,11 +47,24 @@ export function buildLocalParcelRecord(params: {
           { lat: Number((c.lat - 0.00035).toFixed(6)), lon: Number((c.lon + 0.00045).toFixed(6)) },
         ];
 
+  const eredesType: ParcelRecord['eredesType'] = hasEredesLine
+    ? 'MT 15kV (Faixa 7m)'
+    : 'Sem linha aérea';
+
+  const vectorContext = synthesizeDeterministicCadastreContext({
+    parcelVertices: resolvedVertices,
+    hasEredesLine,
+    eredesType,
+    hasProtectedOaks,
+    detectedAtIso: new Date(ts).toISOString(),
+  });
+
   const spatial = computeParcelFgc({
     vertices: resolvedVertices,
     landClass,
     hasEredesLine,
-    neighborDistanceOverrideM: 4.6,
+    eredesType,
+    vectorContext,
   });
 
   const deterministicSuffix = String((ts % 899999) + 100000);
@@ -80,7 +94,7 @@ export function buildLocalParcelRecord(params: {
     vertices: resolvedVertices,
     buildingCenter: spatial.centroidWgs84,
     hasEredesLine,
-    eredesType: hasEredesLine ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea',
+    eredesType,
     ndviHistory: [
       { date: '2026-03-15', ndvi: 0.43, ndmi: 0.28, cloudCoverPct: 7 },
       { date: '2026-04-02', ndvi: 0.51, ndmi: 0.23, cloudCoverPct: 10 },
@@ -94,6 +108,7 @@ export function buildLocalParcelRecord(params: {
       dominantSpecies: 'Pinheiro-bravo, Eucalipto e Silvado',
       ndvi: 0.71,
     },
+    vectorContext,
     spatial,
   };
 }

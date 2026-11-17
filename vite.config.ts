@@ -11,7 +11,14 @@ export default defineConfig(() => {
       tailwindcss(),
       VitePWA({
         registerType: 'autoUpdate',
-        includeAssets: ['icon.svg', 'apple-touch-icon.png', 'pwa-192x192.png', 'pwa-512x512.png', 'pwa-maskable-512x512.png'],
+        includeAssets: [
+          'icon.svg',
+          'apple-touch-icon.png',
+          'pwa-192x192.png',
+          'pwa-512x512.png',
+          'pwa-maskable-512x512.png',
+          'push-sw.js',
+        ],
         manifest: {
           id: '/',
           name: 'FaixaSegura — Gestão de Combustível & Prova Legal',
@@ -44,6 +51,7 @@ export default defineConfig(() => {
           ],
         },
         workbox: {
+          importScripts: ['/push-sw.js'],
           maximumFileSizeToCacheInBytes: 10 * 1024 * 1024,
           globPatterns: ['**/*.{js,css,html,ico,png,svg,jpg,woff2}'],
           runtimeCaching: [
@@ -66,10 +74,11 @@ export default defineConfig(() => {
               },
             },
             {
-              urlPattern: /^https:\/\/server\.arcgisonline\.com\/ArcGIS\/rest\/services\/World_Imagery\/MapServer\/tile\/.*/i,
+              urlPattern:
+                /^https:\/\/server\.arcgisonline\.com\/ArcGIS\/rest\/services\/(World_Imagery|World_Topo_Map)\/MapServer\/tile\/.*/i,
               handler: 'CacheFirst',
               options: {
-                cacheName: 'faixasegura-map-tiles-v1',
+                cacheName: 'faixasegura-map-tiles-v2',
                 expiration: { maxEntries: 600, maxAgeSeconds: 60 * 60 * 24 * 30 },
                 cacheableResponse: { statuses: [0, 200] },
               },
@@ -78,7 +87,7 @@ export default defineConfig(() => {
               urlPattern: /^https:\/\/[a-d]\.basemaps\.cartocdn\.com\/light_all\/.*/i,
               handler: 'CacheFirst',
               options: {
-                cacheName: 'faixasegura-map-tiles-v1',
+                cacheName: 'faixasegura-map-tiles-v2',
                 expiration: { maxEntries: 600, maxAgeSeconds: 60 * 60 * 24 * 30 },
                 cacheableResponse: { statuses: [0, 200] },
               },

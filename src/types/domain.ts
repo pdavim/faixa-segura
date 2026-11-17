@@ -27,6 +27,70 @@ export interface MunicipalityInfo {
   isPriorityParishDefault: boolean;
 }
 
+export type LatLonMultiPolygon = LatLon[][][];
+
+export interface DetectedVectorBuilding {
+  id: string;
+  role: 'OWN' | 'NEIGHBOR';
+  label: string;
+  source: 'OSM_OVERPASS' | 'CADASTRO_SEED' | 'USER_DEFINED' | 'CV_ORTHOPHOTO_25CM';
+  footprint: LatLon[];
+  areaM2: number;
+  distanceToParcelEdgeM: number;
+}
+
+export type EasementCategory =
+  | 'EREDES_MT_AT'
+  | 'REN_MAT'
+  | 'PUBLIC_ROAD'
+  | 'RAILWAY';
+
+export interface DetectedLinearEasement {
+  id: string;
+  category: EasementCategory;
+  label: string;
+  operatorLabel: string;
+  bufferHalfWidthM: number;
+  centerline: LatLon[];
+  source: 'OSM_OVERPASS' | 'EREDES_OPENDATA' | 'CADASTRO_SEED' | 'USER_DEFINED';
+}
+
+export type ExemptFeatureCategory =
+  | 'RIPARIAN_WATERWAY'
+  | 'IRRIGATED_AGRICULTURE'
+  | 'IMPERVIOUS_WATER';
+
+export interface DetectedExemptFeature {
+  id: string;
+  category: ExemptFeatureCategory;
+  label: string;
+  legalBasis: string;
+  bufferHalfWidthM?: number;
+  centerline?: LatLon[];
+  polygon?: LatLon[];
+  source: 'OSM_OVERPASS' | 'COS_DGT' | 'CADASTRO_SEED' | 'USER_DEFINED';
+}
+
+export interface ParcelVectorContext {
+  detectedAtIso: string;
+  sourceMode: 'LIVE_OVERPASS_WFS' | 'SYNTHESIZED_CADASTRE';
+  sourceSummaryPt: string;
+  searchRadiusM: number;
+  isSettlementInterface100m?: boolean;
+  settlementName?: string;
+  humanVerifiedCount?: number;
+  buildings: DetectedVectorBuilding[];
+  easements: DetectedLinearEasement[];
+  exemptFeatures: DetectedExemptFeature[];
+  neighborParcels?: Array<{
+    id: string;
+    label: string;
+    bupiRef: string;
+    polygon: LatLon[];
+    ndvi: number;
+  }>;
+}
+
 export interface SpatialZoneBreakdown {
   totalAreaM2: number;
   perimeterM: number;
@@ -49,6 +113,31 @@ export interface SpatialZoneBreakdown {
     exemptCore: LatLon[];
     neighborRiskParcel: LatLon[];
   };
+  multiPolygons?: {
+    ownBuildings: LatLonMultiPolygon;
+    neighborBuildings: LatLonMultiPolygon;
+    zone1Immediate: LatLonMultiPolygon;
+    zone2Near: LatLonMultiPolygon;
+    zone3Extended: LatLonMultiPolygon;
+    neighborInducedObligation: LatLonMultiPolygon;
+    thirdPartyCorridor: LatLonMultiPolygon;
+    riparianAndAgriExempt: LatLonMultiPolygon;
+    exemptCore: LatLonMultiPolygon;
+    neighborRiskOverflow: LatLonMultiPolygon;
+  };
+  decompositionMeta?: {
+    engineVersion: 'BOOLEAN_EPSG3763_V2';
+    outerBufferRadiusM: 10 | 50 | 100;
+    ownBuildingsCount: number;
+    ownBuildingsAreaM2: number;
+    neighborBuildingsWithin50mCount: number;
+    neighborInducedCleanAreaM2: number;
+    eredesEasementM2: number;
+    roadEasementM2: number;
+    riparianProtectedM2: number;
+    neighborOverflowRiskM2: number;
+    vectorSourceLabel: string;
+  };
   neighborMinDistanceM: number;
   neighborDirection: string;
 }
@@ -58,6 +147,78 @@ export interface SatelliteObservation {
   ndvi: number;
   ndmi: number;
   cloudCoverPct: number;
+}
+
+export type OrthophotoSemanticClass =
+  | 'MINERAL_INERT_BARE'
+  | 'PAVED_ROAD_IMPERVIOUS'
+  | 'BUILT_ROOF_STRUCTURE'
+  | 'LOW_HERBACEOUS_CLEARED'
+  | 'SHRUB_SCRUB_FUEL'
+  | 'TREE_CANOPY_CROWN'
+  | 'WATER_RIPARIAN';
+
+export interface DetectedTreeCrown {
+  id: string;
+  centerWgs84: LatLon;
+  centerPtTm06: PtTm06Coord;
+  areaM2: number;
+  diameterM: number;
+  polygonWgs84: LatLon[];
+  speciesGroup: 'RESINOUS_EUCALYPT' | 'BROADLEAF_QUERCUS';
+  distanceToBuildingWallM: number;
+  nearestCrownDistanceM: number;
+  zoneCode: 'ZONE_1' | 'ZONE_2' | 'ZONE_3' | 'EASEMENT' | 'EXEMPT' | 'OUTSIDE';
+  violationRulePt: string | null;
+  originalViolationRulePt?: string | null;
+  humanOverride?: 'PROTECTED_QUERCUS' | 'PRUNED_COMPLIANT';
+}
+
+export interface DetectedRoofStructure {
+  id: string;
+  label: string;
+  centerWgs84: LatLon;
+  areaM2: number;
+  footprintWgs84: LatLon[];
+  confidence: number;
+  isUnmappedInOsm: boolean;
+  role: 'OWN' | 'NEIGHBOR';
+  distanceToParcelEdgeM: number;
+  reviewStatus?: 'UNREVIEWED' | 'ACCEPTED' | 'DISMISSED';
+}
+
+export interface ZoneCvComplianceMetrics {
+  zone1BareMineralPct: number;
+  zone1Compliant: boolean;
+  zone2CanopyPct: number;
+  zone2ShrubPct: number;
+  zone2CrownsUnder5mCount: number;
+  zone3CanopyPct: number;
+  zone3ShrubPct: number;
+  zone3MeanCrownSpacingM: number;
+  crownSpacingViolationsCount: number;
+  easementCanopyIntrusionPct: number;
+  overallStatus: 'COMPLIANT' | 'ATTENTION' | 'NON_COMPLIANT';
+  auditSummaryPt: string;
+}
+
+export interface ParcelOrthophotoCvAnalysis {
+  analyzedAtIso: string;
+  engineMode: 'ONNX_MICROSERVICE' | 'REAL_ORTHOPHOTO_PIXEL_CV' | 'OFFLINE_SYNTHETIC_CV';
+  imagerySourceLabel: string;
+  modelProfile: string;
+  rasterWidthPx: number;
+  rasterHeightPx: number;
+  gsdMetersPerPx: number;
+  bboxWgs84: [number, number, number, number];
+  leafletBounds: [[number, number], [number, number]];
+  overlayDataUrl?: string;
+  classAreasM2: Record<OrthophotoSemanticClass, number>;
+  crowns: DetectedTreeCrown[];
+  detectedRoofs: DetectedRoofStructure[];
+  unmappedRoofsCount: number;
+  fusedIntoVectorContext?: boolean;
+  zoneCompliance: ZoneCvComplianceMetrics;
 }
 
 export interface ParcelRecord {
@@ -84,6 +245,15 @@ export interface ParcelRecord {
   hasEredesLine: boolean;
   eredesType: 'MT 15kV (Faixa 7m)' | 'AT 60kV (Faixa 10m)' | 'Sem linha aérea';
   ndviHistory: SatelliteObservation[];
+  satelliteSourceLabel?: string;
+  elevationMeta?: {
+    minElevationM: number;
+    maxElevationM: number;
+    reliefM: number;
+    aspectLabelPt: string;
+    sourceLabel: string;
+    sampledPointsCount?: number;
+  };
   neighborInfo: {
     bupiRef: string;
     vegetationDescription: string;
@@ -91,6 +261,8 @@ export interface ParcelRecord {
     dominantSpecies: string;
     ndvi: number;
   };
+  vectorContext?: ParcelVectorContext;
+  cvAnalysis?: ParcelOrthophotoCvAnalysis;
   spatial: SpatialZoneBreakdown;
 }
 
@@ -241,6 +413,7 @@ export interface QuoteLead {
   matchedProvidersCount: number;
   unlockedByProviderIds: string[];
   status: 'OPEN' | 'QUOTED' | 'COMPLETED';
+  dispatchReceiptPt?: string;
   createdAt: string;
 }
 

@@ -79,13 +79,16 @@ export interface OfflineTileStorageAdapter {
   clearSnapshots(): Promise<void>;
 }
 
-export const TILE_CACHE_DB_NAME = 'faixasegura_tile_cache_v1';
-export const TILE_CACHE_SW_NAME = 'faixasegura-map-tiles-v1';
+export const TILE_CACHE_DB_NAME = 'faixasegura_tile_cache_v2';
+export const TILE_CACHE_SW_NAME = 'faixasegura-map-tiles-v2';
+const LEGACY_V1_TILE_DB_NAME = 'faixasegura_tile_cache_v1';
+const LEGACY_V1_TILE_SW_NAME = 'faixasegura-map-tiles-v1';
 export const DEFAULT_SNAPSHOT_ZOOMS = [15, 16, 17, 18, 19] as const;
 export const DEFAULT_MAX_CACHED_TILES = 850;
 
 const MAX_MERCATOR_LAT = 85.05112878;
-const SNAPSHOTS_LS_FALLBACK_KEY = 'faixasegura_tile_snapshots_v1';
+const SNAPSHOTS_LS_FALLBACK_KEY = 'faixasegura_tile_snapshots_v2';
+let legacyV1PurgeScheduled = false;
 
 /**
  * Projects a WGS84 coordinate (lat, lon) to Slippy Map Web Mercator XYZ tile indices.
@@ -117,20 +120,68 @@ export function buildTileCacheKey(
   return `${style}:${z}:${x}:${y}`;
 }
 
+function readMapEnvVar(
+  name: string,
+  envOverride?: Record<string, string | undefined>
+): string {
+  if (envOverride && name in envOverride) {
+    return (envOverride[name] ?? '').trim();
+  }
+  const viteEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+  if (viteEnv && typeof viteEnv[name] === 'string') {
+    return viteEnv[name]!.trim();
+  }
+  if (typeof process !== 'undefined' && process.env && typeof process.env[name] === 'string') {
+    return process.env[name]!.trim();
+  }
+  return '';
+}
+
 /**
- * Builds deterministic CORS-enabled tile URLs for both Orthophoto (Esri z/y/x)
- * and Vector (CARTO z/x/y) basemaps.
+ * Resolves the Leaflet `{z}/{x}/{y}` (or `{z}/{y}/{x}`) tile template URL.
+ * - `ORTHOPHOTO`: defaults to Esri `World_Imagery` (or `VITE_MAP_ORTHO_TILE_URL`).
+ * - `VECTOR`: defaults to watermark-free Esri `World_Topo_Map` / OSM (no API key needed on cloud domains).
+ *   If `VITE_MAP_VECTOR_TILE_URL` is set, uses that template; if `VITE_CARTO_API_KEY` is set, uses CARTO Positron with `?key=...`.
+ */
+export function resolveTileTemplateUrl(
+  style: MapTileStyle,
+  envOverride?: Record<string, string | undefined>
+): string {
+  if (style === 'ORTHOPHOTO') {
+    const customOrtho = readMapEnvVar('VITE_MAP_ORTHO_TILE_URL', envOverride);
+    return (
+      customOrtho ||
+      'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
+    );
+  }
+
+  const customVector = readMapEnvVar('VITE_MAP_VECTOR_TILE_URL', envOverride);
+  if (customVector) {
+    return customVector;
+  }
+
+  const cartoKey = readMapEnvVar('VITE_CARTO_API_KEY', envOverride);
+  if (cartoKey) {
+    return `https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png?key=${encodeURIComponent(cartoKey)}`;
+  }
+
+  return 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}';
+}
+
+/**
+ * Builds deterministic CORS-enabled tile URLs for both Orthophoto and Topographic/Vector basemaps.
  */
 export function buildTileUrl(
   style: MapTileStyle,
   z: number,
   x: number,
-  y: number
+  y: number,
+  envOverride?: Record<string, string | undefined>
 ): string {
-  if (style === 'ORTHOPHOTO') {
-    return `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/${z}/${y}/${x}`;
-  }
-  return `https://a.basemaps.cartocdn.com/light_all/${z}/${x}/${y}.png`;
+  return resolveTileTemplateUrl(style, envOverride)
+    .replace('{z}', String(z))
+    .replace('{x}', String(x))
+    .replace('{y}', String(y));
 }
 
 export interface EnumerateSnapshotOptions {
@@ -284,7 +335,27 @@ export function createMemoryTileStorageAdapter(): OfflineTileStorageAdapter {
   };
 }
 
+function schedulePurgeLegacyV1WatermarkedCache(): void {
+  if (legacyV1PurgeScheduled) return;
+  legacyV1PurgeScheduled = true;
+  try {
+    if (typeof indexedDB !== 'undefined') {
+      indexedDB.deleteDatabase(LEGACY_V1_TILE_DB_NAME);
+    }
+  } catch {
+    // Ignore IndexedDB cleanup restrictions
+  }
+  try {
+    if (typeof caches !== 'undefined') {
+      void caches.delete(LEGACY_V1_TILE_SW_NAME).catch(() => {});
+    }
+  } catch {
+    // Ignore CacheStorage cleanup restrictions
+  }
+}
+
 function openTileIndexedDb(): Promise<IDBDatabase> {
+  schedulePurgeLegacyV1WatermarkedCache();
   return new Promise((resolve, reject) => {
     if (typeof indexedDB === 'undefined') {
       reject(new Error('IndexedDB unavailable'));
@@ -577,6 +648,7 @@ export class OfflineTileCacheManager {
     y: number
   ): Promise<TileLookupResult | null> {
     const key = buildTileCacheKey(style, z, x, y);
+    const expectedUrl = buildTileUrl(style, z, x, y);
     const hot = this.hotMemoryCache.get(key);
     if (hot && hot.data.byteLength > 0) {
       return { data: hot.data, mimeType: hot.mimeType, source: 'CACHE' };
@@ -584,16 +656,20 @@ export class OfflineTileCacheManager {
 
     const stored = await this.storage.getTile(key);
     if (stored && stored.data.byteLength > 0) {
-      this.rememberHot(key, stored.data, stored.mimeType);
-      return { data: stored.data, mimeType: stored.mimeType, source: 'CACHE' };
+      // Evict stale tiles if provider URL changed (e.g. legacy CARTO tile without key)
+      if (stored.url && stored.url !== expectedUrl) {
+        await this.storage.deleteTile(key);
+      } else {
+        this.rememberHot(key, stored.data, stored.mimeType);
+        return { data: stored.data, mimeType: stored.mimeType, source: 'CACHE' };
+      }
     }
 
     // Secondary check in Browser CacheStorage if populated by Workbox Service Worker
     if (typeof caches !== 'undefined') {
       try {
-        const url = buildTileUrl(style, z, x, y);
         const swCache = await caches.open(TILE_CACHE_SW_NAME);
-        const matched = await swCache.match(url);
+        const matched = await swCache.match(expectedUrl);
         if (matched && matched.ok) {
           const buf = await matched.arrayBuffer();
           if (buf.byteLength > 0) {

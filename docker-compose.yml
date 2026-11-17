@@ -45,6 +45,9 @@ services:
         VITE_FIREBASE_MESSAGING_SENDER_ID: ${VITE_FIREBASE_MESSAGING_SENDER_ID:-}
         VITE_FIREBASE_APP_ID: ${VITE_FIREBASE_APP_ID:-}
         VITE_FIREBASE_DATABASE_ID: ${VITE_FIREBASE_DATABASE_ID:-}
+        VITE_CARTO_API_KEY: ${VITE_CARTO_API_KEY:-}
+        VITE_MAP_ORTHO_TILE_URL: ${VITE_MAP_ORTHO_TILE_URL:-}
+        VITE_MAP_VECTOR_TILE_URL: ${VITE_MAP_VECTOR_TILE_URL:-}
     restart: unless-stopped
     depends_on:
       faixasegura-db:
@@ -54,11 +57,37 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3000
+      APP_URL: ${APP_URL:-http://localhost:3000}
       DATABASE_URL: postgresql://faixasegura:${POSTGRES_PASSWORD:-faixasegura_local_2026}@faixasegura-db:5432/faixasegura
       REDIS_URL: redis://faixasegura-redis:6379/0
       OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-https://ollama.innovaive.com}
+      OLLAMA_API_KEY: ${OLLAMA_API_KEY:-}
       OLLAMA_VISION_MODEL: ${OLLAMA_VISION_MODEL:-gemma3:4b}
       OLLAMA_TEXT_MODEL: ${OLLAMA_TEXT_MODEL:-qwen3:4b}
+      OLLAMA_TIMEOUT_MS: ${OLLAMA_TIMEOUT_MS:-8500}
+      COPERNICUS_TOKEN_URL: ${COPERNICUS_TOKEN_URL:-https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token}
+      COPERNICUS_STAC_URL: ${COPERNICUS_STAC_URL:-https://sh.dataspace.copernicus.eu/api/v1/process}
+      COPERNICUS_STATS_URL: ${COPERNICUS_STATS_URL:-https://sh.dataspace.copernicus.eu/api/v1/statistics}
+      COPERNICUS_CATALOG_URL: ${COPERNICUS_CATALOG_URL:-https://catalogue.dataspace.copernicus.eu/resto/api/collections/Sentinel2/search.json}
+      COPERNICUS_CLIENT_ID: ${COPERNICUS_CLIENT_ID:-}
+      COPERNICUS_CLIENT_SECRET: ${COPERNICUS_CLIENT_SECRET:-}
+      DGT_ORTHO_WMS_URL: ${DGT_ORTHO_WMS_URL:-https://cartografia.dgterritorio.gov.pt/ortos2021/service}
+      DGT_CADASTRE_OGC_URL: ${DGT_CADASTRE_OGC_URL:-https://ogcapi.dgterritorio.gov.pt/collections/cadastro/items}
+      EREDES_OPENDATA_BASE_URL: ${EREDES_OPENDATA_BASE_URL:-https://e-redes.opendatasoft.com/api/explore/v2.1/catalog/datasets}
+      EREDES_OPENDATA_DATASET: ${EREDES_OPENDATA_DATASET:-rede-aerea-de-alta-e-media-tensao}
+      EREDES_OPENDATA_API_KEY: ${EREDES_OPENDATA_API_KEY:-}
+      ELEVATION_API_URL: ${ELEVATION_API_URL:-https://api.open-meteo.com/v1/elevation}
+      ORTHOPHOTO_CV_SERVICE_URL: ${ORTHOPHOTO_CV_SERVICE_URL:-}
+      ORTHOPHOTO_CV_API_KEY: ${ORTHOPHOTO_CV_API_KEY:-}
+      ORTHOPHOTO_ONNX_PROFILE: ${ORTHOPHOTO_ONNX_PROFILE:-yolo11s-seg+segformer-b2-dgt25cm}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_DEFAULT_CHAT_ID: ${TELEGRAM_DEFAULT_CHAT_ID:-}
+      VAPID_PUBLIC_KEY: ${VAPID_PUBLIC_KEY:-}
+      VAPID_PRIVATE_KEY: ${VAPID_PRIVATE_KEY:-}
+      VAPID_SUBJECT: ${VAPID_SUBJECT:-mailto:alertas@faixasegura.pt}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      RESEND_FROM_EMAIL: ${RESEND_FROM_EMAIL:-FaixaSegura SGIFR <alertas@faixasegura.pt>}
+      SMTP_WEBHOOK_URL: ${SMTP_WEBHOOK_URL:-}
     expose:
       - "3000"
     # Para acesso local direto fora do Dokploy/Traefik, descomente:

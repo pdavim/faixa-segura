@@ -27,6 +27,7 @@ import {
   buildOfflineFallbackTileSvgDataUrl,
   buildTileUrl,
   getSharedOfflineTileCacheManager,
+  resolveTileTemplateUrl,
   type MapTileStyle,
   type OfflineTileCacheManager,
 } from '../lib/offlineTileCache.ts';
@@ -42,17 +43,14 @@ class PolygonModalOfflineTileLayer extends L.TileLayer {
     tileCacheManager: OfflineTileCacheManager;
     parcelId: string;
   }) {
-    const templateUrl =
-      params.style === 'ORTHOPHOTO'
-        ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-        : 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png';
+    const templateUrl = resolveTileTemplateUrl(params.style);
 
     super(templateUrl, {
       maxZoom: params.maxZoom,
       attribution:
         params.style === 'ORTHOPHOTO'
           ? 'Ortofoto Aérea / Satélite · EPSG:3763'
-          : 'Cartografia Vetorial OpenStreetMap / CARTO',
+          : 'Cartografia Topográfica & Vetorial OSM',
     });
 
     this.tileStyle = params.style;
@@ -571,16 +569,37 @@ export const ParcelPolygonMapModal: React.FC<ParcelPolygonMapModalProps> = ({
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
-            <button
-              type="button"
-              onClick={() =>
-                setTileStyle((prev) => (prev === 'ORTHOPHOTO' ? 'VECTOR' : 'ORTHOPHOTO'))
-              }
-              className="min-h-[36px] px-3 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+            <div
+              role="group"
+              aria-label="Fundo do mapa"
+              className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-300 dark:border-[#263248]"
             >
-              <Layers className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E]" aria-hidden="true" />
-              {tileStyle === 'ORTHOPHOTO' ? 'Mapa Vetorial' : 'Ortofoto Satélite'}
-            </button>
+              <button
+                type="button"
+                aria-pressed={tileStyle === 'ORTHOPHOTO'}
+                onClick={() => setTileStyle('ORTHOPHOTO')}
+                className={`min-h-[34px] px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                  tileStyle === 'ORTHOPHOTO'
+                    ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                    : 'text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                <Layers className="w-3.5 h-3.5" aria-hidden="true" />
+                Ortofoto
+              </button>
+              <button
+                type="button"
+                aria-pressed={tileStyle === 'VECTOR'}
+                onClick={() => setTileStyle('VECTOR')}
+                className={`min-h-[34px] px-2.5 py-1 rounded-lg text-xs font-semibold inline-flex items-center gap-1 whitespace-nowrap shrink-0 ${
+                  tileStyle === 'VECTOR'
+                    ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                    : 'text-slate-700 dark:text-slate-300'
+                }`}
+              >
+                Topográfico
+              </button>
+            </div>
 
             <button
               type="button"

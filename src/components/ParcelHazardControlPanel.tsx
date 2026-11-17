@@ -10,6 +10,7 @@ import {
   MapPin,
   RefreshCw,
   RotateCcw,
+  Send,
   ShieldCheck,
   Trees,
 } from 'lucide-react';
@@ -108,6 +109,35 @@ export const ParcelHazardControlPanel: React.FC<ParcelHazardControlPanelProps> =
       parcels[0],
     [parcels, simulationTargetId, activeParcelId]
   );
+
+  const [dispatchingExternal, setDispatchingExternal] = useState(false);
+  const [externalDispatchFeedback, setExternalDispatchFeedback] = useState<string | null>(null);
+
+  const handleDispatchExternalAlert = async (targetParcel: ParcelRecord) => {
+    setDispatchingExternal(true);
+    setExternalDispatchFeedback(null);
+    try {
+      const resp = await fetch('/api/notifications/dispatch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          parcelId: targetParcel.id,
+        }),
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as { summaryPt?: string };
+        setExternalDispatchFeedback(
+          data.summaryPt || `Despacho externo processado para ${targetParcel.label}.`
+        );
+      } else {
+        setExternalDispatchFeedback('Não foi possível despachar alerta externo neste momento.');
+      }
+    } catch {
+      setExternalDispatchFeedback('Sem ligação ao servidor de despacho externo.');
+    } finally {
+      setDispatchingExternal(false);
+    }
+  };
 
   const visibleAlerts = useMemo(() => {
     return evaluation.alerts.filter((alert) => {
@@ -676,6 +706,16 @@ export const ParcelHazardControlPanel: React.FC<ParcelHazardControlPanelProps> =
                 <CloudLightning className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
                 <span>Simular Tempestade (3,1 km)</span>
               </button>
+              <button
+                type="button"
+                data-testid="dispatch-external-alert-btn"
+                disabled={dispatchingExternal}
+                onClick={() => void handleDispatchExternalAlert(resolvedSimParcel)}
+                className="min-h-[38px] px-3 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+              >
+                <Send className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                <span>{dispatchingExternal ? 'A enviar...' : 'Testar Envio Externo'}</span>
+              </button>
             </>
           )}
 
@@ -692,6 +732,17 @@ export const ParcelHazardControlPanel: React.FC<ParcelHazardControlPanelProps> =
           )}
         </div>
       </div>
+
+      {externalDispatchFeedback && (
+        <p
+          role="status"
+          aria-live="polite"
+          data-testid="external-dispatch-feedback"
+          className="text-xs text-slate-600 dark:text-slate-300 tabular-nums"
+        >
+          {externalDispatchFeedback}
+        </p>
+      )}
     </section>
   );
 };

@@ -383,8 +383,15 @@ export default function App() {
               hasProtectedOaks: parcel.hasProtectedOaks,
               userNotes: parcel.userNotes ?? '',
               vertices: parcel.vertices,
+              buildingCenter: parcel.buildingCenter,
               landClass: parcel.landClass,
               hasEredesLine: parcel.hasEredesLine,
+              eredesType: parcel.eredesType,
+              vectorContext: parcel.vectorContext,
+              cvAnalysis: parcel.cvAnalysis,
+              ndviHistory: parcel.ndviHistory,
+              satelliteSourceLabel: parcel.satelliteSourceLabel,
+              elevationMeta: parcel.elevationMeta,
             }),
           });
           if (!resp.ok) {
@@ -857,6 +864,48 @@ export default function App() {
     setUserSettings(clean);
   }, []);
 
+  const subscribeBrowserWebPush = useCallback(async () => {
+    if (
+      typeof window === 'undefined' ||
+      !('serviceWorker' in navigator) ||
+      !('PushManager' in window)
+    ) {
+      return;
+    }
+    try {
+      const keyRes = await fetch('/api/notifications/webpush/vapid-public-key');
+      if (!keyRes.ok) return;
+      const keyJson = (await keyRes.json()) as { publicKey?: string };
+      const vapidPublicKey = keyJson.publicKey?.trim();
+      if (!vapidPublicKey) return;
+
+      const padding = '='.repeat((4 - (vapidPublicKey.length % 4)) % 4);
+      const base64 = (vapidPublicKey + padding).replace(/-/g, '+').replace(/_/g, '/');
+      const rawData = window.atob(base64);
+      const applicationServerKey = new Uint8Array(rawData.length);
+      for (let i = 0; i < rawData.length; i++) {
+        applicationServerKey[i] = rawData.charCodeAt(i);
+      }
+
+      const registration = await navigator.serviceWorker.ready;
+      const existingSub = await registration.pushManager.getSubscription();
+      const sub =
+        existingSub ??
+        (await registration.pushManager.subscribe({
+          userVisibleOnly: true,
+          applicationServerKey,
+        }));
+
+      await fetch('/api/notifications/webpush/subscribe', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ subscription: sub.toJSON() }),
+      });
+    } catch {
+      // Non-blocking fallback when browser PushService is restricted in preview
+    }
+  }, []);
+
   const handleRequestBrowserNotifications = useCallback(async () => {
     if (typeof window === 'undefined' || typeof Notification === 'undefined') {
       setNotificationPermissionState('unsupported');
@@ -864,10 +913,14 @@ export default function App() {
     }
     if (Notification.permission === 'granted') {
       setNotificationPermissionState('granted');
+      const nextEnabled = !userSettings.browserNotificationsEnabled;
       handleUpdateUserSettings({
         ...userSettings,
-        browserNotificationsEnabled: !userSettings.browserNotificationsEnabled,
+        browserNotificationsEnabled: nextEnabled,
       });
+      if (nextEnabled) {
+        void subscribeBrowserWebPush();
+      }
       return;
     }
     try {
@@ -878,11 +931,12 @@ export default function App() {
           ...userSettings,
           browserNotificationsEnabled: true,
         });
+        void subscribeBrowserWebPush();
       }
     } catch {
       // Ignore permission dialog restrictions
     }
-  }, [userSettings, handleUpdateUserSettings]);
+  }, [userSettings, handleUpdateUserSettings, subscribeBrowserWebPush]);
 
   const handleDeleteParcel = useCallback(
     async (targetParcelId: string): Promise<{ ok: boolean; error?: string }> => {
@@ -1461,6 +1515,7 @@ export default function App() {
             notificationPermissionState={notificationPermissionState}
             isAuthenticated={Boolean(userProfile)}
             onUpdateSettings={handleUpdateUserSettings}
+            onUpdateParcel={(updated) => void recordParcelOfflineFirst(updated, false)}
             onRefreshHazards={() => void refreshActiveHazardsFeed()}
             onSelectParcel={(id) => setActiveParcelId(id)}
             onFocusParcelOnMap={handleFocusParcelOnMap}
@@ -1511,6 +1566,9 @@ export default function App() {
                 soilMoisturePct: currentSoilMoisturePct,
                 summary: `Área total ${created.spatial.totalAreaM2.toFixed(0)} m² · Limpeza exigível ${created.spatial.mandatoryCleanAreaM2.toFixed(0)} m² (${created.matrixArticle}).`,
               });
+            }}
+            onUpdateParcel={(updated) => {
+              void recordParcelOfflineFirst(updated, false);
             }}
             onNavigateTab={handleNavigate}
           />

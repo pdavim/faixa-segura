@@ -4,18 +4,24 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
+import * as pngjsNs from 'pngjs';
 import type {
   ActiveFireIncident,
   AnepcNationalSummary,
   ComplianceCertificate,
   DailyPirForecast,
   ForestryProvider,
+  LandClass,
+  LatLon,
   NeighborComplaintRecord,
+  ParcelOrthophotoCvAnalysis,
   ParcelRecord,
+  ParcelVectorContext,
   PirLevel,
   QuoteLead,
   RealtimeHazardFeedMeta,
   RealtimeHazardsSnapshotPayload,
+  SatelliteObservation,
   StormAlertIncident,
 } from './src/types/domain.ts';
 import {
@@ -51,11 +57,323 @@ import {
   parseIpmaWarningsPayload,
   type IpmaAreaLocation,
 } from './src/lib/officialAlertsIngestor.ts';
+import {
+  buildOverpassParcelContextQuery,
+  computePaddedBoundingBoxWgs84,
+  finalizeParcelVectorContext,
+  parseOverpassVectorContext,
+  synthesizeDeterministicCadastreContext,
+} from './src/lib/vectorContextIngestor.ts';
+import {
+  buildOrthophotoInferenceSpec,
+  computeParcelCvRasterGrid,
+  fuseCvDetectionsIntoVectorContext,
+  runOrthophotoPixelPipeline,
+  synthesizeDeterministicParcelOrthophotoRgba,
+  type ParcelCvRasterGrid,
+} from './src/lib/orthophotoCvPipeline.ts';
+import {
+  buildCopernicusOpenCatalogUrl,
+  buildCopernicusStatsRequestBody,
+  buildDgtCadastreOgcUrl,
+  buildEredesOpenDataUrl,
+  buildParcelElevationSampleGrid,
+  computeTerrainSlopeFromElevations,
+  mergeEredesEasementsIntoVectorContext,
+  parseCopernicusOpenCatalogScenes,
+  parseCopernicusStatsResponse,
+  parseDgtCadastreFeatures,
+  parseElevationApiResponse,
+  parseEredesOpenDataLines,
+} from './src/lib/externalGeoConnectors.ts';
+import {
+  ServerInfraBridge,
+  WebPushNotificationHub,
+  dispatchTelegramAlert,
+  dispatchTransactionalEmailOrWebhook,
+  formatTelegramHazardAlertPt,
+  type ExternalChannelReceipt,
+  type ServerIntegrationCapabilities,
+} from './src/lib/serverInfraAndNotifications.ts';
+import type { PushSubscription } from 'web-push';
 
 dotenv.config();
 
+const PNG =
+  (
+    pngjsNs as unknown as {
+      PNG?: typeof pngjsNs.PNG;
+      default?: { PNG: typeof pngjsNs.PNG };
+    }
+  ).PNG ?? (pngjsNs as unknown as { default: { PNG: typeof pngjsNs.PNG } }).default.PNG;
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
+// Non-blocking PostgreSQL/PostGIS + Redis bridge & RFC 8291 Web Push VAPID Hub
+const infraBridge = new ServerInfraBridge();
+void infraBridge.initializeFromEnv().catch(() => {});
+const webPushHub = new WebPushNotificationHub();
+
+let copernicusTokenCache: { accessToken: string; expiresAtMs: number } | null = null;
+
+async function fetchEredesOpenDataForParcel(
+  vertices: LatLon[],
+  timeoutMs = 3600
+) {
+  const url = buildEredesOpenDataUrl({
+    baseUrl: process.env.EREDES_OPENDATA_BASE_URL,
+    dataset: process.env.EREDES_OPENDATA_DATASET,
+    vertices,
+    paddingM: 120,
+    limit: 25,
+  });
+  const apiKey = process.env.EREDES_OPENDATA_API_KEY?.trim();
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+    'User-Agent': 'FaixaSegura-SGIFR/2.0',
+  };
+  if (apiKey) {
+    headers.Authorization = `Apikey ${apiKey}`;
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const resp = await fetch(url, { headers, signal: ctrl.signal });
+    if (!resp.ok) return [];
+    const json = await resp.json();
+    return parseEredesOpenDataLines(json);
+  } catch {
+    return [];
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchRealParcelTerrainSlope(params: {
+  vertices: LatLon[];
+  centroid?: LatLon;
+  timeoutMs?: number;
+}): Promise<{
+  avgSlopePct: number;
+  elevationMeta: NonNullable<ParcelRecord['elevationMeta']>;
+} | null> {
+  const sampleGrid = buildParcelElevationSampleGrid(params.vertices, params.centroid);
+  const cacheKey = `dem:${sampleGrid[0].lat.toFixed(4)},${sampleGrid[0].lon.toFixed(4)}:${sampleGrid.length}`;
+  const cached = await infraBridge.cacheGetJson<{
+    avgSlopePct: number;
+    elevationMeta: NonNullable<ParcelRecord['elevationMeta']>;
+  }>(cacheKey);
+  if (cached) return cached;
+
+  const baseElevationUrl =
+    process.env.ELEVATION_API_URL?.trim() || 'https://api.open-meteo.com/v1/elevation';
+  const url = new URL(baseElevationUrl);
+  if (baseElevationUrl.includes('opentopodata.org')) {
+    url.searchParams.set(
+      'locations',
+      sampleGrid.map((p) => `${p.lat},${p.lon}`).join('|')
+    );
+  } else {
+    url.searchParams.set('latitude', sampleGrid.map((p) => p.lat).join(','));
+    url.searchParams.set('longitude', sampleGrid.map((p) => p.lon).join(','));
+  }
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), params.timeoutMs ?? 3500);
+  try {
+    const resp = await fetch(url.toString(), {
+      headers: { Accept: 'application/json', 'User-Agent': 'FaixaSegura-SGIFR/2.0' },
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) return null;
+    const rawJson = await resp.json();
+    const elevations = parseElevationApiResponse(rawJson);
+    if (elevations.length < 3) return null;
+
+    const computed = computeTerrainSlopeFromElevations(sampleGrid, elevations);
+    const result = {
+      avgSlopePct: computed.avgSlopePct,
+      elevationMeta: {
+        minElevationM: computed.minElevationM,
+        maxElevationM: computed.maxElevationM,
+        reliefM: computed.reliefM,
+        aspectLabelPt: computed.aspectLabelPt,
+        sourceLabel: baseElevationUrl.includes('open-meteo.com')
+          ? 'Copernicus DEM GLO-90 / MDT 30 m (Open-Meteo)'
+          : 'MDT Altimétrico Oficial (ELEVATION_API_URL)',
+        sampledPointsCount: Math.min(sampleGrid.length, elevations.length),
+      },
+    };
+    await infraBridge.cacheSetJson(cacheKey, result, 12 * 3600);
+    return result;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function getCopernicusOAuthToken(): Promise<string | null> {
+  const clientId = process.env.COPERNICUS_CLIENT_ID?.trim();
+  const clientSecret = process.env.COPERNICUS_CLIENT_SECRET?.trim();
+  if (!clientId || !clientSecret) return null;
+
+  if (copernicusTokenCache && copernicusTokenCache.expiresAtMs > Date.now() + 30_000) {
+    return copernicusTokenCache.accessToken;
+  }
+
+  const tokenUrl =
+    process.env.COPERNICUS_TOKEN_URL?.trim() ||
+    'https://identity.dataspace.copernicus.eu/auth/realms/CDSE/protocol/openid-connect/token';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 4500);
+  try {
+    const body = new URLSearchParams({
+      grant_type: 'client_credentials',
+      client_id: clientId,
+      client_secret: clientSecret,
+    });
+    const resp = await fetch(tokenUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: body.toString(),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) return null;
+    const json = (await resp.json()) as { access_token?: string; expires_in?: number };
+    if (!json.access_token) return null;
+    copernicusTokenCache = {
+      accessToken: json.access_token,
+      expiresAtMs: Date.now() + Math.max(60, Number(json.expires_in ?? 600)) * 1000,
+    };
+    return json.access_token;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function fetchCopernicusSentinel2Observations(params: {
+  vertices: LatLon[];
+  centroid: LatLon;
+  landClass: LandClass;
+  existingHistory?: SatelliteObservation[];
+  forceRefresh?: boolean;
+}): Promise<{ observations: SatelliteObservation[]; sourceLabel: string }> {
+  const cacheKey = `s2:${params.centroid.lat.toFixed(4)},${params.centroid.lon.toFixed(4)}:${params.landClass}`;
+  if (!params.forceRefresh) {
+    const cached = await infraBridge.cacheGetJson<{
+      observations: SatelliteObservation[];
+      sourceLabel: string;
+    }>(cacheKey);
+    if (cached && cached.observations.length > 0) return cached;
+  }
+
+  const now = new Date();
+  const fromDate = new Date(now.getTime() - 65 * 24 * 3600_000).toISOString().slice(0, 10);
+  const toDate = now.toISOString().slice(0, 10);
+
+  // 1. Authenticated Copernicus Data Space Statistical API (B04/B08/B11 10m polygon stats)
+  const accessToken = await getCopernicusOAuthToken();
+  if (accessToken && params.vertices.length >= 3) {
+    const statsUrl =
+      process.env.COPERNICUS_STATS_URL?.trim() ||
+      'https://sh.dataspace.copernicus.eu/api/v1/statistics';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 6500);
+    try {
+      const resp = await fetch(statsUrl, {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify(
+          buildCopernicusStatsRequestBody({
+            vertices: params.vertices,
+            fromIsoDate: fromDate,
+            toIsoDate: toDate,
+          })
+        ),
+        signal: ctrl.signal,
+      });
+      if (resp.ok) {
+        const rawJson = await resp.json();
+        const statsObs = parseCopernicusStatsResponse(rawJson, 4);
+        if (statsObs.length >= 2) {
+          const out = {
+            observations: statsObs,
+            sourceLabel: 'Copernicus Sentinel-2 L2A (Statistical API OAuth2 · 10 m)',
+          };
+          await infraBridge.cacheSetJson(cacheKey, out, 6 * 3600);
+          return out;
+        }
+      }
+    } catch {
+      // Fall through to Open Catalog
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // 2. Unauthenticated Copernicus Data Space Open Catalog (Real Sentinel-2 L2A overpass dates & cloud cover)
+  const catalogUrl = buildCopernicusOpenCatalogUrl({
+    catalogBaseUrl: process.env.COPERNICUS_CATALOG_URL,
+    centroid: params.centroid,
+    startDateIso: fromDate,
+    completionDateIso: toDate,
+    maxRecords: 24,
+  });
+  const catCtrl = new AbortController();
+  const catTimer = setTimeout(() => catCtrl.abort(), 4800);
+  try {
+    const catResp = await fetch(catalogUrl, {
+      headers: { Accept: 'application/json', 'User-Agent': 'FaixaSegura-SGIFR/2.0' },
+      signal: catCtrl.signal,
+    });
+    if (catResp.ok) {
+      const catJson = await catResp.json();
+      const catalogObs = parseCopernicusOpenCatalogScenes({
+        rawJson: catJson,
+        landClass: params.landClass,
+        centroid: params.centroid,
+        existingHistory: params.existingHistory,
+        maxCount: 4,
+      });
+      if (catalogObs.length >= 2) {
+        const out = {
+          observations: catalogObs,
+          sourceLabel: 'Copernicus Data Space · Passagens Reais Sentinel-2 L2A',
+        };
+        await infraBridge.cacheSetJson(cacheKey, out, 3 * 3600);
+        return out;
+      }
+    }
+  } catch {
+    // Fall through to deterministic seasonal curve
+  } finally {
+    clearTimeout(catTimer);
+  }
+
+  // 3. Offline / Hermetic Fallback
+  const fallbackObs: SatelliteObservation[] =
+    params.existingHistory && params.existingHistory.length > 0
+      ? params.existingHistory
+      : [
+          { date: '2026-03-15', ndvi: 0.44, ndmi: 0.27, cloudCoverPct: 7 },
+          { date: '2026-04-02', ndvi: 0.51, ndmi: 0.22, cloudCoverPct: 9 },
+          { date: '2026-04-18', ndvi: 0.57, ndmi: 0.18, cloudCoverPct: 6 },
+          { date: '2026-05-04', ndvi: 0.62, ndmi: 0.15, cloudCoverPct: 8 },
+        ];
+  return {
+    observations: fallbackObs,
+    sourceLabel: 'Série Multiespectral Regional Sentinel-2 (Contingência Local)',
+  };
+}
 
 // In-memory state store (mirrors PostgreSQL faixasegura schema + Redis TTL cache)
 const parcelsStore: ParcelRecord[] = structuredClone(INITIAL_PARCELS);
@@ -70,6 +388,230 @@ interface PirCacheEntry {
   source: 'IPMA Open Data (rcm)' | 'Cache Determinístico Regional IPMA';
 }
 const pirRedisCache = new Map<string, PirCacheEntry>();
+
+interface OverpassCacheEntry {
+  expiresAt: number;
+  parsed: ParcelVectorContext;
+}
+const overpassContextCache = new Map<string, OverpassCacheEntry>();
+
+interface OrthophotoCvCacheEntry {
+  expiresAt: number;
+  analysis: ParcelOrthophotoCvAnalysis;
+}
+const orthophotoCvCache = new Map<string, OrthophotoCvCacheEntry>();
+
+async function acquireParcelOrthophotoRgba(params: {
+  grid: ParcelCvRasterGrid;
+  parcelVertices: LatLon[];
+  landClass: LandClass;
+  spatial: ParcelRecord['spatial'];
+  vectorContext?: ParcelVectorContext;
+  timeoutMs?: number;
+}): Promise<{
+  rgba: Uint8Array;
+  sourceLabel: string;
+  engineMode: ParcelOrthophotoCvAnalysis['engineMode'];
+}> {
+  const { grid, parcelVertices, landClass, spatial, vectorContext } = params;
+  const [west, south, east, north] = grid.bboxWgs84;
+  const dgtWmsBase =
+    process.env.DGT_ORTHO_WMS_URL?.trim() ||
+    'https://cartografia.dgterritorio.gov.pt/ortos2021/service';
+
+  const candidates: Array<{ url: string; label: string }> = [
+    {
+      url: `${dgtWmsBase}?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=Ortos2021-RGB&STYLES=&SRS=EPSG:4326&BBOX=${west},${south},${east},${north}&WIDTH=${grid.width}&HEIGHT=${grid.height}&FORMAT=image/png`,
+      label: 'DGT Ortofotos Oficiais 25 cm (WMS PT)',
+    },
+    {
+      url: `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${west},${south},${east},${north}&bboxSR=4326&imageSR=4326&size=${grid.width},${grid.height}&format=png24&f=image`,
+      label: 'Ortofoto Aérea Real 25 cm (World Imagery RGB)',
+    },
+  ];
+
+  const perCandidateTimeout = Math.max(2000, params.timeoutMs ?? 4200);
+
+  for (const cand of candidates) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), perCandidateTimeout);
+    try {
+      const resp = await fetch(cand.url, {
+        headers: {
+          Accept: 'image/png,*/*;q=0.8',
+          'User-Agent': 'FaixaSeguraPT/2.0 (Pipeline CV Ortofoto 25cm)',
+        },
+        signal: ctrl.signal,
+      });
+      if (!resp.ok) continue;
+      const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+      if (contentType.includes('xml') || contentType.includes('html') || contentType.includes('json')) {
+        continue;
+      }
+
+      const buf = Buffer.from(await resp.arrayBuffer());
+      if (buf.length < 256) continue;
+      const decoded = PNG.sync.read(buf);
+      if (decoded.width < 32 || decoded.height < 32) continue;
+
+      let rgba: Uint8Array;
+      if (decoded.width === grid.width && decoded.height === grid.height) {
+        rgba = new Uint8Array(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
+      } else {
+        // Nearest-neighbor resample to exact grid dimensions
+        rgba = new Uint8Array(grid.width * grid.height * 4);
+        for (let r = 0; r < grid.height; r++) {
+          const srcR = Math.min(decoded.height - 1, Math.floor((r * decoded.height) / grid.height));
+          for (let c = 0; c < grid.width; c++) {
+            const srcC = Math.min(decoded.width - 1, Math.floor((c * decoded.width) / grid.width));
+            const sIdx = (srcR * decoded.width + srcC) * 4;
+            const dIdx = (r * grid.width + c) * 4;
+            rgba[dIdx] = decoded.data[sIdx];
+            rgba[dIdx + 1] = decoded.data[sIdx + 1];
+            rgba[dIdx + 2] = decoded.data[sIdx + 2];
+            rgba[dIdx + 3] = decoded.data[sIdx + 3];
+          }
+        }
+      }
+
+      // Reject blank/uniform tiles (e.g. empty white WMS frame) via luminance standard deviation
+      const pxCount = grid.width * grid.height;
+      let sumLum = 0;
+      let sumSqLum = 0;
+      let opaqueCount = 0;
+      for (let i = 0; i < pxCount; i++) {
+        const bIdx = i * 4;
+        if (rgba[bIdx + 3] > 20) opaqueCount++;
+        const l = 0.299 * rgba[bIdx] + 0.587 * rgba[bIdx + 1] + 0.114 * rgba[bIdx + 2];
+        sumLum += l;
+        sumSqLum += l * l;
+      }
+      const meanL = sumLum / pxCount;
+      const variance = Math.max(0, sumSqLum / pxCount - meanL * meanL);
+      const stdDev = Math.sqrt(variance);
+      if (opaqueCount < pxCount * 0.75 || stdDev < 4.5) {
+        continue;
+      }
+
+      return {
+        rgba,
+        sourceLabel: cand.label,
+        engineMode: 'REAL_ORTHOPHOTO_PIXEL_CV',
+      };
+    } catch {
+      // Try next imagery provider
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  const synth = synthesizeDeterministicParcelOrthophotoRgba({
+    grid,
+    parcelVertices,
+    landClass,
+    spatial,
+    vectorContext,
+  });
+  return {
+    rgba: new Uint8Array(synth.buffer, synth.byteOffset, synth.byteLength),
+    sourceLabel: 'Ortofoto Sintética Georreferenciada EPSG:3763 (Modo Offline)',
+    engineMode: 'OFFLINE_SYNTHETIC_CV',
+  };
+}
+
+async function fetchLiveParcelVectorContext(params: {
+  vertices: LatLon[];
+  buildingCenter?: LatLon;
+  hasEredesLine: boolean;
+  eredesType?: ParcelRecord['eredesType'];
+  hasProtectedOaks?: boolean;
+  existingContext?: ParcelVectorContext;
+  forceRefresh?: boolean;
+  timeoutMs?: number;
+}): Promise<ParcelVectorContext> {
+  const bboxKey = computePaddedBoundingBoxWgs84(params.vertices, 110).join(',');
+  const cached = !params.forceRefresh ? overpassContextCache.get(bboxKey) : undefined;
+  if (cached && cached.expiresAt > Date.now()) {
+    return finalizeParcelVectorContext({
+      liveParsed: cached.parsed,
+      parcelVertices: params.vertices,
+      buildingCenter: params.buildingCenter,
+      hasEredesLine: params.hasEredesLine,
+      eredesType: params.eredesType,
+      hasProtectedOaks: params.hasProtectedOaks,
+      existingContext: params.existingContext,
+    });
+  }
+
+  const query = buildOverpassParcelContextQuery(params.vertices, 110);
+  const endpoints = [
+    'https://overpass-api.de/api/interpreter',
+    'https://lz4.overpass-api.de/api/interpreter',
+  ];
+  const perEndpointTimeout = Math.max(2000, params.timeoutMs ?? 5200);
+
+  const eredesPromise = fetchEredesOpenDataForParcel(
+    params.vertices,
+    Math.min(3600, perEndpointTimeout)
+  );
+
+  let overpassParsed: ParcelVectorContext | null = null;
+  for (const endpoint of endpoints) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), perEndpointTimeout);
+    try {
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+          Accept: 'application/json',
+          'User-Agent': 'FaixaSegura-SGIFR/1.0',
+        },
+        body: `data=${encodeURIComponent(query)}`,
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) continue;
+      const json = await res.json();
+      overpassParsed = parseOverpassVectorContext({
+        overpassJson: json,
+        parcelVertices: params.vertices,
+        searchRadiusM: 110,
+      });
+      break;
+    } catch {
+      clearTimeout(timer);
+    }
+  }
+
+  const eredesLines = await eredesPromise;
+  let mergedLive = overpassParsed;
+  if (mergedLive && eredesLines.length > 0) {
+    mergedLive = mergeEredesEasementsIntoVectorContext(mergedLive, eredesLines).context;
+  }
+
+  if (mergedLive) {
+    overpassContextCache.set(bboxKey, {
+      expiresAt: Date.now() + 30 * 60_000,
+      parsed: mergedLive,
+    });
+  }
+
+  const finalized = finalizeParcelVectorContext({
+    liveParsed: mergedLive,
+    parcelVertices: params.vertices,
+    buildingCenter: params.buildingCenter,
+    hasEredesLine: params.hasEredesLine || eredesLines.length > 0,
+    eredesType: params.eredesType,
+    hasProtectedOaks: params.hasProtectedOaks,
+    existingContext: params.existingContext,
+  });
+
+  if (!mergedLive && eredesLines.length > 0) {
+    return mergeEredesEasementsIntoVectorContext(finalized, eredesLines).context;
+  }
+  return finalized;
+}
 
 // Circuit breaker state for ollama.innovaive.com
 const ollamaCircuit = {
@@ -87,10 +629,15 @@ async function callOllamaWithFallback(prompt: string, model: string): Promise<{ 
 
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), Number(process.env.OLLAMA_TIMEOUT_MS || 4500));
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const ollamaApiKey = process.env.OLLAMA_API_KEY?.trim();
+  if (ollamaApiKey) {
+    headers.Authorization = `Bearer ${ollamaApiKey}`;
+  }
   try {
     const resp = await fetch(`${ollamaCircuit.baseUrl.replace(/\/$/, '')}/api/generate`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ model, prompt, stream: false }),
       signal: controller.signal,
     });
@@ -115,7 +662,11 @@ async function fetchIpmaRcmLevel(dayIndex: 0 | 1, dico: string): Promise<PirLeve
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 3200);
   try {
-    const url = `https://api.ipma.pt/open-data/forecast/meteorology/rcm/rcm-d${dayIndex}.json`;
+    const baseUrl = (
+      process.env.IPMA_RCM_BASE_URL?.trim() ||
+      'https://api.ipma.pt/open-data/forecast/meteorology/rcm'
+    ).replace(/\/$/, '');
+    const url = `${baseUrl}/rcm-d${dayIndex}.json`;
     const res = await fetch(url, { signal: controller.signal });
     clearTimeout(timer);
     if (!res.ok) return null;
@@ -145,13 +696,53 @@ function formatDayPt(offsetDays: number): { label: string; isoDate: string } {
   };
 }
 
-function resolveServerPort(): number {
-  const portFlagIndex = process.argv.indexOf('--port');
-  if (portFlagIndex !== -1 && process.argv[portFlagIndex + 1]) {
-    const parsed = Number(process.argv[portFlagIndex + 1]);
-    if (!Number.isNaN(parsed) && parsed > 0) return parsed;
+function resolveServerPort(
+  env: NodeJS.ProcessEnv = process.env,
+  argv: string[] = process.argv
+): number {
+  // 1. Explicit CLI `--port 3000` or `--port=3000`
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i];
+    if (arg === '--port' && argv[i + 1]) {
+      const parsed = Number(argv[i + 1]);
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
+    if (arg.startsWith('--port=')) {
+      const parsed = Number(arg.slice('--port='.length));
+      if (Number.isFinite(parsed) && parsed > 0) return parsed;
+    }
   }
-  return Number(process.env.PORT || 3000);
+
+  // 2. npm flag forwarding (`npm run dev --port 3000` without `--`)
+  if (env.npm_config_port) {
+    const parsed = Number(env.npm_config_port);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+
+  // 3. Explicit APP_PORT override
+  if (env.APP_PORT) {
+    const parsed = Number(env.APP_PORT);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+
+  // 4. In non-production containers where Nginx owns NGINX_PORT (e.g. PORT=8080, DEFAULT_APP_PORT=3000),
+  //    avoid EADDRINUSE against Nginx and bind to DEFAULT_APP_PORT (3000).
+  const isProd = env.NODE_ENV === 'production';
+  if (!isProd && env.DEFAULT_APP_PORT) {
+    const defaultAppPort = Number(env.DEFAULT_APP_PORT);
+    const rawPort = Number(env.PORT || 0);
+    const nginxPort = Number(env.NGINX_PORT || 0);
+    if (
+      Number.isFinite(defaultAppPort) &&
+      defaultAppPort > 0 &&
+      (!rawPort || (nginxPort > 0 && rawPort === nginxPort))
+    ) {
+      return defaultAppPort;
+    }
+  }
+
+  const envPort = Number(env.PORT || 3000);
+  return Number.isFinite(envPort) && envPort > 0 ? envPort : 3000;
 }
 
 const DEV_SERVICE_WORKER_JS = `self.addEventListener('install', () => {
@@ -180,6 +771,45 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 });
+
+self.addEventListener('push', (event) => {
+  let payload = {
+    title: 'FaixaSegura — Alerta Operacional',
+    body: 'Nova ocorrência detetada na proximidade dos seus terrenos.',
+    url: '/?autostart=1',
+    tag: 'faixasegura-hazard',
+  };
+  if (event.data) {
+    try {
+      const parsed = event.data.json();
+      if (parsed && typeof parsed === 'object') payload = Object.assign(payload, parsed);
+    } catch {
+      payload.body = event.data.text() || payload.body;
+    }
+  }
+  event.waitUntil(
+    self.registration.showNotification(payload.title, {
+      body: payload.body,
+      icon: '/pwa-192x192.png',
+      badge: '/pwa-192x192.png',
+      tag: payload.tag || 'faixasegura-hazard',
+      data: { url: payload.url || '/?autostart=1' },
+    })
+  );
+});
+
+self.addEventListener('notificationclick', (event) => {
+  event.notification.close();
+  const targetUrl = (event.notification.data && event.notification.data.url) || '/?autostart=1';
+  event.waitUntil(
+    self.clients.matchAll({ type: 'window', includeUncontrolled: true }).then((windowClients) => {
+      for (const client of windowClients) {
+        if ('focus' in client) return client.focus();
+      }
+      if (self.clients.openWindow) return self.clients.openWindow(targetUrl);
+    })
+  );
+});
 `;
 
 async function startServer() {
@@ -188,7 +818,32 @@ async function startServer() {
   app.use(express.json({ limit: '6mb' }));
 
   app.get('/api/health', (_req, res) => {
-    res.json({ status: 'ok', service: 'faixasegura', ts: new Date().toISOString() });
+    const integrations: ServerIntegrationCapabilities = {
+      postgresConfigured: Boolean(process.env.DATABASE_URL?.trim()),
+      postgresConnected: infraBridge.isPostgresConnected(),
+      redisConfigured: Boolean(process.env.REDIS_URL?.trim()),
+      redisConnected: infraBridge.isRedisConnected(),
+      copernicusOAuthConfigured: Boolean(
+        process.env.COPERNICUS_CLIENT_ID?.trim() && process.env.COPERNICUS_CLIENT_SECRET?.trim()
+      ),
+      eredesApiKeyConfigured: Boolean(process.env.EREDES_OPENDATA_API_KEY?.trim()),
+      orthophotoCvMicroserviceConfigured: Boolean(process.env.ORTHOPHOTO_CV_SERVICE_URL?.trim()),
+      ollamaApiKeyConfigured: Boolean(process.env.OLLAMA_API_KEY?.trim()),
+      telegramBotConfigured: Boolean(
+        process.env.TELEGRAM_BOT_TOKEN?.trim() && process.env.TELEGRAM_DEFAULT_CHAT_ID?.trim()
+      ),
+      webPushVapidReady: Boolean(webPushHub.getPublicKey()),
+      vapidEnvConfigured: webPushHub.isEnvConfigured(),
+      emailDispatchConfigured: Boolean(
+        process.env.RESEND_API_KEY?.trim() || process.env.SMTP_WEBHOOK_URL?.trim()
+      ),
+    };
+    res.json({
+      status: 'ok',
+      service: 'faixasegura',
+      ts: new Date().toISOString(),
+      integrations,
+    });
   });
 
   // 1. Snapshot of full application state
@@ -443,7 +1098,10 @@ async function startServer() {
       const ctrl = new AbortController();
       const timer = setTimeout(() => ctrl.abort(), 3500);
       try {
-        const res = await fetch('https://api.apiaberta.pt/v1/anpc/incidents/active', {
+        const apiAbertaUrl =
+          process.env.ANEPC_API_ABERTA_URL?.trim() ||
+          'https://api.apiaberta.pt/v1/anpc/incidents/active';
+        const res = await fetch(apiAbertaUrl, {
           headers: { Accept: 'application/json', 'User-Agent': 'FaixaSegura/1.0' },
           signal: ctrl.signal,
         });
@@ -814,8 +1472,546 @@ async function startServer() {
     });
   });
 
-  // 4. Compute, Save, Update & Delete Custom / Imported Parcel (EPSG:3763)
-  app.post('/api/parcels', (req, res) => {
+  // 4. Phase 1 Spatial Vector Context Ingestion (Live OSM Overpass + Cadastral Fallback) & Parcel CRUD
+  app.post('/api/spatial/vector-context', async (req, res) => {
+    const body = req.body as {
+      parcelId?: string;
+      vertices?: LatLon[];
+      buildingCenter?: LatLon;
+      landClass?: LandClass;
+      hasEredesLine?: boolean;
+      eredesType?: ParcelRecord['eredesType'];
+      hasProtectedOaks?: boolean;
+      existingContext?: ParcelVectorContext;
+      resetUserEdits?: boolean;
+      forceRefresh?: boolean;
+    };
+
+    const existing = body.parcelId
+      ? parcelsStore.find((p) => p.id === body.parcelId)
+      : undefined;
+    const vertices =
+      Array.isArray(body.vertices) && body.vertices.length >= 3
+        ? body.vertices
+        : existing?.vertices;
+
+    if (!vertices || vertices.length < 3) {
+      res.status(400).json({ error: 'Indique pelo menos 3 vértices geográficos para analisar o contexto vetorial.' });
+      return;
+    }
+
+    const landClass: LandClass = body.landClass ?? existing?.landClass ?? 'FOREST_SCRUB';
+    const hasEredesInput =
+      body.hasEredesLine !== undefined
+        ? Boolean(body.hasEredesLine)
+        : (existing?.hasEredesLine ?? false);
+    const eredesTypeInput =
+      body.eredesType ??
+      existing?.eredesType ??
+      (hasEredesInput ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea');
+    const hasProtectedOaks =
+      body.hasProtectedOaks !== undefined
+        ? Boolean(body.hasProtectedOaks)
+        : (existing?.hasProtectedOaks ?? false);
+
+    const preservedContext = body.resetUserEdits
+      ? undefined
+      : (body.existingContext ?? existing?.vectorContext);
+
+    const vectorContext = await fetchLiveParcelVectorContext({
+      vertices,
+      buildingCenter: body.buildingCenter ?? existing?.buildingCenter,
+      hasEredesLine: hasEredesInput,
+      eredesType: eredesTypeInput,
+      hasProtectedOaks,
+      existingContext: preservedContext,
+      forceRefresh: Boolean(body.forceRefresh),
+      timeoutMs: 5200,
+    });
+
+    const detectedPowerEasement = vectorContext.easements.some(
+      (e) => e.category === 'EREDES_MT_AT' || e.category === 'REN_MAT'
+    );
+    const effectiveHasEredes = hasEredesInput || detectedPowerEasement;
+    const effectiveEredesType: ParcelRecord['eredesType'] = effectiveHasEredes
+      ? eredesTypeInput !== 'Sem linha aérea'
+        ? eredesTypeInput
+        : 'MT 15kV (Faixa 7m)'
+      : 'Sem linha aérea';
+
+    const spatial = computeParcelFgc({
+      vertices,
+      buildingCenter: body.buildingCenter ?? existing?.buildingCenter,
+      landClass,
+      hasEredesLine: effectiveHasEredes,
+      eredesType: effectiveEredesType,
+      vectorContext,
+    });
+
+    if (existing) {
+      const idx = parcelsStore.findIndex((p) => p.id === existing.id);
+      if (idx !== -1) {
+        parcelsStore[idx] = {
+          ...parcelsStore[idx],
+          hasEredesLine: effectiveHasEredes,
+          eredesType: effectiveEredesType,
+          vectorContext,
+          spatial,
+        };
+      }
+    }
+
+    res.json({
+      vectorContext,
+      spatial,
+      hasDetectedPowerEasement: detectedPowerEasement,
+      effectiveHasEredes,
+      effectiveEredesType,
+    });
+  });
+
+  // Phase 2A: ONNX Runtime / CV Microservice Tensor & Class Specification Contract
+  app.get('/api/spatial/orthophoto-cv/spec', (_req, res) => {
+    const profile =
+      process.env.ORTHOPHOTO_ONNX_PROFILE?.trim() || 'yolo11s-seg+segformer-b2-dgt25cm';
+    res.json({
+      ...buildOrthophotoInferenceSpec(profile),
+      externalMicroserviceConfigured: Boolean(process.env.ORTHOPHOTO_CV_SERVICE_URL?.trim()),
+    });
+  });
+
+  // Phase 2B: 25 cm Aerial Orthophoto Acquisition + 7-Class Segmentation + Crown & Annex Audit
+  app.post('/api/spatial/orthophoto-cv', async (req, res) => {
+    const body = req.body as {
+      parcelId?: string;
+      vertices?: LatLon[];
+      buildingCenter?: LatLon;
+      landClass?: LandClass;
+      hasEredesLine?: boolean;
+      eredesType?: ParcelRecord['eredesType'];
+      vectorContext?: ParcelVectorContext;
+      fuseIntoBoolean?: boolean;
+      forceRefresh?: boolean;
+    };
+
+    const existing = body.parcelId ? parcelsStore.find((p) => p.id === body.parcelId) : undefined;
+    const vertices =
+      Array.isArray(body.vertices) && body.vertices.length >= 3
+        ? body.vertices
+        : (existing?.vertices ?? []);
+
+    if (vertices.length < 3) {
+      res.status(400).json({ error: 'Indique pelo menos 3 vértices geográficos para analisar a ortofoto.' });
+      return;
+    }
+
+    const landClass = body.landClass ?? existing?.landClass ?? 'FOREST_SCRUB';
+    const hasEredesLine =
+      body.hasEredesLine !== undefined
+        ? Boolean(body.hasEredesLine)
+        : (existing?.hasEredesLine ?? false);
+    const eredesType: ParcelRecord['eredesType'] = hasEredesLine
+      ? (body.eredesType ?? existing?.eredesType ?? 'MT 15kV (Faixa 7m)')
+      : 'Sem linha aérea';
+    let vectorContext = body.vectorContext ?? existing?.vectorContext;
+    if (!vectorContext) {
+      vectorContext = synthesizeDeterministicCadastreContext({
+        parcelVertices: vertices,
+        buildingCenter: body.buildingCenter ?? existing?.buildingCenter,
+        hasEredesLine,
+        eredesType,
+      });
+    }
+
+    let spatial = computeParcelFgc({
+      vertices,
+      buildingCenter: body.buildingCenter ?? existing?.buildingCenter,
+      landClass,
+      hasEredesLine,
+      eredesType,
+      vectorContext,
+    });
+
+    const grid = computeParcelCvRasterGrid(vertices, 28, 224);
+    const cacheKey = `${grid.bboxWgs84.join(',')}:${landClass}:${vectorContext.buildings.length}`;
+    const modelProfile =
+      process.env.ORTHOPHOTO_ONNX_PROFILE?.trim() || 'yolo11s-seg+segformer-b2-dgt25cm';
+
+    let cvAnalysis: ParcelOrthophotoCvAnalysis | null = null;
+    const cachedCv = !body.forceRefresh ? orthophotoCvCache.get(cacheKey) : undefined;
+    if (cachedCv && cachedCv.expiresAt > Date.now() && !body.fuseIntoBoolean) {
+      cvAnalysis = cachedCv.analysis;
+    }
+
+    // Optional external ONNX Runtime / PyTorch FastAPI microservice bridge
+    const externalServiceUrl = process.env.ORTHOPHOTO_CV_SERVICE_URL?.trim();
+    if (!cvAnalysis && externalServiceUrl) {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 5500);
+      const cvHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
+      const cvApiKey = process.env.ORTHOPHOTO_CV_API_KEY?.trim();
+      if (cvApiKey) {
+        cvHeaders.Authorization = `Bearer ${cvApiKey}`;
+      }
+      try {
+        const extResp = await fetch(externalServiceUrl, {
+          method: 'POST',
+          headers: cvHeaders,
+          body: JSON.stringify({
+            specVersion: 'SGIFR-ORTHOPHOTO-ONNX-V2',
+            modelProfile,
+            bboxWgs84: grid.bboxWgs84,
+            width: grid.width,
+            height: grid.height,
+            parcelVertices: vertices,
+            landClass,
+            vectorContext,
+          }),
+          signal: ctrl.signal,
+        });
+        if (extResp.ok) {
+          const extJson = (await extResp.json()) as { cvAnalysis?: ParcelOrthophotoCvAnalysis };
+          if (extJson.cvAnalysis) {
+            cvAnalysis = {
+              ...extJson.cvAnalysis,
+              engineMode: 'ONNX_MICROSERVICE',
+            };
+          }
+        }
+      } catch {
+        // External ONNX microservice unreachable — seamlessly execute built-in pixel CV pipeline
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    if (!cvAnalysis) {
+      const acquired = await acquireParcelOrthophotoRgba({
+        grid,
+        parcelVertices: vertices,
+        landClass,
+        spatial,
+        vectorContext,
+        timeoutMs: 4200,
+      });
+
+      const pipelineOut = runOrthophotoPixelPipeline({
+        rgba: acquired.rgba,
+        grid,
+        parcelVertices: vertices,
+        landClass,
+        spatial,
+        vectorContext,
+        imagerySourceLabel: acquired.sourceLabel,
+        engineMode: acquired.engineMode,
+        modelProfile,
+      });
+
+      const pngOut = new PNG({ width: grid.width, height: grid.height });
+      pngOut.data = Buffer.from(
+        pipelineOut.overlayRgba.buffer,
+        pipelineOut.overlayRgba.byteOffset,
+        pipelineOut.overlayRgba.byteLength
+      );
+      const encodedPng = PNG.sync.write(pngOut);
+      cvAnalysis = {
+        ...pipelineOut.analysis,
+        overlayDataUrl: `data:image/png;base64,${encodedPng.toString('base64')}`,
+      };
+
+      orthophotoCvCache.set(cacheKey, {
+        expiresAt: Date.now() + 10 * 60_000,
+        analysis: cvAnalysis,
+      });
+    }
+
+    let addedBuildingsCount = 0;
+    if (body.fuseIntoBoolean) {
+      const fused = fuseCvDetectionsIntoVectorContext({
+        existingContext: vectorContext,
+        cvAnalysis,
+        parcelVertices: vertices,
+      });
+      vectorContext = fused.vectorContext;
+      addedBuildingsCount = fused.addedBuildingsCount;
+      spatial = computeParcelFgc({
+        vertices,
+        buildingCenter: body.buildingCenter ?? existing?.buildingCenter,
+        landClass,
+        hasEredesLine,
+        eredesType,
+        vectorContext,
+      });
+      cvAnalysis = {
+        ...cvAnalysis,
+        fusedIntoVectorContext: true,
+      };
+    }
+
+    if (existing) {
+      const idx = parcelsStore.findIndex((p) => p.id === existing.id);
+      if (idx !== -1) {
+        parcelsStore[idx] = {
+          ...parcelsStore[idx],
+          vectorContext,
+          cvAnalysis,
+          spatial,
+        };
+      }
+    }
+
+    res.json({
+      cvAnalysis,
+      vectorContext,
+      spatial,
+      addedBuildingsCount,
+    });
+  });
+
+  // Official DGT / BUPi Cadastre OGC API Features Lookup around map target point
+  app.post('/api/spatial/official-cadastre', async (req, res) => {
+    const body = req.body as {
+      targetPoint?: LatLon;
+      searchHalfSpanM?: number;
+    };
+    const pt = body.targetPoint;
+    if (!pt || !Number.isFinite(pt.lat) || !Number.isFinite(pt.lon)) {
+      res.status(400).json({ error: 'Indique coordenadas válidas (lat/lon) para consultar o cadastro oficial DGT.' });
+      return;
+    }
+
+    const url = buildDgtCadastreOgcUrl({
+      baseUrl: process.env.DGT_CADASTRE_OGC_URL,
+      targetPoint: pt,
+      searchHalfSpanM: body.searchHalfSpanM ?? 140,
+      limit: 15,
+    });
+
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 5200);
+    try {
+      const resp = await fetch(url, {
+        headers: { Accept: 'application/geo+json,application/json', 'User-Agent': 'FaixaSegura-SGIFR/2.0' },
+        signal: ctrl.signal,
+      });
+      if (resp.ok) {
+        const rawJson = await resp.json();
+        const match = parseDgtCadastreFeatures(rawJson, pt);
+        if (match) {
+          res.json({ found: true, match });
+          return;
+        }
+      }
+      res.json({
+        found: false,
+        match: null,
+        fallbackNotePt:
+          'Sem geometria aberta publicada pela DGT/BUPi neste ponto exato (concelho fora do Cadastro Predial aberto ou RGG reservado). Desenhe o polígono ou cole a Caderneta Predial.',
+      });
+    } catch {
+      res.json({
+        found: false,
+        match: null,
+        fallbackNotePt:
+          'Serviço OGC da DGT temporariamente indisponível — utilize Desenhar Lote ou importação de Caderneta AT.',
+      });
+    } finally {
+      clearTimeout(timer);
+    }
+  });
+
+  // Real Digital Elevation Model (DEM / MDT) Topographic Slope Calculation in EPSG:3763
+  app.post('/api/spatial/elevation-slope', async (req, res) => {
+    const body = req.body as {
+      parcelId?: string;
+      vertices?: LatLon[];
+    };
+    const existing = body.parcelId ? parcelsStore.find((p) => p.id === body.parcelId) : undefined;
+    const vertices =
+      Array.isArray(body.vertices) && body.vertices.length >= 3
+        ? body.vertices
+        : (existing?.vertices ?? []);
+
+    if (vertices.length < 3) {
+      res.status(400).json({ error: 'Indique pelo menos 3 vértices para calcular o declive altimétrico MDT.' });
+      return;
+    }
+
+    const slopeData = await fetchRealParcelTerrainSlope({
+      vertices,
+      centroid: existing?.spatial.centroidWgs84,
+      timeoutMs: 4200,
+    });
+
+    const resolvedSlope = slopeData?.avgSlopePct ?? existing?.avgSlopePct ?? 12.5;
+    const resolvedMeta: NonNullable<ParcelRecord['elevationMeta']> =
+      slopeData?.elevationMeta ?? {
+        minElevationM: 112,
+        maxElevationM: 126,
+        reliefM: 14,
+        aspectLabelPt: 'Exposição Sudoeste',
+        sourceLabel: 'Modelo Altimétrico Regional EPSG:3763 (Contingência Local)',
+        sampledPointsCount: vertices.length,
+      };
+
+    if (existing) {
+      const idx = parcelsStore.findIndex((p) => p.id === existing.id);
+      if (idx !== -1) {
+        parcelsStore[idx] = {
+          ...parcelsStore[idx],
+          avgSlopePct: resolvedSlope,
+          elevationMeta: resolvedMeta,
+        };
+        void infraBridge.persistParcelPostgis(parcelsStore[idx]);
+      }
+    }
+
+    res.json({
+      avgSlopePct: resolvedSlope,
+      elevationMeta: resolvedMeta,
+    });
+  });
+
+  // Copernicus Data Space Sentinel-2 L2A (10 m NDVI & NDMI) Live Refresh
+  app.post('/api/satellite/sentinel2', async (req, res) => {
+    const body = req.body as {
+      parcelId?: string;
+      vertices?: LatLon[];
+      centroid?: LatLon;
+      landClass?: LandClass;
+      existingHistory?: SatelliteObservation[];
+      forceRefresh?: boolean;
+    };
+
+    const existing = body.parcelId ? parcelsStore.find((p) => p.id === body.parcelId) : undefined;
+    const vertices =
+      Array.isArray(body.vertices) && body.vertices.length >= 3
+        ? body.vertices
+        : (existing?.vertices ?? []);
+    const centroid =
+      body.centroid ??
+      existing?.spatial.centroidWgs84 ??
+      (vertices.length > 0
+        ? {
+            lat: vertices.reduce((s, v) => s + v.lat, 0) / vertices.length,
+            lon: vertices.reduce((s, v) => s + v.lon, 0) / vertices.length,
+          }
+        : { lat: 38.7984, lon: -9.4621 });
+    const landClass = body.landClass ?? existing?.landClass ?? 'FOREST_SCRUB';
+
+    const result = await fetchCopernicusSentinel2Observations({
+      vertices,
+      centroid,
+      landClass,
+      existingHistory: body.existingHistory ?? existing?.ndviHistory,
+      forceRefresh: Boolean(body.forceRefresh),
+    });
+
+    if (existing) {
+      const idx = parcelsStore.findIndex((p) => p.id === existing.id);
+      if (idx !== -1) {
+        parcelsStore[idx] = {
+          ...parcelsStore[idx],
+          ndviHistory: result.observations,
+          satelliteSourceLabel: result.sourceLabel,
+        };
+        void infraBridge.persistParcelPostgis(parcelsStore[idx]);
+      }
+    }
+
+    res.json(result);
+  });
+
+  // External 24/7 Notifications: Web Push VAPID (RFC 8291), Telegram Bot API & Transactional Email
+  app.get('/api/notifications/webpush/vapid-public-key', (_req, res) => {
+    res.json({
+      publicKey: webPushHub.getPublicKey(),
+      vapidEnvConfigured: webPushHub.isEnvConfigured(),
+      activeSubscriptionsCount: webPushHub.getSubscriptionCount(),
+    });
+  });
+
+  app.post('/api/notifications/webpush/subscribe', (req, res) => {
+    const subscription = req.body?.subscription as PushSubscription | undefined;
+    if (!subscription?.endpoint) {
+      res.status(400).json({ error: 'Subscrição PushManager inválida.' });
+      return;
+    }
+    const outcome = webPushHub.registerSubscription(subscription);
+    res.json({
+      ok: outcome.ok,
+      activeSubscriptionsCount: outcome.count,
+    });
+  });
+
+  app.post('/api/notifications/dispatch', async (req, res) => {
+    const body = req.body as {
+      parcelId?: string;
+      headline?: string;
+      detail?: string;
+      chatId?: string;
+      recipientEmail?: string;
+    };
+    const parcel =
+      (body.parcelId ? parcelsStore.find((p) => p.id === body.parcelId) : undefined) ??
+      parcelsStore[0];
+    const headline =
+      body.headline?.trim() ||
+      `Vigilância preventiva ativa para ${parcel.label} (${parcel.municipality})`;
+    const detail =
+      body.detail?.trim() ||
+      `Faixa exigível ${parcel.spatial.mandatoryCleanAreaM2.toFixed(0)} m² · Declive ${parcel.avgSlopePct}% · NDVI ${(parcel.ndviHistory[parcel.ndviHistory.length - 1]?.ndvi ?? 0.62).toFixed(2)}.`;
+    const appUrl = `${(process.env.APP_URL || 'http://localhost:3000').replace(/\/$/, '')}/?parcel=${encodeURIComponent(parcel.id)}`;
+
+    const telegramText = formatTelegramHazardAlertPt({
+      parcelLabel: parcel.label,
+      municipality: parcel.municipality,
+      headline,
+      detail,
+      appUrl,
+    });
+
+    const receipts: ExternalChannelReceipt[] = await Promise.all([
+      webPushHub.broadcastPush({
+        title: `FaixaSegura · ${parcel.label}`,
+        body: `${headline} — ${detail}`,
+        url: `/?parcel=${encodeURIComponent(parcel.id)}&autostart=1`,
+        tag: `faixasegura-${parcel.id}`,
+      }),
+      dispatchTelegramAlert({
+        botToken: process.env.TELEGRAM_BOT_TOKEN,
+        chatId: body.chatId || process.env.TELEGRAM_DEFAULT_CHAT_ID,
+        text: telegramText,
+      }),
+      ...(body.recipientEmail?.trim()
+        ? [
+            dispatchTransactionalEmailOrWebhook({
+              resendApiKey: process.env.RESEND_API_KEY,
+              fromEmail: process.env.RESEND_FROM_EMAIL,
+              smtpWebhookUrl: process.env.SMTP_WEBHOOK_URL,
+              toEmails: [body.recipientEmail.trim()],
+              subject: `[FaixaSegura] Alerta de Terreno — ${parcel.label}`,
+              textBody: `${headline}\n${detail}\n\nAbrir Raio-X: ${appUrl}`,
+            }),
+          ]
+        : []),
+    ]);
+
+    const deliveredChannels = receipts.filter((r) => r.delivered).length;
+    const summaryPt =
+      deliveredChannels > 0
+        ? `Alerta expedido com sucesso em ${deliveredChannels}/${receipts.length} canal(is) externo(s).`
+        : receipts.map((r) => `${r.channel}: ${r.detailPt}`).join(' · ');
+
+    res.json({
+      parcelId: parcel.id,
+      deliveredChannels,
+      receipts,
+      summaryPt,
+    });
+  });
+
+  app.post('/api/parcels', async (req, res) => {
     const body = req.body as Partial<ParcelRecord> & { dico?: string };
     if (!body.label || !Array.isArray(body.vertices) || body.vertices.length < 3) {
       res.status(400).json({ error: 'Indique uma designação e pelo menos 3 vértices geográficos para o lote.' });
@@ -824,13 +2020,12 @@ async function startServer() {
 
     const muni = MUNICIPALITIES.find((m) => m.dico === body.dico) ?? MUNICIPALITIES[0];
     const landClass = body.landClass ?? 'FOREST_SCRUB';
-    const hasEredesLine = Boolean(body.hasEredesLine);
-    const spatial = computeParcelFgc({
-      vertices: body.vertices,
-      landClass,
-      hasEredesLine,
-      neighborDistanceOverrideM: 4.6,
-    });
+    const hasEredesInput = Boolean(body.hasEredesLine);
+    const eredesTypeInput: ParcelRecord['eredesType'] = hasEredesInput
+      ? body.eredesType && body.eredesType !== 'Sem linha aérea'
+        ? body.eredesType
+        : 'MT 15kV (Faixa 7m)'
+      : 'Sem linha aérea';
 
     const requestedId =
       typeof body.id === 'string' && /^[a-zA-Z0-9_-]{2,128}$/.test(body.id)
@@ -838,10 +2033,53 @@ async function startServer() {
         : `parcel-${Date.now()}`;
 
     const existingMatch = parcelsStore.find((p) => p.id === requestedId);
+    const vectorContext =
+      body.vectorContext ??
+      (await fetchLiveParcelVectorContext({
+        vertices: body.vertices,
+        buildingCenter: body.buildingCenter ?? existingMatch?.buildingCenter,
+        hasEredesLine: hasEredesInput,
+        eredesType: eredesTypeInput,
+        hasProtectedOaks: Boolean(body.hasProtectedOaks),
+        timeoutMs: 3200,
+      }));
+
+    const detectedPower = vectorContext.easements.some(
+      (e) => e.category === 'EREDES_MT_AT' || e.category === 'REN_MAT'
+    );
+    const hasEredesLine = hasEredesInput || detectedPower;
+    const eredesType: ParcelRecord['eredesType'] = hasEredesLine
+      ? eredesTypeInput !== 'Sem linha aérea'
+        ? eredesTypeInput
+        : 'MT 15kV (Faixa 7m)'
+      : 'Sem linha aérea';
+
+    const spatial = computeParcelFgc({
+      vertices: body.vertices,
+      buildingCenter: body.buildingCenter ?? existingMatch?.buildingCenter,
+      landClass,
+      hasEredesLine,
+      eredesType,
+      vectorContext,
+    });
+
     const cleanUserNotes =
       typeof body.userNotes === 'string'
         ? body.userNotes.trim().slice(0, 2000)
         : (existingMatch?.userNotes ?? '');
+
+    let computedSlopePct =
+      body.avgSlopePct !== undefined ? Number(body.avgSlopePct) : existingMatch?.avgSlopePct;
+    let resolvedElevationMeta = body.elevationMeta ?? existingMatch?.elevationMeta;
+    if (computedSlopePct === undefined || Number.isNaN(computedSlopePct)) {
+      const liveSlope = await fetchRealParcelTerrainSlope({
+        vertices: body.vertices,
+        centroid: spatial.centroidWgs84,
+        timeoutMs: 2800,
+      });
+      computedSlopePct = liveSlope?.avgSlopePct ?? 12.5;
+      resolvedElevationMeta = liveSlope?.elevationMeta ?? resolvedElevationMeta;
+    }
 
     const newParcel: ParcelRecord = {
       id: requestedId,
@@ -854,7 +2092,8 @@ async function startServer() {
       matrixArticle: body.matrixArticle?.trim() || 'Rústico — Art.º 204, Secção D',
       bupiRggId: body.bupiRggId?.trim() || `RGG-${Math.floor(100000 + Math.random() * 899999)}`,
       landClass,
-      avgSlopePct: Number(body.avgSlopePct ?? 12.5),
+      avgSlopePct: computedSlopePct,
+      elevationMeta: resolvedElevationMeta,
       hasPavedAccess: true,
       roadFrontageM: 24,
       hazardLevel: 4,
@@ -865,15 +2104,19 @@ async function startServer() {
         : 'Sem quercíneas protegidas assinaladas no polígono.',
       userNotes: cleanUserNotes,
       vertices: body.vertices,
-      buildingCenter: spatial.centroidWgs84,
+      buildingCenter: body.buildingCenter ?? existingMatch?.buildingCenter ?? spatial.centroidWgs84,
       hasEredesLine,
-      eredesType: hasEredesLine ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea',
-      ndviHistory: existingMatch?.ndviHistory ?? [
-        { date: '2026-03-15', ndvi: 0.43, ndmi: 0.28, cloudCoverPct: 7 },
-        { date: '2026-04-02', ndvi: 0.51, ndmi: 0.23, cloudCoverPct: 10 },
-        { date: '2026-04-18', ndvi: 0.57, ndmi: 0.19, cloudCoverPct: 6 },
-        { date: '2026-05-04', ndvi: 0.63, ndmi: 0.15, cloudCoverPct: 8 },
-      ],
+      eredesType,
+      ndviHistory:
+        Array.isArray(body.ndviHistory) && body.ndviHistory.length > 0
+          ? body.ndviHistory
+          : existingMatch?.ndviHistory ?? [
+              { date: '2026-03-15', ndvi: 0.43, ndmi: 0.28, cloudCoverPct: 7 },
+              { date: '2026-04-02', ndvi: 0.51, ndmi: 0.23, cloudCoverPct: 10 },
+              { date: '2026-04-18', ndvi: 0.57, ndmi: 0.19, cloudCoverPct: 6 },
+              { date: '2026-05-04', ndvi: 0.63, ndmi: 0.15, cloudCoverPct: 8 },
+            ],
+      satelliteSourceLabel: body.satelliteSourceLabel ?? existingMatch?.satelliteSourceLabel,
       neighborInfo: existingMatch?.neighborInfo ?? {
         bupiRef: 'Confrontação Poente (Titular a apurar pela Câmara)',
         vegetationDescription: 'Mato contínuo e silvado junto à estrema poente',
@@ -881,8 +2124,12 @@ async function startServer() {
         dominantSpecies: 'Pinheiro-bravo, Eucalipto e Silvado',
         ndvi: 0.71,
       },
+      vectorContext,
+      cvAnalysis: body.cvAnalysis ?? existingMatch?.cvAnalysis,
       spatial,
     };
+
+    void infraBridge.persistParcelPostgis(newParcel);
 
     const existingIdx = parcelsStore.findIndex((p) => p.id === requestedId);
     if (existingIdx !== -1) {
@@ -895,7 +2142,7 @@ async function startServer() {
     res.status(201).json(newParcel);
   });
 
-  app.put('/api/parcels/:id', (req, res) => {
+  app.put('/api/parcels/:id', async (req, res) => {
     const targetId = req.params.id;
     const idx = parcelsStore.findIndex((p) => p.id === targetId);
     if (idx === -1) {
@@ -909,17 +2156,37 @@ async function startServer() {
       Array.isArray(body.vertices) && body.vertices.length >= 3
         ? body.vertices
         : existing.vertices;
+    const verticesChanged = vertices !== existing.vertices;
     const landClass = body.landClass ?? existing.landClass;
     const hasEredesLine =
       body.hasEredesLine !== undefined ? Boolean(body.hasEredesLine) : existing.hasEredesLine;
+    const eredesType: ParcelRecord['eredesType'] = hasEredesLine
+      ? existing.eredesType !== 'Sem linha aérea'
+        ? existing.eredesType
+        : 'MT 15kV (Faixa 7m)'
+      : 'Sem linha aérea';
     const hasProtectedOaks =
       body.hasProtectedOaks !== undefined ? Boolean(body.hasProtectedOaks) : existing.hasProtectedOaks;
 
+    const vectorContext =
+      body.vectorContext ??
+      (verticesChanged
+        ? await fetchLiveParcelVectorContext({
+            vertices,
+            hasEredesLine,
+            eredesType,
+            hasProtectedOaks,
+            timeoutMs: 3200,
+          })
+        : existing.vectorContext);
+
     const spatial = computeParcelFgc({
       vertices,
+      buildingCenter: verticesChanged ? undefined : existing.buildingCenter,
       landClass,
       hasEredesLine,
-      neighborDistanceOverrideM: existing.spatial.neighborMinDistanceM,
+      eredesType,
+      vectorContext,
     });
 
     const updated: ParcelRecord = {
@@ -935,7 +2202,7 @@ async function startServer() {
       landClass,
       avgSlopePct: body.avgSlopePct !== undefined ? Number(body.avgSlopePct) : existing.avgSlopePct,
       hasEredesLine,
-      eredesType: hasEredesLine ? 'MT 15kV (Faixa 7m)' : 'Sem linha aérea',
+      eredesType,
       hasProtectedOaks,
       protectedOakNotes: hasProtectedOaks
         ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
@@ -945,11 +2212,16 @@ async function startServer() {
           ? body.userNotes.trim().slice(0, 2000)
           : (existing.userNotes ?? ''),
       vertices,
-      buildingCenter: spatial.centroidWgs84,
+      buildingCenter: verticesChanged ? spatial.centroidWgs84 : existing.buildingCenter,
+      vectorContext,
+      cvAnalysis: body.cvAnalysis ?? (verticesChanged ? undefined : existing.cvAnalysis),
+      elevationMeta: body.elevationMeta ?? existing.elevationMeta,
+      satelliteSourceLabel: body.satelliteSourceLabel ?? existing.satelliteSourceLabel,
       spatial,
     };
 
     parcelsStore[idx] = updated;
+    void infraBridge.persistParcelPostgis(updated);
     res.json(updated);
   });
 
@@ -1045,6 +2317,7 @@ async function startServer() {
     };
 
     certificatesStore.unshift(cert);
+    void infraBridge.persistCertificate(cert);
     res.status(201).json(cert);
   });
 
@@ -1220,7 +2493,7 @@ async function startServer() {
   });
 
   // 8. Marketplace Quotes & B2B Forestry Providers (/prestadores)
-  app.post('/api/quotes', (req, res) => {
+  app.post('/api/quotes', async (req, res) => {
     const { parcelId, ownerName, ownerPhone, preferredWindow, includeDebrisRemoval } = req.body as {
       parcelId?: string;
       ownerName?: string;
@@ -1242,6 +2515,31 @@ async function startServer() {
     const highEst = Math.round(lowEst * 1.38);
 
     const matchingProviders = providersStore.filter((pr) => pr.coveredDicos.includes(parcel.dico));
+    const providerEmails = matchingProviders.map((pr) => pr.email).filter(Boolean);
+
+    const emailReceipt = await dispatchTransactionalEmailOrWebhook({
+      resendApiKey: process.env.RESEND_API_KEY,
+      fromEmail: process.env.RESEND_FROM_EMAIL,
+      smtpWebhookUrl: process.env.SMTP_WEBHOOK_URL,
+      toEmails: providerEmails.length > 0 ? providerEmails : ['bolsa@faixasegura.pt'],
+      subject: `[FaixaSegura Parceiros] Novo Pedido de Limpeza — ${parcel.municipality} (${cleanM2.toFixed(0)} m²)`,
+      textBody:
+        `Terreno: ${parcel.label} (${parcel.municipality} · ${parcel.parish})\n` +
+        `Área obrigatória (Z1+Z2+Z3): ${cleanM2.toFixed(0)} m² · Declive MDT: ${parcel.avgSlopePct}%\n` +
+        `Janela pretendida: ${preferredWindow || 'Próximos 15 dias'}\n` +
+        `Estimativa orientativa: ${lowEst} € – ${highEst} €`,
+    });
+
+    if (process.env.TELEGRAM_BOT_TOKEN?.trim() && process.env.TELEGRAM_DEFAULT_CHAT_ID?.trim()) {
+      void dispatchTelegramAlert({
+        botToken: process.env.TELEGRAM_BOT_TOKEN,
+        chatId: process.env.TELEGRAM_DEFAULT_CHAT_ID,
+        text:
+          `🌲 *Novo Pedido na Bolsa FaixaSegura (${process.env.TELEGRAM_PARTNERS_BOT_HANDLE || '@FaixaSeguraParceirosBot'})*\n` +
+          `Concelho: *${parcel.municipality}* · Área: *${cleanM2.toFixed(0)} m²* · Declive: *${parcel.avgSlopePct}%*\n` +
+          `Intervalo: ${lowEst} € – ${highEst} € (${preferredWindow || 'Próximos 15 dias'})`,
+      });
+    }
 
     const newLead: QuoteLead = {
       id: `lead-${Date.now()}`,
@@ -1265,9 +2563,11 @@ async function startServer() {
       unlockedByProviderIds: [],
       status: 'OPEN',
       createdAt: new Date().toISOString(),
+      dispatchReceiptPt: emailReceipt.detailPt,
     };
 
     quotesStore.unshift(newLead);
+    void infraBridge.persistQuoteLead(newLead);
     res.status(201).json(newLead);
   });
 
@@ -1357,8 +2657,16 @@ async function startServer() {
     let viteInitError: unknown = null;
 
     // Bind port 3000 immediately so reverse-proxy readiness probes never hit 502 during cold boot
-    await new Promise<void>((resolve) => {
+    await new Promise<void>((resolve, reject) => {
+      const onListenError = (err: NodeJS.ErrnoException) => {
+        console.error(
+          `[FaixaSegura] Falha ao abrir porta ${PORT} (${err.code ?? 'ERR'}): verifique conflitos de PORT no .env.`
+        );
+        reject(err);
+      };
+      httpServer.once('error', onListenError);
       httpServer.listen(PORT, '0.0.0.0', () => {
+        httpServer.removeListener('error', onListenError);
         console.log(`FaixaSegura server listening on http://0.0.0.0:${PORT}`);
         resolve();
       });
@@ -1369,9 +2677,12 @@ async function startServer() {
       server: {
         middlewareMode: true,
         allowedHosts: true,
-        ws: {
-          server: httpServer,
-        },
+        hmr:
+          process.env.DISABLE_HMR === 'true'
+            ? false
+            : {
+                server: httpServer,
+              },
       },
       appType: 'spa',
     })

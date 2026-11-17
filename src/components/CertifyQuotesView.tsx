@@ -1090,6 +1090,14 @@ export const CertifyQuotesView: React.FC<CertifyQuotesViewProps> = ({
                 <p className="text-slate-700 dark:text-slate-300 tabular-nums">
                   Intervalo orientativo de mercado: <strong>{createdQuote.estimatedBudgetRange}</strong> · Já visível no portal <strong>Prestadores</strong>.
                 </p>
+                {createdQuote.dispatchReceiptPt && (
+                  <p
+                    data-testid="quote-dispatch-receipt"
+                    className="text-slate-600 dark:text-slate-400"
+                  >
+                    {createdQuote.dispatchReceiptPt}
+                  </p>
+                )}
               </div>
             )}
           </form>

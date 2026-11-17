@@ -5,6 +5,7 @@ import type {
   ParcelDocumentCategory,
   ParcelDocumentRecord,
   ParcelRecord,
+  ParcelVectorContext,
   ProximityRadiusKm,
   UserAppSettings,
 } from '../types/domain.ts';
@@ -14,6 +15,7 @@ import {
   resolveMergedMunicipalityCatalog,
 } from '../data/portugalAdminCatalog.ts';
 import { computeParcelFgc } from './spatialEngine.ts';
+import { synthesizeDeterministicCadastreContext } from './vectorContextIngestor.ts';
 
 export interface KeyValueStorageLike {
   getItem(key: string): string | null;
@@ -253,7 +255,10 @@ export function validateParcelMutationInput(input: {
  */
 export function applyParcelUpdate(
   existing: ParcelRecord,
-  patch: Partial<ParcelMutationInput> & { recenterVerticesOnMunicipalityChange?: boolean },
+  patch: Partial<ParcelMutationInput> & {
+    recenterVerticesOnMunicipalityChange?: boolean;
+    vectorContext?: ParcelVectorContext;
+  },
   municipalities: MunicipalityInfo[] = MUNICIPALITIES
 ): ParcelRecord {
   const catalog = resolveMergedMunicipalityCatalog(municipalities);
@@ -271,6 +276,11 @@ export function applyParcelUpdate(
   const nextLandClass: LandClass = patch.landClass ?? existing.landClass;
   const nextHasEredes =
     patch.hasEredesLine !== undefined ? Boolean(patch.hasEredesLine) : existing.hasEredesLine;
+  const nextEredesType: ParcelRecord['eredesType'] = nextHasEredes
+    ? existing.eredesType !== 'Sem linha aérea'
+      ? existing.eredesType
+      : 'MT 15kV (Faixa 7m)'
+    : 'Sem linha aérea';
   const nextHasOaks =
     patch.hasProtectedOaks !== undefined ? Boolean(patch.hasProtectedOaks) : existing.hasProtectedOaks;
 
@@ -279,17 +289,34 @@ export function applyParcelUpdate(
       ? Math.max(0, Math.min(100, Number(Number(patch.avgSlopePct).toFixed(1)) || 0))
       : existing.avgSlopePct;
 
+  const verticesChanged = nextVertices !== existing.vertices;
+  const nextVectorContext: ParcelVectorContext | undefined =
+    patch.vectorContext !== undefined
+      ? patch.vectorContext
+      : verticesChanged
+        ? synthesizeDeterministicCadastreContext({
+            parcelVertices: nextVertices,
+            hasEredesLine: nextHasEredes,
+            eredesType: nextEredesType,
+            hasProtectedOaks: nextHasOaks,
+          })
+        : existing.vectorContext;
+
   const spatialNeedsRecompute =
     nextLandClass !== existing.landClass ||
     nextHasEredes !== existing.hasEredesLine ||
-    nextVertices !== existing.vertices;
+    verticesChanged ||
+    patch.vectorContext !== undefined;
 
   const nextSpatial = spatialNeedsRecompute
     ? computeParcelFgc({
         vertices: nextVertices,
+        buildingCenter: verticesChanged ? undefined : existing.buildingCenter,
         landClass: nextLandClass,
         hasEredesLine: nextHasEredes,
+        eredesType: nextEredesType,
         neighborDistanceOverrideM: existing.spatial.neighborMinDistanceM,
+        vectorContext: nextVectorContext,
       })
     : existing.spatial;
 
@@ -339,18 +366,15 @@ export function applyParcelUpdate(
     landClass: nextLandClass,
     avgSlopePct: nextSlope,
     hasEredesLine: nextHasEredes,
-    eredesType: nextHasEredes
-      ? existing.eredesType !== 'Sem linha aérea'
-        ? existing.eredesType
-        : 'MT 15kV (Faixa 7m)'
-      : 'Sem linha aérea',
+    eredesType: nextEredesType,
     hasProtectedOaks: nextHasOaks,
     protectedOakNotes: nextHasOaks
       ? 'Exemplares de Sobreiro/Azinheira assinalados — corte interdito sem autorização ICNF (DL 169/2001).'
       : 'Sem quercíneas protegidas assinaladas no polígono.',
     userNotes: nextUserNotes,
     vertices: nextVertices,
-    buildingCenter: nextSpatial.centroidWgs84,
+    buildingCenter: verticesChanged ? nextSpatial.centroidWgs84 : existing.buildingCenter,
+    vectorContext: nextVectorContext,
     spatial: nextSpatial,
   };
 }

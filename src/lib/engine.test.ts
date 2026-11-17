@@ -7,12 +7,30 @@ import {
   buildMunicipalGtfKml,
   haversineDistanceKm,
 } from './spatialEngine.ts';
+import { readFileSync as readEnvFileSync } from 'node:fs';
 import {
   evaluateOperationalSemaphore,
   buildCanonicalCertificatePayload,
   computeSha256Hex,
   answerLegalFieldQuestion,
 } from './pirRules.ts';
+import {
+  buildCopernicusStatsRequestBody,
+  parseCopernicusStatsResponse,
+  parseCopernicusOpenCatalogScenes,
+  parseEredesOpenDataLines,
+  mergeEredesEasementsIntoVectorContext,
+  parseDgtCadastreFeatures,
+  buildParcelElevationSampleGrid,
+  parseElevationApiResponse,
+  computeTerrainSlopeFromElevations,
+} from './externalGeoConnectors.ts';
+import {
+  ServerInfraBridge,
+  WebPushNotificationHub,
+  dispatchTelegramAlert,
+  dispatchTransactionalEmailOrWebhook,
+} from './serverInfraAndNotifications.ts';
 
 test('PT-TM06 (EPSG:3763) origin projects to (0, 0) meters', () => {
   const origin = wgs84ToPtTm06({ lat: 39.668258333333334, lon: -8.133108333333334 });
@@ -995,15 +1013,22 @@ test('OfflineTileCacheManager enumerates Web Mercator XYZ tiles, pre-downloads O
   assert.ok(tile18.x > 120000 && tile18.x < 130000, `Expected Portuguese Z18 X tile, got ${tile18.x}`);
   assert.ok(tile18.y > 95000 && tile18.y < 105000, `Expected Portuguese Z18 Y tile, got ${tile18.y}`);
 
-  const orthoUrl = buildTileUrl('ORTHOPHOTO', 18, tile18.x, tile18.y);
-  const vectorUrl = buildTileUrl('VECTOR', 18, tile18.x, tile18.y);
+  const orthoUrl = buildTileUrl('ORTHOPHOTO', 18, tile18.x, tile18.y, {});
+  const vectorUrl = buildTileUrl('VECTOR', 18, tile18.x, tile18.y, {});
+  const cartoKeyUrl = buildTileUrl('VECTOR', 18, tile18.x, tile18.y, {
+    VITE_CARTO_API_KEY: 'demo_carto_key_123',
+  });
   assert.ok(
-    orthoUrl.endsWith(`/tile/18/${tile18.y}/${tile18.x}`),
-    'Esri World Imagery must format URL as /tile/{z}/{y}/{x}'
+    orthoUrl.endsWith(`/World_Imagery/MapServer/tile/18/${tile18.y}/${tile18.x}`),
+    'Esri World Imagery must format URL as /World_Imagery/MapServer/tile/{z}/{y}/{x}'
   );
   assert.ok(
-    vectorUrl.endsWith(`/light_all/18/${tile18.x}/${tile18.y}.png`),
-    'CARTO Vector must format URL as /light_all/{z}/{x}/{y}.png'
+    vectorUrl.endsWith(`/World_Topo_Map/MapServer/tile/18/${tile18.y}/${tile18.x}`),
+    'Default Vector/Topographic basemap must use watermark-free World_Topo_Map /tile/{z}/{y}/{x}'
+  );
+  assert.ok(
+    cartoKeyUrl.includes(`/light_all/18/${tile18.x}/${tile18.y}.png?key=demo_carto_key_123`),
+    'Optional VITE_CARTO_API_KEY must enable authenticated CARTO Positron tiles'
   );
 
   const enumerated = enumerateParcelSnapshotTiles(bounds, {
@@ -2313,3 +2338,781 @@ test('officialAlertsIngestor parses chunked ANEPC SADO SSE streams, classifies P
   assert.ok(valongoDistrictAlert, 'Valongo parcel in Porto district must receive PTO IPMA land warning');
   assert.equal(valongoDistrictAlert.urgency, 'WARNING');
 });
+
+test('Phase 1 Boolean EPSG:3763 engine conserves concave L-shaped parcel area, isolates neighbor-induced obligations, parses Overpass ways/poles, and exports MultiPolygon GeoJSON', async () => {
+  const {
+    projectWgs84ToPtTm06Exact,
+    ptTm06ToWgs84,
+    computeBooleanParcelDecomposition,
+  } = await import('./booleanSpatialEngine.ts');
+  const {
+    parseOverpassVectorContext,
+    buildOverpassParcelContextQuery,
+  } = await import('./vectorContextIngestor.ts');
+  const {
+    buildParcelLegalDecompositionGeoJson,
+    buildParcelLegalGeoJsonFilename,
+  } = await import('./spatialEngine.ts');
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+
+  // 1. Exact PT-TM06 forward <-> inverse round-trip (< 1e-5 deg error across Portugal)
+  const testLocations = [
+    { lat: 38.79836, lon: -9.46224 }, // Sintra
+    { lat: 39.74376, lon: -8.80724 }, // Leiria
+    { lat: 41.18612, lon: -8.50008 }, // Valongo
+  ];
+  for (const loc of testLocations) {
+    const xy = projectWgs84ToPtTm06Exact(loc);
+    const inv = ptTm06ToWgs84(xy);
+    assert.ok(Math.abs(inv.lat - loc.lat) < 1e-5, `Lat drift too large for ${loc.lat}: ${inv.lat}`);
+    assert.ok(Math.abs(inv.lon - loc.lon) < 1e-5, `Lon drift too large for ${loc.lon}: ${inv.lon}`);
+  }
+
+  // 2. Concave L-shaped parcel (100m x 100m minus 50m x 50m NE quadrant = 7500 m² exact in EPSG:3763)
+  const originX = -95000;
+  const originY = -82000;
+  const lShapeVertices = [
+    ptTm06ToWgs84([originX, originY]),
+    ptTm06ToWgs84([originX + 100, originY]),
+    ptTm06ToWgs84([originX + 100, originY + 50]),
+    ptTm06ToWgs84([originX + 50, originY + 50]),
+    ptTm06ToWgs84([originX + 50, originY + 100]),
+    ptTm06ToWgs84([originX, originY + 100]),
+  ];
+
+  // Own dwelling inside SW wing; external neighbor house 14 m outside East wing; overhead E-REDES + road + riparian stream
+  const ownHouse = [
+    ptTm06ToWgs84([originX + 15, originY + 15]),
+    ptTm06ToWgs84([originX + 25, originY + 15]),
+    ptTm06ToWgs84([originX + 25, originY + 25]),
+    ptTm06ToWgs84([originX + 15, originY + 25]),
+  ];
+  const neighborHouseEast = [
+    ptTm06ToWgs84([originX + 114, originY + 20]),
+    ptTm06ToWgs84([originX + 124, originY + 20]),
+    ptTm06ToWgs84([originX + 124, originY + 30]),
+    ptTm06ToWgs84([originX + 114, originY + 30]),
+  ];
+
+  const overpassMock = {
+    elements: [
+      {
+        type: 'way',
+        id: 101,
+        tags: { building: 'house' },
+        geometry: [...ownHouse, ownHouse[0]],
+      },
+      {
+        type: 'way',
+        id: 102,
+        tags: { building: 'residential', name: 'Moradia Vizinha Nascente' },
+        geometry: [...neighborHouseEast, neighborHouseEast[0]],
+      },
+      {
+        type: 'node',
+        id: 201,
+        lat: ptTm06ToWgs84([originX - 5, originY + 85]).lat,
+        lon: ptTm06ToWgs84([originX - 5, originY + 85]).lon,
+        tags: { power: 'pole' },
+      },
+      {
+        type: 'node',
+        id: 202,
+        lat: ptTm06ToWgs84([originX + 55, originY + 85]).lat,
+        lon: ptTm06ToWgs84([originX + 55, originY + 85]).lon,
+        tags: { power: 'pole' },
+      },
+      {
+        type: 'way',
+        id: 301,
+        tags: { highway: 'tertiary', name: 'EM 542' },
+        geometry: [
+          ptTm06ToWgs84([originX - 10, originY + 1]),
+          ptTm06ToWgs84([originX + 110, originY + 1]),
+        ],
+      },
+      {
+        type: 'way',
+        id: 401,
+        tags: { waterway: 'stream', name: 'Ribeira da Mata' },
+        geometry: [
+          ptTm06ToWgs84([originX + 5, originY + 95]),
+          ptTm06ToWgs84([originX + 48, originY + 60]),
+        ],
+      },
+    ],
+  };
+
+  const ql = buildOverpassParcelContextQuery(lShapeVertices, 110);
+  assert.ok(ql.includes('way["building"]'));
+  assert.ok(ql.includes('way["waterway"'));
+
+  const parsedCtx = parseOverpassVectorContext({
+    overpassJson: overpassMock,
+    parcelVertices: lShapeVertices,
+    searchRadiusM: 110,
+  });
+
+  assert.equal(parsedCtx.buildings.length, 2);
+  assert.equal(parsedCtx.buildings.filter((b) => b.role === 'OWN').length, 1);
+  assert.equal(parsedCtx.buildings.filter((b) => b.role === 'NEIGHBOR').length, 1);
+  assert.ok(
+    parsedCtx.easements.some((e) => e.id === 'osm-poles-reconstructed'),
+    'Aligned power poles without way should reconstruct minor E-REDES corridor'
+  );
+  assert.ok(parsedCtx.easements.some((e) => e.category === 'PUBLIC_ROAD'));
+  assert.equal(parsedCtx.exemptFeatures.length, 1);
+
+  const lBreakdown = computeBooleanParcelDecomposition({
+    vertices: lShapeVertices,
+    landClass: 'FOREST_SCRUB',
+    hasEredesLine: true,
+    vectorContext: parsedCtx,
+  });
+
+  assert.ok(
+    Math.abs(lBreakdown.totalAreaM2 - 7500) < 5,
+    `Expected ~7500 m² for L-shaped parcel, got ${lBreakdown.totalAreaM2}`
+  );
+
+  const sumExclusiveZones =
+    lBreakdown.zone1ImmediateM2 +
+    lBreakdown.zone2NearM2 +
+    lBreakdown.zone3ExtendedM2 +
+    lBreakdown.thirdPartyEasementM2 +
+    lBreakdown.exemptAreaM2;
+
+  assert.ok(
+    Math.abs(sumExclusiveZones - lBreakdown.totalAreaM2) < 0.05,
+    `Boolean decomposition must strictly conserve area: sum=${sumExclusiveZones} vs total=${lBreakdown.totalAreaM2}`
+  );
+  assert.ok((lBreakdown.decompositionMeta?.neighborInducedCleanAreaM2 ?? 0) > 50);
+  assert.ok((lBreakdown.decompositionMeta?.eredesEasementM2 ?? 0) > 20);
+  assert.ok((lBreakdown.decompositionMeta?.roadEasementM2 ?? 0) > 50);
+  assert.ok((lBreakdown.decompositionMeta?.riparianProtectedM2 ?? 0) > 20);
+  assert.ok((lBreakdown.decompositionMeta?.neighborOverflowRiskM2 ?? 0) > 100);
+  assert.ok((lBreakdown.multiPolygons?.zone3Extended.length ?? 0) >= 1);
+
+  // 3. Multi-layer legal GeoJSON exporter (RFC 7946 MultiPolygon + LineString axes)
+  const sintraParcel = INITIAL_PARCELS[0];
+  const legalFilename = buildParcelLegalGeoJsonFilename(sintraParcel);
+  assert.ok(legalFilename.startsWith('faixasegura-camadas-legais-'));
+  assert.ok(legalFilename.endsWith('.geojson'));
+
+  const legalGeoJsonRaw = buildParcelLegalDecompositionGeoJson(
+    sintraParcel,
+    '2026-11-17T10:00:00Z'
+  );
+  const legalFc = JSON.parse(legalGeoJsonRaw);
+  assert.equal(legalFc.type, 'FeatureCollection');
+  assert.ok(legalFc.features.length >= 8);
+  const layerCodes = new Set(
+    legalFc.features.map((f: { properties?: { layer_code?: string } }) => f.properties?.layer_code)
+  );
+  assert.ok(layerCodes.has('PARCEL_BOUNDARY'));
+  assert.ok(layerCodes.has('ZONE_1_IMMEDIATE_0_2M'));
+  assert.ok(layerCodes.has('ZONE_2_NEAR_2_10M'));
+  assert.ok(layerCodes.has('ZONE_3_EXTENDED_10_50M'));
+  assert.ok(layerCodes.has('THIRD_PARTY_EASEMENT'));
+  assert.ok(layerCodes.has('EXEMPT_ZONE'));
+  assert.ok(layerCodes.has('DETECTED_EASEMENT_AXIS'));
+});
+
+test('Phase 2 Orthophoto 25 cm CV Pipeline: ONNX NCHW float32 tensor, 7-class segmentation, pngjs round-trip, Despacho 675/2026 crown audit, and boolean annex fusion', async () => {
+  const pngjsMod = await import('pngjs');
+  const PNG =
+    (pngjsMod as unknown as { PNG?: typeof pngjsMod.PNG; default?: { PNG: typeof pngjsMod.PNG } })
+      .PNG ?? (pngjsMod as unknown as { default: { PNG: typeof pngjsMod.PNG } }).default.PNG;
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const { buildParcelLegalDecompositionGeoJson, computeParcelFgc } = await import(
+    './spatialEngine.ts'
+  );
+  const {
+    ORTHOPHOTO_CLASS_ORDER,
+    buildNormalizedNchwFloat32Tensor,
+    buildOrthophotoInferenceSpec,
+    computeParcelCvRasterGrid,
+    fuseCvDetectionsIntoVectorContext,
+    runOrthophotoPixelPipeline,
+    synthesizeDeterministicParcelOrthophotoRgba,
+  } = await import('./orthophotoCvPipeline.ts');
+
+  // 1. ONNX microservice spec & NCHW [1, 3, H, W] float32 ImageNet tensor check
+  const spec = buildOrthophotoInferenceSpec('yolo11s-seg+segformer-b2-dgt25cm');
+  assert.equal(spec.specVersion, 'SGIFR-ORTHOPHOTO-ONNX-V2');
+  assert.equal(spec.semanticClasses.length, 7);
+  assert.equal(spec.inputTensor.layout, 'NCHW');
+  assert.equal(spec.legalThresholds675_2026.minCrownToWallDistanceM, 5.0);
+  assert.equal(spec.legalThresholds675_2026.minCrownSpacingResinousForestM, 10.0);
+
+  const parcel = INITIAL_PARCELS[0];
+  const grid = computeParcelCvRasterGrid(parcel.vertices, 28, 224);
+  assert.equal(grid.width % 8, 0, 'Raster width must be a multiple of 8 for ONNX Runtime');
+  assert.equal(grid.height % 8, 0, 'Raster height must be a multiple of 8 for ONNX Runtime');
+  assert.ok(grid.gsdMetersPerPx > 0.2 && grid.gsdMetersPerPx < 1.2);
+
+  // 2. Synthesize georeferenced 25 cm orthophoto & verify lossless PNG encode/decode via pngjs
+  const rawRgba = synthesizeDeterministicParcelOrthophotoRgba({
+    grid,
+    parcelVertices: parcel.vertices,
+    landClass: parcel.landClass,
+    spatial: parcel.spatial,
+    vectorContext: parcel.vectorContext,
+  });
+
+  const nchwTensor = buildNormalizedNchwFloat32Tensor(rawRgba, grid.width, grid.height);
+  assert.equal(nchwTensor.length, 3 * grid.width * grid.height);
+
+  const pngIn = new PNG({ width: grid.width, height: grid.height });
+  pngIn.data = Buffer.from(rawRgba.buffer, rawRgba.byteOffset, rawRgba.byteLength);
+  const pngBuffer = PNG.sync.write(pngIn);
+  assert.ok(pngBuffer.length > 512, 'Encoded orthophoto PNG must be non-trivial');
+  const pngDecoded = PNG.sync.read(pngBuffer);
+  assert.equal(pngDecoded.width, grid.width);
+  assert.equal(pngDecoded.height, grid.height);
+
+  // 3. Run pixel CV + OBIA instance segmentation & Despacho 675/2026 audit
+  const out = runOrthophotoPixelPipeline({
+    rgba: pngDecoded.data,
+    grid,
+    parcelVertices: parcel.vertices,
+    landClass: parcel.landClass,
+    spatial: parcel.spatial,
+    vectorContext: parcel.vectorContext,
+    imagerySourceLabel: 'Ortofoto Sintética Georreferenciada EPSG:3763',
+    engineMode: 'OFFLINE_SYNTHETIC_CV',
+    analyzedAtIso: '2026-11-17T12:00:00.000Z',
+  });
+
+  const { analysis, overlayRgba } = out;
+  assert.equal(overlayRgba.length, grid.width * grid.height * 4);
+
+  const sumClassAreas = ORTHOPHOTO_CLASS_ORDER.reduce(
+    (sum, cls) => sum + analysis.classAreasM2[cls],
+    0
+  );
+  assert.ok(
+    Math.abs(sumClassAreas - parcel.spatial.totalAreaM2) < 2.0,
+    `7-class semantic areas must sum to parcel totalAreaM2 (${sumClassAreas} vs ${parcel.spatial.totalAreaM2})`
+  );
+
+  // Must detect individual crowns, <5m facade violation, <10m pine spacing violation, and unmapped rural annex
+  assert.ok(analysis.crowns.length >= 5, `Expected >=5 crowns, got ${analysis.crowns.length}`);
+  assert.ok(
+    analysis.zoneCompliance.zone2CrownsUnder5mCount >= 1,
+    'Expected at least 1 crown <5m from building wall'
+  );
+  assert.ok(
+    analysis.zoneCompliance.crownSpacingViolationsCount >= 1,
+    'Expected at least 1 resinous crown spacing violation (<10m) in Zona 2/3'
+  );
+  assert.ok(
+    analysis.zoneCompliance.zone2CrownsUnder5mCount +
+      analysis.zoneCompliance.crownSpacingViolationsCount <=
+      analysis.crowns.length,
+    'Total crown violations must never exceed retained crowns count'
+  );
+  assert.ok(
+    analysis.unmappedRoofsCount >= 1,
+    `Expected >=1 unmapped rural annex detected by CV, got ${analysis.unmappedRoofsCount}`
+  );
+
+  // 4. Fuse unmapped annex into ParcelVectorContext & recompute EPSG:3763 boolean zones
+  const beforeOwnCount = parcel.spatial.decompositionMeta?.ownBuildingsCount ?? 1;
+  const beforeOwnArea = parcel.spatial.decompositionMeta?.ownBuildingsAreaM2 ?? 0;
+  const beforeZ1 = parcel.spatial.zone1ImmediateM2;
+
+  const fused = fuseCvDetectionsIntoVectorContext({
+    existingContext: parcel.vectorContext,
+    cvAnalysis: analysis,
+    parcelVertices: parcel.vertices,
+  });
+  assert.ok(fused.addedBuildingsCount >= 1);
+  assert.ok(
+    fused.vectorContext.buildings.some((b) => b.source === 'CV_ORTHOPHOTO_25CM'),
+    'Fused building must carry CV_ORTHOPHOTO_25CM provenance'
+  );
+
+  const recomputedSpatial = computeParcelFgc({
+    vertices: parcel.vertices,
+    buildingCenter: parcel.buildingCenter,
+    landClass: parcel.landClass,
+    hasEredesLine: parcel.hasEredesLine,
+    eredesType: parcel.eredesType,
+    vectorContext: fused.vectorContext,
+  });
+
+  assert.ok(
+    (recomputedSpatial.decompositionMeta?.ownBuildingsCount ?? 0) > beforeOwnCount,
+    'Own building count must increase after fusing unmapped rural annex'
+  );
+  assert.ok(
+    (recomputedSpatial.decompositionMeta?.ownBuildingsAreaM2 ?? 0) > beforeOwnArea + 8,
+    'Own building footprint area must include newly fused annex'
+  );
+  assert.ok(
+    recomputedSpatial.zone1ImmediateM2 > beforeZ1 + 5,
+    'Zona 1 (0-2m inert strip) must expand around newly fused rural annex'
+  );
+
+  const recomputedSum =
+    recomputedSpatial.zone1ImmediateM2 +
+    recomputedSpatial.zone2NearM2 +
+    recomputedSpatial.zone3ExtendedM2 +
+    recomputedSpatial.thirdPartyEasementM2 +
+    recomputedSpatial.exemptAreaM2;
+  assert.ok(
+    Math.abs(recomputedSum - recomputedSpatial.totalAreaM2) < 0.05,
+    'Boolean area conservation must hold strictly after CV annex fusion'
+  );
+
+  // 5. Legal GeoJSON export includes DETECTED_TREE_CROWN and CV_UNMAPPED_STRUCTURE
+  const geoJsonWithCv = JSON.parse(
+    buildParcelLegalDecompositionGeoJson({ ...parcel, cvAnalysis: analysis })
+  ) as { features: Array<{ properties?: { layer_code?: string } }> };
+  const exportedCodes = new Set(geoJsonWithCv.features.map((f) => f.properties?.layer_code));
+  assert.ok(exportedCodes.has('DETECTED_TREE_CROWN'));
+  assert.ok(exportedCodes.has('CV_UNMAPPED_STRUCTURE'));
+});
+
+test('Phase 3 Assisted Map Editor (Human-in-the-Loop) stamps/draws buildings, easements & exemptions, reviews CV roofs/crowns, preserves USER_DEFINED edits across OSM refreshes, and conserves EPSG:3763 area', async () => {
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const {
+    buildParcelLegalDecompositionGeoJson,
+    offsetMetersFromWgs84,
+  } = await import('./spatialEngine.ts');
+  const {
+    computeParcelCvRasterGrid,
+    runOrthophotoPixelPipeline,
+    synthesizeDeterministicParcelOrthophotoRgba,
+  } = await import('./orthophotoCvPipeline.ts');
+  const { finalizeParcelVectorContext } = await import('./vectorContextIngestor.ts');
+  const {
+    addAssistedBuildingToParcel,
+    addAssistedEasementToParcel,
+    addAssistedExemptZoneToParcel,
+    buildRectangularFootprintAtWgs84,
+    countHumanVerifiedEdits,
+    overrideCvCrownStatus,
+    removeAssistedVectorElement,
+    resetParcelToAutomaticContext,
+    reviewCvRoofDetection,
+    toggleAssistedBuildingRole,
+    updateAssistedEasementWidth,
+  } = await import('./assistedMapEditor.ts');
+
+  const assertAreaConservation = (p: (typeof INITIAL_PARCELS)[0], label: string) => {
+    const sp = p.spatial;
+    const sum =
+      sp.zone1ImmediateM2 +
+      sp.zone2NearM2 +
+      sp.zone3ExtendedM2 +
+      sp.thirdPartyEasementM2 +
+      sp.exemptAreaM2;
+    assert.ok(
+      Math.abs(sum - sp.totalAreaM2) < 0.06,
+      `[${label}] Boolean zones sum (${sum}) must equal totalAreaM2 (${sp.totalAreaM2})`
+    );
+  };
+
+  // Start with a parcel that has CV detections ready for human review
+  const baseParcel = structuredClone(INITIAL_PARCELS[0]);
+  baseParcel.hasProtectedOaks = false;
+  const grid = computeParcelCvRasterGrid(baseParcel.vertices, 28, 160);
+  const rgba = synthesizeDeterministicParcelOrthophotoRgba({
+    grid,
+    parcelVertices: baseParcel.vertices,
+    landClass: baseParcel.landClass,
+    spatial: baseParcel.spatial,
+    vectorContext: baseParcel.vectorContext,
+  });
+  const cvOut = runOrthophotoPixelPipeline({
+    rgba,
+    grid,
+    parcelVertices: baseParcel.vertices,
+    landClass: baseParcel.landClass,
+    spatial: baseParcel.spatial,
+    vectorContext: baseParcel.vectorContext,
+    imagerySourceLabel: 'Ortofoto Teste HITL',
+    engineMode: 'OFFLINE_SYNTHETIC_CV',
+  });
+  let parcel: typeof baseParcel = { ...baseParcel, cvAnalysis: cvOut.analysis };
+
+  // 1. 1-Click stamp of a new OWN rural annex inside the parcel expands Zona 1 (0-2m)
+  const stampCenter = offsetMetersFromWgs84(parcel.spatial.centroidWgs84, -14, -10);
+  const stampFootprint = buildRectangularFootprintAtWgs84(stampCenter, 8.5, 6.5);
+  assert.equal(stampFootprint.length, 4);
+
+  const z1BeforeStamp = parcel.spatial.zone1ImmediateM2;
+  parcel = addAssistedBuildingToParcel(parcel, {
+    id: 'user-annex-1',
+    footprint: stampFootprint,
+    role: 'OWN',
+    label: 'Palheiro Validado pelo Proprietário',
+  });
+  assert.ok(parcel.spatial.zone1ImmediateM2 > z1BeforeStamp + 8, 'Zona 1 must grow around stamped annex');
+  assertAreaConservation(parcel, 'after-own-stamp');
+
+  // 2. Toggle building role OWN -> NEIGHBOR and back
+  const ownCountAfterStamp = parcel.spatial.decompositionMeta?.ownBuildingsCount ?? 0;
+  const toggledToNeighbor = toggleAssistedBuildingRole(parcel, 'user-annex-1');
+  assert.equal(
+    toggledToNeighbor.spatial.decompositionMeta?.ownBuildingsCount,
+    ownCountAfterStamp - 1
+  );
+  assertAreaConservation(toggledToNeighbor, 'after-role-toggle');
+
+  // 3. Add a custom E-REDES AT line across the parcel center and widen its corridor
+  const easBefore = parcel.spatial.thirdPartyEasementM2;
+  const lineStart = offsetMetersFromWgs84(parcel.spatial.centroidWgs84, -45, 2);
+  const lineEnd = offsetMetersFromWgs84(parcel.spatial.centroidWgs84, 45, 2);
+  parcel = addAssistedEasementToParcel(parcel, {
+    id: 'user-power-1',
+    centerline: [lineStart, lineEnd],
+    preset: 'EREDES_AT',
+    bufferHalfWidthM: 5.0,
+  });
+  assert.ok(
+    parcel.spatial.thirdPartyEasementM2 > easBefore + 40,
+    'Third-party easement area must increase when user traces an overhead line'
+  );
+  const easAt5m = parcel.spatial.thirdPartyEasementM2;
+  parcel = updateAssistedEasementWidth(parcel, 'user-power-1', 10.0);
+  assert.ok(
+    parcel.spatial.thirdPartyEasementM2 > easAt5m + 30,
+    'Widening easement from ±5m to ±10m must subtract additional corridor area'
+  );
+  assertAreaConservation(parcel, 'after-easement-widen');
+
+  // 4. Add an irrigated orchard exemption polygon inside the parcel
+  const orchardCenter = offsetMetersFromWgs84(parcel.spatial.centroidWgs84, 14, -14);
+  const orchardPoly = buildRectangularFootprintAtWgs84(orchardCenter, 14, 12);
+  const exemptBefore = parcel.spatial.exemptAreaM2;
+  parcel = addAssistedExemptZoneToParcel(parcel, {
+    id: 'user-orchard-1',
+    points: orchardPoly,
+    preset: 'IRRIGATED_AGRICULTURE',
+    label: 'Pomar de Citrinos Regado',
+  });
+  assert.ok(parcel.spatial.exemptAreaM2 > exemptBefore + 20, 'Orchard polygon must expand exemptAreaM2');
+  assertAreaConservation(parcel, 'after-orchard-exempt');
+
+  // 5. Human-in-the-Loop CV roof review (ACCEPT_OWN vs DISMISS) and Crown Protected Oak override
+  const unmappedRoof = parcel.cvAnalysis?.detectedRoofs.find((r) => r.isUnmappedInOsm);
+  assert.ok(unmappedRoof, 'Expected at least 1 unmapped CV roof to review');
+  const dismissedParcel = reviewCvRoofDetection(
+    parcel,
+    unmappedRoof.id,
+    'DISMISS_FALSE_POSITIVE'
+  );
+  assert.equal(dismissedParcel.cvAnalysis?.unmappedRoofsCount, 0);
+
+  parcel = reviewCvRoofDetection(parcel, unmappedRoof.id, 'ACCEPT_OWN');
+  assert.equal(parcel.cvAnalysis?.unmappedRoofsCount, 0);
+  assert.ok(
+    parcel.vectorContext?.buildings.some((b) => b.id === `hitl-${unmappedRoof.id}`),
+    'Accepted CV roof must be promoted into vectorContext.buildings with hitl-* id'
+  );
+
+  const violatingCrown = parcel.cvAnalysis?.crowns.find((c) => c.violationRulePt !== null);
+  assert.ok(violatingCrown, 'Expected a violating CV crown for human override test');
+  const violBefore =
+    (parcel.cvAnalysis?.zoneCompliance.zone2CrownsUnder5mCount ?? 0) +
+    (parcel.cvAnalysis?.zoneCompliance.crownSpacingViolationsCount ?? 0);
+
+  parcel = overrideCvCrownStatus(parcel, violatingCrown.id, 'PROTECTED_QUERCUS');
+  assert.equal(parcel.hasProtectedOaks, true, 'Marking protected oak must enable hasProtectedOaks');
+  const violAfterOak =
+    (parcel.cvAnalysis?.zoneCompliance.zone2CrownsUnder5mCount ?? 0) +
+    (parcel.cvAnalysis?.zoneCompliance.crownSpacingViolationsCount ?? 0);
+  assert.ok(violAfterOak < violBefore, 'Protected oak override must clear felling spacing violation');
+
+  // Clearing override restores original violation count cleanly
+  const clearedCrownParcel = overrideCvCrownStatus(parcel, violatingCrown.id, 'CLEAR');
+  const violRestored =
+    (clearedCrownParcel.cvAnalysis?.zoneCompliance.zone2CrownsUnder5mCount ?? 0) +
+    (clearedCrownParcel.cvAnalysis?.zoneCompliance.crownSpacingViolationsCount ?? 0);
+  assert.equal(violRestored, violBefore);
+
+  // 6. Preserving USER_DEFINED elements across automatic OSM Overpass / cadastral refreshes
+  assert.ok(countHumanVerifiedEdits(parcel.vectorContext, parcel.cvAnalysis) >= 5);
+  const refreshedCtx = finalizeParcelVectorContext({
+    liveParsed: null,
+    parcelVertices: parcel.vertices,
+    buildingCenter: parcel.buildingCenter,
+    hasEredesLine: parcel.hasEredesLine,
+    eredesType: parcel.eredesType,
+    existingContext: parcel.vectorContext,
+  });
+  assert.ok(refreshedCtx.buildings.some((b) => b.id === 'user-annex-1'));
+  assert.ok(refreshedCtx.easements.some((e) => e.id === 'user-power-1'));
+  assert.ok(refreshedCtx.exemptFeatures.some((ex) => ex.id === 'user-orchard-1'));
+
+  // 7. Legal GeoJSON export includes USER_VERIFIED_BUILDING, DETECTED_EXEMPT_POLYGON & human_override
+  const exported = JSON.parse(buildParcelLegalDecompositionGeoJson(parcel)) as {
+    features: Array<{ properties?: Record<string, unknown> }>;
+  };
+  const layerCodes = new Set(exported.features.map((f) => f.properties?.layer_code));
+  assert.ok(layerCodes.has('USER_VERIFIED_BUILDING'));
+  assert.ok(layerCodes.has('DETECTED_EXEMPT_POLYGON'));
+  assert.ok(
+    exported.features.some(
+      (f) =>
+        f.properties?.layer_code === 'DETECTED_TREE_CROWN' &&
+        f.properties?.human_override === 'PROTECTED_QUERCUS'
+    )
+  );
+
+  // 8. Remove element & full reset back to automatic baseline
+  const afterRemove = removeAssistedVectorElement(parcel, 'EASEMENT', 'user-power-1');
+  assert.ok(!afterRemove.vectorContext?.easements.some((e) => e.id === 'user-power-1'));
+  assertAreaConservation(afterRemove, 'after-remove-easement');
+
+  const resetParcel = resetParcelToAutomaticContext(afterRemove);
+  assert.equal(countHumanVerifiedEdits(resetParcel.vectorContext, resetParcel.cvAnalysis), 0);
+  assertAreaConservation(resetParcel, 'after-reset');
+});
+
+test('External Geo Connectors, .env.example catalog, and ServerInfra/Notifications unit checks', async () => {
+  // 1. Verify .env.example documents every required variable without leaked secrets
+  const envExample = readEnvFileSync('.env.example', 'utf8');
+  const requiredEnvKeys = [
+    'APP_URL=',
+    'PORT=',
+    'DISABLE_HMR=',
+    'VITE_FIREBASE_STORAGE_BUCKET=',
+    'VITE_FIREBASE_MESSAGING_SENDER_ID=',
+    'ORTHOPHOTO_CV_API_KEY=',
+    'OLLAMA_API_KEY=',
+    'COPERNICUS_CLIENT_ID=',
+    'COPERNICUS_CLIENT_SECRET=',
+    'COPERNICUS_STATS_URL=',
+    'COPERNICUS_CATALOG_URL=',
+    'DGT_CADASTRE_OGC_URL=',
+    'EREDES_OPENDATA_BASE_URL=',
+    'EREDES_OPENDATA_API_KEY=',
+    'ELEVATION_API_URL=',
+    'VITE_CARTO_API_KEY=',
+    'VITE_MAP_ORTHO_TILE_URL=',
+    'VITE_MAP_VECTOR_TILE_URL=',
+    'TELEGRAM_BOT_TOKEN=',
+    'TELEGRAM_DEFAULT_CHAT_ID=',
+    'VAPID_PUBLIC_KEY=',
+    'VAPID_PRIVATE_KEY=',
+    'RESEND_API_KEY=',
+    'SMTP_WEBHOOK_URL=',
+  ];
+  for (const key of requiredEnvKeys) {
+    assert.ok(envExample.includes(key), `Missing ${key} in .env.example`);
+  }
+  assert.ok(!envExample.includes('AIzaSy'), '.env.example must never contain real API keys');
+
+  // 2. Copernicus Sentinel-2 L2A Statistical API & Open Catalog parsers
+  const parcelVerts = [
+    { lat: 38.79805, lon: -9.46258 },
+    { lat: 38.79876, lon: -9.46252 },
+    { lat: 38.79879, lon: -9.46164 },
+    { lat: 38.79802, lon: -9.46168 },
+  ];
+  const statsBody = buildCopernicusStatsRequestBody({
+    vertices: parcelVerts,
+    fromIsoDate: '2026-04-01',
+    toIsoDate: '2026-05-15',
+  });
+  assert.ok(statsBody.input && statsBody.aggregation);
+
+  const statsParsed = parseCopernicusStatsResponse({
+    data: [
+      {
+        interval: { from: '2026-05-01T00:00:00Z', to: '2026-05-12T00:00:00Z' },
+        outputs: {
+          indices: {
+            bands: {
+              B0: { stats: { mean: 0.642, sampleCount: 100, noDataCount: 8 } },
+              B1: { stats: { mean: 0.184, sampleCount: 100, noDataCount: 8 } },
+            },
+          },
+        },
+      },
+      {
+        interval: { from: '2026-04-18T00:00:00Z', to: '2026-04-30T00:00:00Z' },
+        outputs: {
+          indices: {
+            bands: {
+              B0: { stats: { mean: 0.588, sampleCount: 100, noDataCount: 4 } },
+              B1: { stats: { mean: 0.221, sampleCount: 100, noDataCount: 4 } },
+            },
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(statsParsed.length, 2);
+  assert.equal(statsParsed[0].date, '2026-04-30');
+  assert.equal(statsParsed[1].date, '2026-05-12');
+  assert.equal(statsParsed[1].ndvi, 0.64);
+  assert.equal(statsParsed[1].cloudCoverPct, 8);
+
+  const openCatalogParsed = parseCopernicusOpenCatalogScenes({
+    rawJson: {
+      features: [
+        { properties: { startDate: '2026-05-14T11:21:00Z', cloudCover: 6.2 } },
+        { properties: { startDate: '2026-05-04T11:21:00Z', cloudCover: 12.8 } },
+        { properties: { startDate: '2026-04-24T11:21:00Z', cloudCover: 3.1 } },
+      ],
+    },
+    landClass: 'FOREST_SCRUB',
+    centroid: { lat: 38.7984, lon: -9.4621 },
+  });
+  assert.equal(openCatalogParsed.length, 3);
+  assert.equal(openCatalogParsed[2].date, '2026-05-14');
+  assert.equal(openCatalogParsed[2].cloudCoverPct, 6);
+
+  // 3. E-REDES Open Data v2.1 parser & 8m deduplication against OSM powerlines
+  const eredesLines = parseEredesOpenDataLines({
+    results: [
+      {
+        id: 'LN-30KV-901',
+        nivel_tensao: 'MT 30kV',
+        geo_shape: {
+          geometry: {
+            type: 'LineString',
+            coordinates: [
+              [-9.4626, 38.7981],
+              [-9.4616, 38.7987],
+            ],
+          },
+        },
+      },
+      {
+        id: 'LN-60KV-902',
+        nivel_tensao: 'AT 60kV',
+        geo_shape: {
+          geometry: {
+            type: 'LineString',
+            coordinates: [
+              [-9.464, 38.7995],
+              [-9.463, 38.8001],
+            ],
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(eredesLines.length, 2);
+  assert.equal(eredesLines[0].source, 'EREDES_OPENDATA');
+  assert.equal(eredesLines[0].bufferHalfWidthM, 4.25);
+  assert.equal(eredesLines[1].bufferHalfWidthM, 5.0);
+
+  const mergedOnce = mergeEredesEasementsIntoVectorContext(
+    {
+      detectedAtIso: '2026-05-15T10:00:00Z',
+      sourceMode: 'LIVE_OVERPASS_WFS',
+      sourceSummaryPt: 'OSM Overpass',
+      searchRadiusM: 120,
+      buildings: [],
+      easements: [
+        {
+          ...eredesLines[0],
+          id: 'osm-power-existing',
+          source: 'OSM_OVERPASS',
+        },
+      ],
+      exemptFeatures: [],
+    },
+    eredesLines
+  );
+  // First line is <8 m from osm-power-existing so only the second line is appended
+  assert.equal(mergedOnce.addedCount, 1);
+  assert.equal(mergedOnce.context.easements.length, 2);
+
+  // 4. Official DGT Cadastre OGC API Features polygon selection & EPSG:3763 area
+  const dgtMatch = parseDgtCadastreFeatures(
+    {
+      type: 'FeatureCollection',
+      features: [
+        {
+          id: 'PT.DGT.CAD.1111',
+          geometry: {
+            type: 'Polygon',
+            coordinates: [
+              [
+                [-9.46258, 38.79805],
+                [-9.46168, 38.79802],
+                [-9.46164, 38.79879],
+                [-9.46252, 38.79876],
+                [-9.46258, 38.79805],
+              ],
+            ],
+          },
+          properties: {
+            nationalCadastralReference: '110509-H-0318',
+            inspireId: 'PT.DGT.110509.318',
+          },
+        },
+      ],
+    },
+    { lat: 38.7984, lon: -9.4621 }
+  );
+  assert.ok(dgtMatch);
+  assert.equal(dgtMatch.containsTargetPoint, true);
+  assert.equal(dgtMatch.cadastralReference, '110509-H-0318');
+  assert.ok(dgtMatch.areaM2 > 5000 && dgtMatch.areaM2 < 8000);
+
+  // 5. Real DEM / MDT Elevation parser & 3D least-squares slope plane fitting (15% synthetic hillside)
+  const sampleGrid = buildParcelElevationSampleGrid(parcelVerts, { lat: 38.7984, lon: -9.4621 });
+  assert.ok(sampleGrid.length >= 9);
+  const originTm = wgs84ToPtTm06(sampleGrid[0]);
+  const syntheticElevations = sampleGrid.map((pt) => {
+    const tm = wgs84ToPtTm06(pt);
+    // 15% rise eastward (dz/dx = 0.15)
+    return 180 + (tm.x - originTm.x) * 0.15;
+  });
+  const parsedElevs = parseElevationApiResponse({ elevation: syntheticElevations });
+  assert.equal(parsedElevs.length, sampleGrid.length);
+  const slopeRes = computeTerrainSlopeFromElevations(sampleGrid, parsedElevs);
+  assert.ok(
+    Math.abs(slopeRes.avgSlopePct - 15.0) < 0.8,
+    `Expected ~15% slope, got ${slopeRes.avgSlopePct}%`
+  );
+  assert.equal(slopeRes.aspectLabelPt, 'Exposição Poente');
+
+  // 6. ServerInfraBridge TTL memory cache, WebPushNotificationHub VAPID keys, and mocked Telegram/Email dispatch
+  const infra = new ServerInfraBridge();
+  await infra.cacheSetJson('unit:test', { ok: true, count: 7 }, 60);
+  const cached = await infra.cacheGetJson<{ ok: boolean; count: number }>('unit:test');
+  assert.deepEqual(cached, { ok: true, count: 7 });
+
+  const pushHub = new WebPushNotificationHub({});
+  assert.ok(pushHub.getPublicKey().length >= 60);
+  assert.equal(pushHub.isEnvConfigured(), false);
+  const badSub = pushHub.registerSubscription({ endpoint: '', keys: { p256dh: '', auth: '' } });
+  assert.equal(badSub.ok, false);
+  const goodSub = pushHub.registerSubscription({
+    endpoint: 'https://fcm.googleapis.com/fcm/send/demo-endpoint-1',
+    keys: { p256dh: 'BNcRdreALRFXTkOOUHK1EtK2wtaz5Ry4YfYCA_0QTpQ', auth: 'tBHItJI5svbpez7KI4CCXg' },
+  });
+  assert.equal(goodSub.ok, true);
+  assert.equal(pushHub.getSubscriptionCount(), 1);
+
+  const tgReceipt = await dispatchTelegramAlert({
+    botToken: '123456:TEST_TOKEN_UNIT',
+    chatId: '-100998877',
+    text: 'Teste unitário FaixaSegura',
+    fetchImpl: async () => new Response(JSON.stringify({ ok: true }), { status: 200 }),
+  });
+  assert.equal(tgReceipt.delivered, true);
+
+  const emailReceipt = await dispatchTransactionalEmailOrWebhook({
+    resendApiKey: 're_unit_mock',
+    toEmails: ['equipa@silvicultura.pt'],
+    subject: 'Pedido Orçamento',
+    textBody: 'Área obrigatória: 2450 m²',
+    fetchImpl: async () => new Response(JSON.stringify({ id: 'msg_1' }), { status: 200 }),
+  });
+  assert.equal(emailReceipt.delivered, true);
+});
+
+
+
+

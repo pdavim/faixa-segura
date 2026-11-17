@@ -1,10 +1,18 @@
 import type {
   LandClass,
   LatLon,
+  LatLonMultiPolygon,
   ParcelRecord,
+  ParcelVectorContext,
   PtTm06Coord,
   SpatialZoneBreakdown,
 } from '../types/domain.ts';
+import {
+  computeBooleanParcelDecomposition,
+  ptTm06ToWgs84,
+} from './booleanSpatialEngine.ts';
+
+export { ptTm06ToWgs84 };
 
 /**
  * ETRS89 / PT-TM06 (EPSG:3763) Official Portuguese Projection Constants (DGT)
@@ -165,178 +173,22 @@ export function azimuthCardinalLabel(deg: number): string {
   return dirs[Math.round(normalized / 45) % 8];
 }
 
-function makeOctagonOrRectBuffer(center: LatLon, radiusXM: number, radiusYM: number, points = 16): LatLon[] {
-  const poly: LatLon[] = [];
-  for (let i = 0; i < points; i++) {
-    const angle = (2 * Math.PI * i) / points;
-    poly.push(
-      offsetMetersFromWgs84(
-        center,
-        Math.cos(angle) * radiusXM,
-        Math.sin(angle) * radiusYM
-      )
-    );
-  }
-  return poly;
-}
-
-function clampPolygonVerticesToBounds(poly: LatLon[], parcelVertices: LatLon[]): LatLon[] {
-  const lats = parcelVertices.map((v) => v.lat);
-  const lons = parcelVertices.map((v) => v.lon);
-  const minLat = Math.min(...lats);
-  const maxLat = Math.max(...lats);
-  const minLon = Math.min(...lons);
-  const maxLon = Math.max(...lons);
-
-  return poly.map((p) => ({
-    lat: Number(Math.min(maxLat, Math.max(minLat, p.lat)).toFixed(6)),
-    lon: Number(Math.min(maxLon, Math.max(minLon, p.lon)).toFixed(6)),
-  }));
-}
-
 /**
- * Deterministic Spatial Fuel-Break Engine (DL n.º 82/2021 + Despacho n.º 675/2026)
- * Calculates exact areas (m²) in EPSG:3763 and generates clean map overlay geometries
- * for Zone 1 (0-2m), Zone 2 (2-10m), Zone 3 (10-50m/100m), E-REDES easement, and Exempt interior.
+ * Exact Boolean Spatial Fuel-Break Engine (DL n.º 82/2021 + Despacho n.º 675/2026)
+ * Performs true Minkowski capsule buffering and Martinez-Rueda boolean polygon algebra
+ * in official Portuguese ETRS89 / PT-TM06 (EPSG:3763) metric coordinates.
  */
 export function computeParcelFgc(params: {
   vertices: LatLon[];
   buildingCenter?: LatLon;
   landClass: LandClass;
   hasEredesLine: boolean;
+  eredesType?: ParcelRecord['eredesType'];
   isClusterInterface?: boolean;
   neighborDistanceOverrideM?: number;
+  vectorContext?: ParcelVectorContext;
 }): SpatialZoneBreakdown {
-  const metrics = computePolygonMetrics3763(params.vertices);
-  const totalAreaM2 = Math.max(metrics.areaM2, 250);
-  const buildingCenter =
-    params.buildingCenter ??
-    offsetMetersFromWgs84(metrics.centroidWgs84, -8, -6);
-
-  // Building footprint (~11m x 9m residential dwelling)
-  const buildingFootprint: LatLon[] = [
-    offsetMetersFromWgs84(buildingCenter, -5.5, -4.5),
-    offsetMetersFromWgs84(buildingCenter, 5.5, -4.5),
-    offsetMetersFromWgs84(buildingCenter, 5.5, 4.5),
-    offsetMetersFromWgs84(buildingCenter, -5.5, 4.5),
-  ];
-
-  // Buffer radii per Despacho n.º 675/2026 & DL 82/2021
-  const outerBufferM = params.isClusterInterface
-    ? 100
-    : params.landClass === 'FOREST_SCRUB'
-      ? 50
-      : 10;
-
-  const zone1Immediate = clampPolygonVerticesToBounds(
-    makeOctagonOrRectBuffer(buildingCenter, 7.5, 6.5, 16),
-    params.vertices
-  );
-  const zone2Near = clampPolygonVerticesToBounds(
-    makeOctagonOrRectBuffer(buildingCenter, 15.5, 14.5, 20),
-    params.vertices
-  );
-  const zone3Extended = clampPolygonVerticesToBounds(
-    makeOctagonOrRectBuffer(
-      buildingCenter,
-      Math.min(outerBufferM, Math.sqrt(totalAreaM2) * 0.72),
-      Math.min(outerBufferM, Math.sqrt(totalAreaM2) * 0.68),
-      24
-    ),
-    params.vertices
-  );
-
-  // Proportional area partition strictly conserving totalAreaM2 in EPSG:3763
-  const rawZ1 = Math.min(totalAreaM2 * 0.08, 152.0);
-  const rawZ2 = Math.min(totalAreaM2 * 0.22, 495.0);
-  const eredesRatio = params.hasEredesLine ? 0.075 : 0;
-  const thirdPartyEasementM2 = Number((totalAreaM2 * eredesRatio).toFixed(2));
-
-  const remainingAfterCore = Math.max(0, totalAreaM2 - rawZ1 - rawZ2 - thirdPartyEasementM2);
-  const z3Share =
-    params.landClass === 'FOREST_SCRUB'
-      ? Math.min(remainingAfterCore * 0.42, 2450)
-      : Math.min(remainingAfterCore * 0.14, 420);
-
-  const zone1ImmediateM2 = Number(rawZ1.toFixed(2));
-  const zone2NearM2 = Number(rawZ2.toFixed(2));
-  const zone3ExtendedM2 = Number(z3Share.toFixed(2));
-  const mandatoryCleanAreaM2 = Number(
-    (zone1ImmediateM2 + zone2NearM2 + zone3ExtendedM2).toFixed(2)
-  );
-  const exemptAreaM2 = Number(
-    Math.max(
-      0,
-      totalAreaM2 - mandatoryCleanAreaM2 - thirdPartyEasementM2
-    ).toFixed(2)
-  );
-
-  // E-REDES corridor strip on northern/eastern edge of parcel
-  const lats = params.vertices.map((v) => v.lat);
-  const lons = params.vertices.map((v) => v.lon);
-  const maxLat = Math.max(...lats);
-  const minLat = Math.min(...lats);
-  const minLon = Math.min(...lons);
-  const maxLon = Math.max(...lons);
-  const latSpan = maxLat - minLat;
-  const lonSpan = maxLon - minLon;
-
-  const thirdPartyCorridor: LatLon[] = params.hasEredesLine
-    ? [
-        { lat: Number((maxLat - latSpan * 0.14).toFixed(6)), lon: minLon },
-        { lat: maxLat, lon: minLon },
-        { lat: maxLat, lon: maxLon },
-        { lat: Number((maxLat - latSpan * 0.14).toFixed(6)), lon: maxLon },
-      ]
-    : [];
-
-  // Exempt interior core polygon (southern/eastern interior portion)
-  const exemptCore: LatLon[] =
-    exemptAreaM2 > 20
-      ? [
-          { lat: minLat, lon: Number((minLon + lonSpan * 0.52).toFixed(6)) },
-          { lat: Number((minLat + latSpan * 0.58).toFixed(6)), lon: Number((minLon + lonSpan * 0.56).toFixed(6)) },
-          { lat: Number((minLat + latSpan * 0.58).toFixed(6)), lon: maxLon },
-          { lat: minLat, lon: maxLon },
-        ]
-      : [];
-
-  // Confinant Neighbor Risk Parcel immediately adjacent to western boundary
-  const neighborRiskParcel: LatLon[] = [
-    { lat: Number((minLat + latSpan * 0.08).toFixed(6)), lon: Number((minLon - lonSpan * 0.42).toFixed(6)) },
-    { lat: Number((maxLat - latSpan * 0.12).toFixed(6)), lon: Number((minLon - lonSpan * 0.38).toFixed(6)) },
-    { lat: Number((maxLat - latSpan * 0.10).toFixed(6)), lon: minLon },
-    { lat: Number((minLat + latSpan * 0.06).toFixed(6)), lon: minLon },
-  ];
-
-  // Average forestry clearing cost ~0.38 €/m² -> quantifiable landowner savings on E-REDES strip
-  const estimatedEredesSavingsEur = Number((thirdPartyEasementM2 * 0.38).toFixed(2));
-
-  return {
-    totalAreaM2,
-    perimeterM: metrics.perimeterM,
-    centroidWgs84: metrics.centroidWgs84,
-    centroidPtTm06: metrics.centroidPtTm06,
-    zone1ImmediateM2,
-    zone2NearM2,
-    zone3ExtendedM2,
-    mandatoryCleanAreaM2,
-    thirdPartyEasementM2,
-    exemptAreaM2,
-    estimatedEredesSavingsEur,
-    polygons: {
-      parcel: params.vertices,
-      buildingFootprint,
-      zone1Immediate,
-      zone2Near,
-      zone3Extended,
-      thirdPartyCorridor,
-      exemptCore,
-      neighborRiskParcel,
-    },
-    neighborMinDistanceM: params.neighborDistanceOverrideM ?? 4.2,
-    neighborDirection: 'Poente / Noroeste',
-  };
+  return computeBooleanParcelDecomposition(params);
 }
 
 /**
@@ -666,4 +518,382 @@ export function computeParcelLeafletBounds(parcel: ParcelRecord): ParcelLeafletB
   };
 }
 
+function toOrientedClosedRing(
+  vertices: LatLon[],
+  counterClockwise: boolean
+): Array<[number, number]> {
+  const ccw = toCounterClockwiseClosedRing(vertices);
+  if (ccw.length < 4) return ccw;
+  if (counterClockwise) return ccw;
+  // Interior hole rings in RFC 7946 §3.1.6 must be clockwise
+  return [...ccw].reverse();
+}
+
+function latLonMultiPolygonToGeoJsonCoords(
+  mp: LatLonMultiPolygon | undefined
+): Array<Array<Array<[number, number]>>> {
+  if (!mp || mp.length === 0) return [];
+  const out: Array<Array<Array<[number, number]>>> = [];
+  for (const poly of mp) {
+    if (!poly || poly.length === 0) continue;
+    const rings: Array<Array<[number, number]>> = [];
+    for (let r = 0; r < poly.length; r++) {
+      const closed = toOrientedClosedRing(poly[r], r === 0);
+      if (closed.length >= 4) {
+        rings.push(closed);
+      }
+    }
+    if (rings.length > 0) {
+      out.push(rings);
+    }
+  }
+  return out;
+}
+
+export function buildParcelLegalGeoJsonFilename(
+  parcel: Pick<ParcelRecord, 'id' | 'bupiRggId' | 'municipality' | 'label'>
+): string {
+  const refSlug = slugifyAscii(parcel.bupiRggId || parcel.id || 'parcela');
+  const munSlug = slugifyAscii(parcel.municipality || 'portugal');
+  const base = ['faixasegura-camadas-legais', refSlug, munSlug].filter(Boolean).join('-');
+  return `${base}.geojson`;
+}
+
+/**
+ * Exports all boolean legal decomposition layers (MultiPolygons with true interior holes + detected easements/waterways)
+ * as an RFC 7946 GeoJSON FeatureCollection ready for QGIS, ArcGIS Pro, BUPi, and Municipal GTF audit.
+ */
+export function buildParcelLegalDecompositionGeoJson(
+  parcel: ParcelRecord,
+  exportedAtIso: string = new Date().toISOString()
+): string {
+  const sp = parcel.spatial;
+  const mp = sp.multiPolygons;
+  const meta = sp.decompositionMeta;
+
+  const rawVertices =
+    parcel.vertices.length >= 3 ? parcel.vertices : sp.polygons.parcel;
+  const uniqueVertices = deduplicateClosingVertex(rawVertices);
+  const parcelClosedRing = toCounterClockwiseClosedRing(uniqueVertices);
+
+  const features: Array<Record<string, unknown>> = [
+    {
+      type: 'Feature',
+      id: `${parcel.id}-boundary`,
+      properties: {
+        layer_code: 'PARCEL_BOUNDARY',
+        layer_label_pt: 'Limite Cadastral da Parcela (RGG)',
+        parcel_id: parcel.id,
+        bupi_rgg_id: parcel.bupiRggId,
+        municipality: parcel.municipality,
+        parish: parcel.parish,
+        area_m2: sp.totalAreaM2,
+        perimeter_m: sp.perimeterM,
+        human_verified_count: parcel.vectorContext?.humanVerifiedCount ?? 0,
+        engine_version: meta?.engineVersion ?? 'BOOLEAN_EPSG3763_V2',
+        metric_crs: 'ETRS89 / PT-TM06 (EPSG:3763)',
+        exported_at: exportedAtIso,
+      },
+      geometry: {
+        type: 'Polygon',
+        coordinates: [parcelClosedRing],
+      },
+    },
+  ];
+
+  const pushMultiPolygonLayer = (params: {
+    code: string;
+    labelPt: string;
+    legalRulePt: string;
+    areaM2: number;
+    colorHex: string;
+    multiPoly?: LatLonMultiPolygon;
+    fallbackSingleRing?: LatLon[];
+  }) => {
+    const coords =
+      params.multiPoly && params.multiPoly.length > 0
+        ? latLonMultiPolygonToGeoJsonCoords(params.multiPoly)
+        : params.fallbackSingleRing && params.fallbackSingleRing.length >= 3
+          ? [[toCounterClockwiseClosedRing(params.fallbackSingleRing)]]
+          : [];
+
+    if (coords.length === 0) return;
+
+    features.push({
+      type: 'Feature',
+      id: `${parcel.id}-${params.code.toLowerCase()}`,
+      properties: {
+        layer_code: params.code,
+        layer_label_pt: params.labelPt,
+        legal_rule: params.legalRulePt,
+        area_m2: params.areaM2,
+        stroke_hex: params.colorHex,
+        parcel_id: parcel.id,
+        bupi_rgg_id: parcel.bupiRggId,
+      },
+      geometry: {
+        type: 'MultiPolygon',
+        coordinates: coords,
+      },
+    });
+  };
+
+  pushMultiPolygonLayer({
+    code: 'OWN_BUILDINGS',
+    labelPt: 'Edificações Próprias na Parcela',
+    legalRulePt: 'Alvenaria base para medição das faixas concêntricas (Despacho n.º 675/2026)',
+    areaM2: meta?.ownBuildingsAreaM2 ?? 0,
+    colorHex: '#FFFFFF',
+    multiPoly: mp?.ownBuildings,
+    fallbackSingleRing: sp.polygons.buildingFootprint,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'NEIGHBOR_BUILDINGS',
+    labelPt: 'Edificações Vizinhas Confinantes (<= 50m/100m)',
+    legalRulePt: 'Edifícios externos que projetam obrigação legal de limpeza sobre esta parcela',
+    areaM2:
+      parcel.vectorContext?.buildings
+        .filter((b) => b.role === 'NEIGHBOR')
+        .reduce((acc, b) => acc + b.areaM2, 0) ?? 0,
+    colorHex: '#C084FC',
+    multiPoly: mp?.neighborBuildings,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'ZONE_1_IMMEDIATE_0_2M',
+    labelPt: 'Zona 1 · Interface Imediata (0–2 m)',
+    legalRulePt: 'Faixa inerte obrigatória (brita, lajeado ou solo mineral nu) — Despacho n.º 675/2026',
+    areaM2: sp.zone1ImmediateM2,
+    colorHex: '#E11D48',
+    multiPoly: mp?.zone1Immediate,
+    fallbackSingleRing: sp.polygons.zone1Immediate,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'ZONE_2_NEAR_2_10M',
+    labelPt: 'Zona 2 · Interface Próxima (2–10 m)',
+    legalRulePt: 'Desramação a 50% / mín. 4 m e zero copas a < 5 m da alvenaria — Despacho n.º 675/2026',
+    areaM2: sp.zone2NearM2,
+    colorHex: '#EA580C',
+    multiPoly: mp?.zone2Near,
+    fallbackSingleRing: sp.polygons.zone2Near,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'ZONE_3_EXTENDED_10_50M',
+    labelPt: `Zona 3 · Interface Alargada (10–${meta?.outerBufferRadiusM ?? 50} m)`,
+    legalRulePt: 'Corte de mato (< 20 cm) e afastamento de copas 4 m / 10 m (pinheiro/eucalipto)',
+    areaM2: sp.zone3ExtendedM2,
+    colorHex: '#F59E0B',
+    multiPoly: mp?.zone3Extended,
+    fallbackSingleRing: sp.polygons.zone3Extended,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'NEIGHBOR_INDUCED_OBLIGATION',
+    labelPt: 'Sub-camada · Obrigação Induzida por Edifício Vizinho',
+    legalRulePt: 'Área dentro da nossa parcela cuja limpeza é exigida exclusivamente por habitação confinante',
+    areaM2: meta?.neighborInducedCleanAreaM2 ?? 0,
+    colorHex: '#FB7185',
+    multiPoly: mp?.neighborInducedObligation,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'THIRD_PARTY_EASEMENT',
+    labelPt: 'Servidões de Terceiros (E-REDES / REN / Rede Viária)',
+    legalRulePt: 'Gestão de combustível da responsabilidade da entidade gestora (Art.º 49.º DL 82/2021)',
+    areaM2: sp.thirdPartyEasementM2,
+    colorHex: '#06B6D4',
+    multiPoly: mp?.thirdPartyCorridor,
+    fallbackSingleRing: sp.polygons.thirdPartyCorridor,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'RIPARIAN_AGRI_EXEMPT',
+    labelPt: 'Galeria Ripícola & Solo Agrícola Protegido',
+    legalRulePt: 'Isenção ambiental de vegetação ripícola e culturas agrícolas regadas (DL 82/2021)',
+    areaM2: meta?.riparianProtectedM2 ?? 0,
+    colorHex: '#10B981',
+    multiPoly: mp?.riparianAndAgriExempt,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'EXEMPT_ZONE',
+    labelPt: 'Zona Total Isenta de Gestão Florestal',
+    legalRulePt: 'Fora dos buffers legais ou protegida por regime hídrico/agrícola',
+    areaM2: sp.exemptAreaM2,
+    colorHex: '#4ADE80',
+    multiPoly: mp?.exemptCore,
+    fallbackSingleRing: sp.polygons.exemptCore,
+  });
+
+  pushMultiPolygonLayer({
+    code: 'NEIGHBOR_OVERFLOW_RISK',
+    labelPt: 'Transbordo da Faixa de 50 m sobre Terreno Vizinho',
+    legalRulePt: 'Coroa exterior de proteção da nossa habitação incidente sobre prédio confinante (Art.º 57.º/58.º DL 82/2021)',
+    areaM2: meta?.neighborOverflowRiskM2 ?? 0,
+    colorHex: '#A855F7',
+    multiPoly: mp?.neighborRiskOverflow,
+    fallbackSingleRing: sp.polygons.neighborRiskParcel,
+  });
+
+  // Include individual human-verified building footprints & linear/polygonal context features for CAD/GIS audit
+  for (const bldg of parcel.vectorContext?.buildings ?? []) {
+    if (bldg.source === 'USER_DEFINED' && bldg.footprint.length >= 3) {
+      features.push({
+        type: 'Feature',
+        id: `${parcel.id}-hitl-bldg-${bldg.id}`,
+        properties: {
+          layer_code: 'USER_VERIFIED_BUILDING',
+          building_id: bldg.id,
+          role: bldg.role,
+          label_pt: bldg.label,
+          area_m2: bldg.areaM2,
+          dist_parcel_edge_m: bldg.distanceToParcelEdgeM,
+          source: bldg.source,
+          human_verified: true,
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [toCounterClockwiseClosedRing(bldg.footprint)],
+        },
+      });
+    }
+  }
+
+  for (const eas of parcel.vectorContext?.easements ?? []) {
+    if (eas.centerline.length >= 2) {
+      features.push({
+        type: 'Feature',
+        id: `${parcel.id}-line-${eas.id}`,
+        properties: {
+          layer_code: 'DETECTED_EASEMENT_AXIS',
+          easement_category: eas.category,
+          label_pt: eas.label,
+          operator: eas.operatorLabel,
+          half_width_m: eas.bufferHalfWidthM,
+          source: eas.source,
+          human_verified: eas.source === 'USER_DEFINED',
+        },
+        geometry: {
+          type: 'LineString',
+          coordinates: eas.centerline.map((pt) => [
+            Number(pt.lon.toFixed(6)),
+            Number(pt.lat.toFixed(6)),
+          ]),
+        },
+      });
+    }
+  }
+
+  for (const ex of parcel.vectorContext?.exemptFeatures ?? []) {
+    if (ex.centerline && ex.centerline.length >= 2) {
+      features.push({
+        type: 'Feature',
+        id: `${parcel.id}-water-${ex.id}`,
+        properties: {
+          layer_code: 'DETECTED_WATERWAY_AXIS',
+          exempt_category: ex.category,
+          label_pt: ex.label,
+          legal_basis: ex.legalBasis,
+          half_width_m: ex.bufferHalfWidthM ?? 5,
+          source: ex.source,
+          human_verified: ex.source === 'USER_DEFINED',
+        },
+        geometry: {
+          type: 'LineString',
+          coordinates: ex.centerline.map((pt) => [
+            Number(pt.lon.toFixed(6)),
+            Number(pt.lat.toFixed(6)),
+          ]),
+        },
+      });
+    } else if (ex.polygon && ex.polygon.length >= 3) {
+      features.push({
+        type: 'Feature',
+        id: `${parcel.id}-exempt-poly-${ex.id}`,
+        properties: {
+          layer_code: 'DETECTED_EXEMPT_POLYGON',
+          exempt_category: ex.category,
+          label_pt: ex.label,
+          legal_basis: ex.legalBasis,
+          source: ex.source,
+          human_verified: ex.source === 'USER_DEFINED',
+        },
+        geometry: {
+          type: 'Polygon',
+          coordinates: [toCounterClockwiseClosedRing(ex.polygon)],
+        },
+      });
+    }
+  }
+
+  // Phase 2 & Phase 3 CV Layers: Individual Tree Crowns & Unmapped Roof Structures from 25 cm Orthophoto
+  if (parcel.cvAnalysis) {
+    for (const crown of parcel.cvAnalysis.crowns) {
+      if (crown.polygonWgs84.length >= 3) {
+        features.push({
+          type: 'Feature',
+          id: `${parcel.id}-cv-${crown.id}`,
+          properties: {
+            layer_code: 'DETECTED_TREE_CROWN',
+            crown_id: crown.id,
+            species_group: crown.speciesGroup,
+            diameter_m: crown.diameterM,
+            area_m2: crown.areaM2,
+            dist_building_wall_m: crown.distanceToBuildingWallM,
+            nearest_crown_dist_m: crown.nearestCrownDistanceM,
+            zone_code: crown.zoneCode,
+            compliant: crown.violationRulePt === null,
+            violation_rule_pt: crown.violationRulePt,
+            human_override: crown.humanOverride ?? null,
+            gsd_m_px: parcel.cvAnalysis.gsdMetersPerPx,
+          },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [toCounterClockwiseClosedRing(crown.polygonWgs84)],
+          },
+        });
+      }
+    }
+
+    for (const roof of parcel.cvAnalysis.detectedRoofs) {
+      if (roof.isUnmappedInOsm && roof.footprintWgs84.length >= 3) {
+        features.push({
+          type: 'Feature',
+          id: `${parcel.id}-cv-${roof.id}`,
+          properties: {
+            layer_code: 'CV_UNMAPPED_STRUCTURE',
+            structure_id: roof.id,
+            label_pt: roof.label,
+            role: roof.role,
+            area_m2: roof.areaM2,
+            confidence: roof.confidence,
+            dist_parcel_edge_m: roof.distanceToParcelEdgeM,
+            review_status: roof.reviewStatus ?? 'UNREVIEWED',
+          },
+          geometry: {
+            type: 'Polygon',
+            coordinates: [toCounterClockwiseClosedRing(roof.footprintWgs84)],
+          },
+        });
+      }
+    }
+  }
+
+  return JSON.stringify(
+    {
+      type: 'FeatureCollection',
+      name: `FaixaSegura_Decomposicao_Legal_${parcel.bupiRggId || parcel.id}`,
+      crs: {
+        type: 'name',
+        properties: { name: 'urn:ogc:def:crs:OGC:1.3:CRS84' },
+      },
+      features,
+    },
+    null,
+    2
+  );
+}
 

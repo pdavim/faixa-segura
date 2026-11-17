@@ -12,6 +12,7 @@ import {
   LocateFixed,
   MapPin,
   Minus,
+  MousePointerClick,
   PenTool,
   Plus,
   PlusCircle,
@@ -26,17 +27,31 @@ import type {
   ActiveFireIncident,
   LandClass,
   LatLon,
+  LatLonMultiPolygon,
   MunicipalityInfo,
+  ParcelOrthophotoCvAnalysis,
   ParcelRecord,
+  ParcelVectorContext,
+  SpatialZoneBreakdown,
   StormAlertIncident,
 } from '../types/domain.ts';
 import {
   buildParcelGeoJsonFilename,
+  buildParcelLegalDecompositionGeoJson,
+  buildParcelLegalGeoJsonFilename,
   buildParcelVerticesGeoJson,
+  computeParcelFgc,
   computeParcelLeafletBounds,
   computePolygonMetrics3763,
   haversineDistanceKm,
 } from '../lib/spatialEngine.ts';
+import { synthesizeDeterministicCadastreContext } from '../lib/vectorContextIngestor.ts';
+import {
+  computeParcelCvRasterGrid,
+  fuseCvDetectionsIntoVectorContext,
+  runOrthophotoPixelPipeline,
+  synthesizeDeterministicParcelOrthophotoRgba,
+} from '../lib/orthophotoCvPipeline.ts';
 import {
   buildLocalParcelRecord,
   extractCadernetaOffline,
@@ -48,10 +63,29 @@ import {
   updatePolygonVertexAt,
 } from '../lib/userWorkspaceStore.ts';
 import {
+  addAssistedBuildingToParcel,
+  addAssistedEasementToParcel,
+  addAssistedExemptZoneToParcel,
+  buildRectangularFootprintAtWgs84,
+  mergePreservingUserDefinedContext,
+  overrideCvCrownStatus,
+  removeAssistedVectorElement,
+  resetParcelToAutomaticContext,
+  reviewCvRoofDetection,
+  toggleAssistedBuildingRole,
+  updateAssistedEasementWidth,
+  type AssistedSubTool,
+  type BuildingDrawStyle,
+  type EasementPresetCode,
+  type ExemptPresetCode,
+} from '../lib/assistedMapEditor.ts';
+import { AssistedHitlPanel } from './AssistedHitlPanel.tsx';
+import {
   buildOfflineFallbackTileSvgDataUrl,
   buildTileUrl,
   formatByteSizePt,
   getSharedOfflineTileCacheManager,
+  resolveTileTemplateUrl,
   type MapTileStyle,
   type OfflineParcelMapSnapshot,
   type OfflineTileCacheManager,
@@ -74,17 +108,14 @@ class OfflineAwareLeafletTileLayer extends L.TileLayer {
     getActiveParcelId: () => string;
     onTileServed?: (source: TileServeSource) => void;
   }) {
-    const templateUrl =
-      params.style === 'ORTHOPHOTO'
-        ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-        : 'https://a.basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png';
+    const templateUrl = resolveTileTemplateUrl(params.style);
 
     super(templateUrl, {
       maxZoom: params.maxZoom,
       attribution:
         params.style === 'ORTHOPHOTO'
           ? 'Ortofoto Aérea / Satélite · Cache Offline EPSG:3763'
-          : 'Cartografia Vetorial OpenStreetMap / CARTO · Cache Offline',
+          : 'Cartografia Topográfica & Vetorial OSM · Cache Offline',
     });
 
     this.tileStyle = params.style;
@@ -178,6 +209,7 @@ interface MapZonesViewProps {
   proximityAlertRadiusKm?: number;
   onSelectParcel: (parcelId: string) => void;
   onCreateParcel: (newParcel: ParcelRecord) => void;
+  onUpdateParcel?: (updatedParcel: ParcelRecord) => void;
   onNavigateTab: (tab: 'today' | 'map' | 'certify' | 'providers' | 'docs', subMode?: string) => void;
 }
 
@@ -190,6 +222,7 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   proximityAlertRadiusKm = 15,
   onSelectParcel,
   onCreateParcel,
+  onUpdateParcel,
   onNavigateTab,
 }) => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
@@ -198,12 +231,16 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   const tileLayerRef = useRef<L.TileLayer | null>(null);
 
   const [baseMapStyle, setBaseMapStyle] = useState<'ORTHOPHOTO' | 'VECTOR'>('ORTHOPHOTO');
-  const [mapToolMode, setMapToolMode] = useState<'INSPECT' | 'DRAW' | 'CADERNETA'>('INSPECT');
+  const [mapToolMode, setMapToolMode] = useState<'INSPECT' | 'ASSISTED' | 'DRAW' | 'CADERNETA'>(
+    'INSPECT'
+  );
   const [visibleLayers, setVisibleLayers] = useState({
     zones675: true,
     eredes: true,
     exempt: true,
     neighborRisk: true,
+    detectedContext: true,
+    orthophotoCv: true,
     hazardPerimeter: true,
   });
 
@@ -219,16 +256,167 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   const [savingParcel, setSavingParcel] = useState(false);
   const [drawError, setDrawError] = useState<string | null>(null);
 
-  // Caderneta Predial extraction & GIS export state
+  // Caderneta Predial extraction, live vector context detection, Orthophoto 25cm CV & GIS export state
   const [cadernetaText, setCadernetaText] = useState('');
   const [extractingCaderneta, setExtractingCaderneta] = useState(false);
+  const [detectingContext, setDetectingContext] = useState(false);
+  const [runningOrthophotoCv, setRunningOrthophotoCv] = useState(false);
+  const [vectorStatusNotice, setVectorStatusNotice] = useState<{
+    parcelId: string;
+    summary: string;
+    detectedAtTime: string;
+  } | null>(null);
+  const [cvStatusNotice, setCvStatusNotice] = useState<{
+    parcelId: string;
+    summary: string;
+    analyzedAtTime: string;
+  } | null>(null);
+  const [lookingUpCadastre, setLookingUpCadastre] = useState(false);
+  const [cadastreLookupNotice, setCadastreLookupNotice] = useState<string | null>(null);
+  const [calculatingSlope, setCalculatingSlope] = useState(false);
+  const [slopeStatusNotice, setSlopeStatusNotice] = useState<{
+    parcelId: string;
+    summary: string;
+  } | null>(null);
   const [selectedZoneCallout, setSelectedZoneCallout] = useState<string | null>(null);
   const [exportedGeoJsonNotice, setExportedGeoJsonNotice] = useState<{
     parcelId: string;
     filename: string;
-    vertexCount: number;
+    detailLabel: string;
     exportedAtTime: string;
   } | null>(null);
+
+  // Phase 3: Assisted Map Editing (Human-in-the-Loop) state
+  const [assistedSubTool, setAssistedSubTool] = useState<AssistedSubTool>('REVIEW');
+  const [assistedBldgStyle, setAssistedBldgStyle] = useState<BuildingDrawStyle>('STAMP_1CLICK');
+  const [assistedBldgLabel, setAssistedBldgLabel] = useState('');
+  const [assistedEasementPreset, setAssistedEasementPreset] =
+    useState<EasementPresetCode>('EREDES_MT');
+  const [assistedEasementWidthM, setAssistedEasementWidthM] = useState<number>(4.25);
+  const [assistedExemptPreset, setAssistedExemptPreset] =
+    useState<ExemptPresetCode>('RIPARIAN_WATERWAY');
+  const [assistedExemptWidthM, setAssistedExemptWidthM] = useState<number>(5);
+  const [assistedDraftPoints, setAssistedDraftPoints] = useState<LatLon[]>([]);
+  const [assistedSelectedId, setAssistedSelectedId] = useState<string | null>(null);
+  const [assistedFeedback, setAssistedFeedback] = useState<string | null>(null);
+  const [assistedUndoStack, setAssistedUndoStack] = useState<ParcelRecord[]>([]);
+
+  const commitAssistedParcelMutation = useCallback(
+    (nextParcel: ParcelRecord, feedbackPt: string) => {
+      setAssistedUndoStack((prev) => [activeParcel, ...prev].slice(0, 10));
+      onUpdateParcel?.(nextParcel);
+      setAssistedFeedback(feedbackPt);
+      setVisibleLayers((prev) => ({
+        ...prev,
+        zones675: true,
+        eredes: true,
+        exempt: true,
+        detectedContext: true,
+      }));
+    },
+    [activeParcel, onUpdateParcel]
+  );
+
+  const handleLookupOfficialDgtCadastre = async () => {
+    setLookingUpCadastre(true);
+    setCadastreLookupNotice(null);
+    setDrawError(null);
+    try {
+      const center = mapInstanceRef.current?.getCenter();
+      const targetPoint: LatLon = center
+        ? { lat: Number(center.lat.toFixed(6)), lon: Number(center.lng.toFixed(6)) }
+        : activeParcel.spatial.centroidWgs84;
+      const resp = await fetch('/api/spatial/official-cadastre', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ targetPoint }),
+      });
+      if (!resp.ok) {
+        setCadastreLookupNotice('Serviço OGC da DGT temporariamente indisponível.');
+        return;
+      }
+      const data = (await resp.json()) as {
+        found?: boolean;
+        match?: {
+          cadastralReference: string;
+          areaM2: number;
+          vertices: LatLon[];
+          sourceLabel: string;
+        } | null;
+        fallbackNotePt?: string;
+      };
+      if (data.found && data.match && Array.isArray(data.match.vertices) && data.match.vertices.length >= 3) {
+        setDrawnVertices(data.match.vertices);
+        setNewParcelLabel(`Prédio DGT ${data.match.cadastralReference}`);
+        setMapToolMode('DRAW');
+        setCadastreLookupNotice(
+          `Polígono oficial ${data.match.cadastralReference} (${data.match.areaM2.toFixed(0)} m²) carregado para validação.`
+        );
+      } else {
+        setCadastreLookupNotice(
+          data.fallbackNotePt ||
+            'Sem geometria cadastral oficial publicada pela DGT neste ponto (concelho sem cadastro geométrico aberto).'
+        );
+      }
+    } catch {
+      setCadastreLookupNotice('Sem ligação ao endpoint de cadastro oficial DGT.');
+    } finally {
+      setLookingUpCadastre(false);
+    }
+  };
+
+  const handleRefreshElevationSlope = async () => {
+    setCalculatingSlope(true);
+    try {
+      const resp = await fetch('/api/spatial/elevation-slope', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          parcelId: activeParcel.id,
+          vertices: activeParcel.vertices,
+        }),
+      });
+      if (resp.ok) {
+        const data = (await resp.json()) as {
+          avgSlopePct?: number;
+          elevationMeta?: ParcelRecord['elevationMeta'];
+        };
+        if (typeof data.avgSlopePct === 'number' && data.elevationMeta) {
+          onUpdateParcel?.({
+            ...activeParcel,
+            avgSlopePct: data.avgSlopePct,
+            elevationMeta: data.elevationMeta,
+          });
+          setSlopeStatusNotice({
+            parcelId: activeParcel.id,
+            summary: `Declive MDT ${data.avgSlopePct}% · Alt. ${data.elevationMeta.minElevationM}–${data.elevationMeta.maxElevationM} m (desnível ${data.elevationMeta.reliefM} m) · ${data.elevationMeta.aspectLabelPt}`,
+          });
+        }
+      }
+    } catch {
+      setSlopeStatusNotice({
+        parcelId: activeParcel.id,
+        summary: `Declive ${activeParcel.avgSlopePct}% mantido localmente.`,
+      });
+    } finally {
+      setCalculatingSlope(false);
+    }
+  };
+
+  const commitAssistedMutationRef = useRef(commitAssistedParcelMutation);
+  commitAssistedMutationRef.current = commitAssistedParcelMutation;
+
+  const activeParcelObjRef = useRef(activeParcel);
+  activeParcelObjRef.current = activeParcel;
+
+  const assistedSubToolRef = useRef(assistedSubTool);
+  assistedSubToolRef.current = assistedSubTool;
+
+  const assistedBldgStyleRef = useRef(assistedBldgStyle);
+  assistedBldgStyleRef.current = assistedBldgStyle;
+
+  const assistedBldgLabelRef = useRef(assistedBldgLabel);
+  assistedBldgLabelRef.current = assistedBldgLabel;
 
   const mapToolModeRef = useRef(mapToolMode);
   mapToolModeRef.current = mapToolMode;
@@ -372,6 +560,40 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             lon: ev.latlng.lng,
           })
         );
+        return;
+      }
+
+      if (mapToolModeRef.current === 'ASSISTED') {
+        const sub = assistedSubToolRef.current;
+        const clickPt: LatLon = {
+          lat: Number(ev.latlng.lat.toFixed(6)),
+          lon: Number(ev.latlng.lng.toFixed(6)),
+        };
+
+        if (
+          (sub === 'OWN_BUILDING' || sub === 'NEIGHBOR_BUILDING') &&
+          assistedBldgStyleRef.current === 'STAMP_1CLICK'
+        ) {
+          const role = sub === 'OWN_BUILDING' ? 'OWN' : 'NEIGHBOR';
+          const rect = buildRectangularFootprintAtWgs84(clickPt, 8.5, 6.5);
+          const nextParcel = addAssistedBuildingToParcel(activeParcelObjRef.current, {
+            footprint: rect,
+            role,
+            label: assistedBldgLabelRef.current.trim() || undefined,
+          });
+          setAssistedBldgLabel('');
+          commitAssistedMutationRef.current(
+            nextParcel,
+            role === 'OWN'
+              ? 'Anexo / edificação própria adicionada e faixas 0–2–10–50 m recalculadas em EPSG:3763.'
+              : 'Edifício vizinho adicionado e obrigação confinante recalculada em EPSG:3763.'
+          );
+          return;
+        }
+
+        if (sub !== 'REVIEW') {
+          setAssistedDraftPoints((prev) => appendPolygonVertex(prev, clickPt));
+        }
       }
     });
 
@@ -404,20 +626,17 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     }).addTo(map);
   }, [baseMapStyle]);
 
-  const handleCenterOnActiveParcel = useCallback(
-    (animate = true) => {
-      const map = mapInstanceRef.current;
-      if (!map) return;
-      const bounds = computeParcelLeafletBounds(activeParcel);
-      map.fitBounds(bounds.leafletBounds, {
-        padding: [36, 36],
-        maxZoom: 18,
-        animate,
-      });
-      setCurrentZoom(map.getZoom());
-    },
-    [activeParcel]
-  );
+  const handleCenterOnActiveParcel = useCallback((animate = true) => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    const bounds = computeParcelLeafletBounds(activeParcelObjRef.current);
+    map.fitBounds(bounds.leafletBounds, {
+      padding: [36, 36],
+      maxZoom: 18,
+      animate,
+    });
+    setCurrentZoom(map.getZoom());
+  }, []);
 
   const handleZoomIn = useCallback(() => {
     const map = mapInstanceRef.current;
@@ -435,137 +654,441 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
   useEffect(() => {
     handleCenterOnActiveParcel(false);
     setSelectedZoneCallout(null);
+    setAssistedDraftPoints([]);
+    setAssistedSelectedId(null);
+    setAssistedFeedback(null);
+    setAssistedUndoStack([]);
   }, [activeParcel.id, handleCenterOnActiveParcel]);
 
-  // Render spatial polygons on map
+  // Render boolean MultiPolygons (with true interior holes) + detected external vector context on map
   useEffect(() => {
     const group = overlaysGroupRef.current;
     if (!group) return;
     group.clearLayers();
 
     const sp = activeParcel.spatial;
+    const mp = sp.multiPolygons;
+    const meta = sp.decompositionMeta;
+    const outerRadiusM = meta?.outerBufferRadiusM ?? 50;
+    const allowOverlayClick =
+      mapToolMode === 'INSPECT' || (mapToolMode === 'ASSISTED' && assistedSubTool === 'REVIEW');
     const toLatLngs = (pts: LatLon[]): L.LatLngExpression[] => pts.map((p) => [p.lat, p.lon]);
-
-    // 1. Exempt Green interior (#4ADE80)
-    if (visibleLayers.exempt && sp.polygons.exemptCore.length >= 3) {
-      L.polygon(toLatLngs(sp.polygons.exemptCore), {
-        color: '#4ADE80',
-        weight: 1.5,
-        fillColor: '#4ADE80',
-        fillOpacity: 0.16,
-      })
-        .bindTooltip('Zona Interior Isenta (Sem obrigação legal)', { sticky: true })
-        .on('click', () =>
-          setSelectedZoneCallout(
-            `Zona Interior Isenta (${sp.exemptAreaM2.toFixed(0)} m²): Fora dos buffers de edifícios e vias.`
+    const toMultiPolyLatLngs = (
+      multi: LatLonMultiPolygon | undefined,
+      fallback?: LatLon[]
+    ): L.LatLngExpression[][][] => {
+      if (multi && multi.length > 0) {
+        return multi
+          .map((poly) =>
+            poly
+              .filter((ring) => ring.length >= 3)
+              .map((ring) => ring.map((p) => [p.lat, p.lon] as [number, number]))
           )
-        )
-        .addTo(group);
+          .filter((poly) => poly.length > 0);
+      }
+      if (fallback && fallback.length >= 3) {
+        return [[fallback.map((p) => [p.lat, p.lon] as [number, number])]];
+      }
+      return [];
+    };
+
+    // 0. Phase 2 Orthophoto 25 cm Semantic Raster Mask (underneath crisp vector boundaries)
+    if (visibleLayers.orthophotoCv && activeParcel.cvAnalysis?.overlayDataUrl) {
+      L.imageOverlay(
+        activeParcel.cvAnalysis.overlayDataUrl,
+        activeParcel.cvAnalysis.leafletBounds,
+        {
+          opacity: 0.54,
+          interactive: false,
+        }
+      ).addTo(group);
     }
 
-    // 2. Despacho 675/2026 Zones (Z3 Amber -> Z2 Orange -> Z1 Crimson)
+    // 1. Exempt Zones: General Exempt Core (#4ADE80) + Riparian/Agricultural Protected Sub-layer (#10B981)
+    if (visibleLayers.exempt) {
+      const exemptCoords = toMultiPolyLatLngs(mp?.exemptCore, sp.polygons.exemptCore);
+      if (exemptCoords.length > 0 && sp.exemptAreaM2 > 0) {
+        L.polygon(exemptCoords, {
+          color: '#4ADE80',
+          weight: 1.5,
+          fillColor: '#4ADE80',
+          fillOpacity: 0.16,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `Zona Isenta (${sp.exemptAreaM2.toFixed(0)} m² · Ripícola/Agrícola: ${(meta?.riparianProtectedM2 ?? 0).toFixed(0)} m²)`,
+            { sticky: true }
+          )
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `Zona Isenta (${sp.exemptAreaM2.toFixed(0)} m²): Fora das faixas obrigatórias ou protegida por galeria ripícola / regime agrícola (${(meta?.riparianProtectedM2 ?? 0).toFixed(0)} m²).`
+            )
+          )
+          .addTo(group);
+      }
+
+      const riparianCoords = toMultiPolyLatLngs(mp?.riparianAndAgriExempt);
+      if (riparianCoords.length > 0 && (meta?.riparianProtectedM2 ?? 0) > 0) {
+        L.polygon(riparianCoords, {
+          color: '#10B981',
+          weight: 2,
+          dashArray: '4, 3',
+          fillColor: '#10B981',
+          fillOpacity: 0.24,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `Galeria Ripícola / Solo Agrícola Protegido: ${(meta?.riparianProtectedM2 ?? 0).toFixed(0)} m² (Isenção DL 82/2021)`,
+            { sticky: true }
+          )
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `Galeria Ripícola / Solo Agrícola Protegido (${(meta?.riparianProtectedM2 ?? 0).toFixed(0)} m²): Vegetação ripícola junto a linha de água protegida contra corte raso (Art.º 49.º DL 82/2021).`
+            )
+          )
+          .addTo(group);
+      }
+    }
+
+    // 2. Despacho 675/2026 Boolean Ring Zones (Z3 Amber -> Z2 Orange -> Z1 Crimson + Neighbor-Induced Slice)
     if (visibleLayers.zones675) {
-      L.polygon(toLatLngs(sp.polygons.zone3Extended), {
-        color: '#F59E0B',
-        weight: 2,
-        fillColor: '#F59E0B',
-        fillOpacity: 0.24,
-      })
-        .bindTooltip(`Zona 3 Alargada (10–50m): ${sp.zone3ExtendedM2.toFixed(0)} m²`, { sticky: true })
-        .on('click', () =>
-          setSelectedZoneCallout(
-            `Zona 3 Alargada (10–50 m · ${sp.zone3ExtendedM2.toFixed(0)} m²): Mato rasteiro (<20 cm) e copas afastadas 4 m (10 m pinheiro/eucalipto).`
+      const z3Coords = toMultiPolyLatLngs(mp?.zone3Extended, sp.polygons.zone3Extended);
+      if (z3Coords.length > 0 && sp.zone3ExtendedM2 > 0) {
+        L.polygon(z3Coords, {
+          color: '#F59E0B',
+          weight: 2,
+          fillColor: '#F59E0B',
+          fillOpacity: 0.24,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `Zona 3 Alargada (10–${outerRadiusM}m): ${sp.zone3ExtendedM2.toFixed(0)} m²`,
+            { sticky: true }
           )
-        )
-        .addTo(group);
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `Zona 3 Alargada (10–${outerRadiusM} m · ${sp.zone3ExtendedM2.toFixed(0)} m²): Mato rasteiro (<20 cm) e copas afastadas 4 m (10 m pinheiro/eucalipto).`
+            )
+          )
+          .addTo(group);
+      }
 
-      L.polygon(toLatLngs(sp.polygons.zone2Near), {
-        color: '#EA580C',
-        weight: 2,
-        fillColor: '#EA580C',
-        fillOpacity: 0.32,
-      })
-        .bindTooltip(`Zona 2 Próxima (2–10m): ${sp.zone2NearM2.toFixed(0)} m²`, { sticky: true })
-        .on('click', () =>
-          setSelectedZoneCallout(
-            `Zona 2 Interface Próxima (2–10 m · ${sp.zone2NearM2.toFixed(0)} m²): Desramação a 50% / mín. 4m e zero copas a menos de 5m da parede.`
+      const z2Coords = toMultiPolyLatLngs(mp?.zone2Near, sp.polygons.zone2Near);
+      if (z2Coords.length > 0 && sp.zone2NearM2 > 0) {
+        L.polygon(z2Coords, {
+          color: '#EA580C',
+          weight: 2,
+          fillColor: '#EA580C',
+          fillOpacity: 0.32,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(`Zona 2 Próxima (2–10m): ${sp.zone2NearM2.toFixed(0)} m²`, { sticky: true })
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `Zona 2 Interface Próxima (2–10 m · ${sp.zone2NearM2.toFixed(0)} m²): Desramação a 50% / mín. 4m e zero copas a menos de 5m da parede.`
+            )
           )
-        )
-        .addTo(group);
+          .addTo(group);
+      }
 
-      L.polygon(toLatLngs(sp.polygons.zone1Immediate), {
-        color: '#E11D48',
-        weight: 2.5,
-        fillColor: '#E11D48',
-        fillOpacity: 0.42,
-      })
-        .bindTooltip(`Zona 1 Faixa Inerte (0–2m): ${sp.zone1ImmediateM2.toFixed(0)} m²`, { sticky: true })
-        .on('click', () =>
-          setSelectedZoneCallout(
-            `Zona 1 Interface Imediata (0–2 m · ${sp.zone1ImmediateM2.toFixed(0)} m²): Faixa inerte obrigatória (brita, lajeado ou solo mineral nu).`
+      const z1Coords = toMultiPolyLatLngs(mp?.zone1Immediate, sp.polygons.zone1Immediate);
+      if (z1Coords.length > 0 && sp.zone1ImmediateM2 > 0) {
+        L.polygon(z1Coords, {
+          color: '#E11D48',
+          weight: 2.5,
+          fillColor: '#E11D48',
+          fillOpacity: 0.42,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(`Zona 1 Faixa Inerte (0–2m): ${sp.zone1ImmediateM2.toFixed(0)} m²`, { sticky: true })
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `Zona 1 Interface Imediata (0–2 m · ${sp.zone1ImmediateM2.toFixed(0)} m²): Faixa inerte obrigatória (brita, lajeado ou solo mineral nu).`
+            )
           )
-        )
-        .addTo(group);
+          .addTo(group);
+      }
+
+      const nbInducedCoords = toMultiPolyLatLngs(mp?.neighborInducedObligation);
+      if (nbInducedCoords.length > 0 && (meta?.neighborInducedCleanAreaM2 ?? 0) > 0) {
+        L.polygon(nbInducedCoords, {
+          color: '#FB7185',
+          weight: 2,
+          dashArray: '5, 4',
+          fillColor: '#FB7185',
+          fillOpacity: 0.14,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `Obrigação Induzida por Edifício Vizinho: ${(meta?.neighborInducedCleanAreaM2 ?? 0).toFixed(0)} m² dentro desta parcela`,
+            { sticky: true }
+          )
+          .on('click', () =>
+            setSelectedZoneCallout(
+              `Obrigação Induzida por Vizinho (${(meta?.neighborInducedCleanAreaM2 ?? 0).toFixed(0)} m²): Área no interior do seu lote abrangida pelo raio legal de 50 m de habitação confinante externa.`
+            )
+          )
+          .addTo(group);
+      }
     }
 
-    // 3. E-REDES Third-Party Corridor (#06B6D4)
-    if (visibleLayers.eredes && sp.polygons.thirdPartyCorridor.length >= 3) {
-      L.polygon(toLatLngs(sp.polygons.thirdPartyCorridor), {
+    // 3. Third-Party Easements: E-REDES / REN + Public Road Corridors (#06B6D4)
+    const easementCoords = toMultiPolyLatLngs(
+      mp?.thirdPartyCorridor,
+      sp.polygons.thirdPartyCorridor
+    );
+    if (visibleLayers.eredes && easementCoords.length > 0 && sp.thirdPartyEasementM2 > 0) {
+      L.polygon(easementCoords, {
         color: '#06B6D4',
         weight: 2.5,
         fillColor: '#06B6D4',
         fillOpacity: 0.32,
+        interactive: allowOverlayClick,
       })
         .bindTooltip(
-          `Servidão ${activeParcel.eredesType}: ${sp.thirdPartyEasementM2.toFixed(0)} m² (Responsabilidade E-REDES)`,
+          `Servidões de Terceiros: ${sp.thirdPartyEasementM2.toFixed(0)} m² (E-REDES ${(meta?.eredesEasementM2 ?? 0).toFixed(0)} m² · Rede Viária ${(meta?.roadEasementM2 ?? 0).toFixed(0)} m²)`,
           { sticky: true }
         )
         .on('click', () =>
           setSelectedZoneCallout(
-            `Servidão ${activeParcel.eredesType} (${sp.thirdPartyEasementM2.toFixed(0)} m²): Limpeza da responsabilidade legal da E-REDES (Art.º 49.º DL 82/2021) — poupa ~${sp.estimatedEredesSavingsEur.toFixed(0)} €.`
+            `Servidões de Terceiros (${sp.thirdPartyEasementM2.toFixed(0)} m²): E-REDES ${(meta?.eredesEasementM2 ?? 0).toFixed(0)} m² + Faixa Viária ${(meta?.roadEasementM2 ?? 0).toFixed(0)} m² — gestão da responsabilidade da entidade gestora (Art.º 49.º DL 82/2021, poupança ~${sp.estimatedEredesSavingsEur.toFixed(0)} €).`
           )
         )
         .addTo(group);
     }
 
-    // 4. Neighbor Risk Parcel (#A855F7)
-    if (visibleLayers.neighborRisk && sp.polygons.neighborRiskParcel.length >= 3) {
-      L.polygon(toLatLngs(sp.polygons.neighborRiskParcel), {
+    // 4. Neighbor Risk Overflow Crescent (#A855F7)
+    const neighborOverflowCoords = toMultiPolyLatLngs(
+      mp?.neighborRiskOverflow,
+      sp.polygons.neighborRiskParcel
+    );
+    if (visibleLayers.neighborRisk && neighborOverflowCoords.length > 0) {
+      L.polygon(neighborOverflowCoords, {
         color: '#A855F7',
         weight: 2.5,
         dashArray: '5, 5',
         fillColor: '#A855F7',
-        fillOpacity: 0.36,
+        fillOpacity: 0.32,
+        interactive: allowOverlayClick,
       })
         .bindTooltip(
-          `Terreno Confinante em Infração (Mato a ${sp.neighborMinDistanceM.toFixed(1)}m da fachada · NDVI ${activeParcel.neighborInfo.ndvi})`,
+          `Transbordo da Faixa de 50 m em Terreno Confinante (${(meta?.neighborOverflowRiskM2 ?? 0).toFixed(0)} m² · Fachada a ${sp.neighborMinDistanceM.toFixed(1)} m · NDVI ${activeParcel.neighborInfo.ndvi})`,
           { sticky: true }
         )
         .on('click', () =>
           setSelectedZoneCallout(
-            `ALERTA VIZINHO: ${activeParcel.neighborInfo.vegetationDescription} a ${sp.neighborMinDistanceM.toFixed(2)} m da parede habitacional. Pode gerar Requerimento Municipal imediato.`
+            `ALERTA VIZINHO: Coroa de 50 m da sua habitação transborda ${(meta?.neighborOverflowRiskM2 ?? 0).toFixed(0)} m² para terreno confinante (${sp.neighborDirection}, parede a ${sp.neighborMinDistanceM.toFixed(1)} m). Pode emitir Requerimento GTF.`
           )
         )
         .addTo(group);
     }
 
-    // 5. Building footprint (Crisp White)
-    L.polygon(toLatLngs(sp.polygons.buildingFootprint), {
-      color: '#0F172A',
-      weight: 1.5,
-      fillColor: '#FFFFFF',
-      fillOpacity: 0.92,
-    })
-      .bindTooltip('Edificação Habitacional Principal', { sticky: true })
-      .addTo(group);
+    // 5. Detected External Vector Context (Neighbor Buildings, Powerline/Road Centerlines, Waterways, Orchards)
+    if (visibleLayers.detectedContext && activeParcel.vectorContext) {
+      for (const bldg of activeParcel.vectorContext.buildings) {
+        if (bldg.footprint.length < 3) continue;
+        if (bldg.role === 'NEIGHBOR') {
+          const isUserDef = bldg.source === 'USER_DEFINED';
+          L.polygon(toLatLngs(bldg.footprint), {
+            color: isUserDef ? '#7E22CE' : '#9333EA',
+            weight: assistedSelectedId === bldg.id ? 3.5 : 2,
+            fillColor: '#C084FC',
+            fillOpacity: 0.78,
+            interactive: allowOverlayClick,
+          })
+            .bindTooltip(
+              `${bldg.label} · ${bldg.areaM2.toFixed(0)} m² (a ${bldg.distanceToParcelEdgeM.toFixed(1)} m da estrema)`,
+              { sticky: true }
+            )
+            .on('click', () => {
+              setAssistedSelectedId(bldg.id);
+              setSelectedZoneCallout(
+                `${bldg.label}: Edifício externo a ${bldg.distanceToParcelEdgeM.toFixed(1)} m do limite da parcela — projeta faixa obrigatória sobre o seu terreno.`
+              );
+            })
+            .addTo(group);
+        }
+      }
 
-    // 6. User Parcel Boundary (#FACC15 Laser Yellow Dashed)
+      for (const eas of activeParcel.vectorContext.easements) {
+        if (eas.centerline.length < 2) continue;
+        const isPower = eas.category === 'EREDES_MT_AT' || eas.category === 'REN_MAT';
+        L.polyline(toLatLngs(eas.centerline), {
+          color: isPower ? '#06B6D4' : '#64748B',
+          weight: assistedSelectedId === eas.id ? 4.5 : isPower ? 3 : 2.5,
+          dashArray: eas.source === 'USER_DEFINED' ? undefined : isPower ? '8, 4' : '4, 4',
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(`${eas.label} · ${eas.operatorLabel} (±${eas.bufferHalfWidthM} m)`, {
+            sticky: true,
+          })
+          .on('click', () => {
+            setAssistedSelectedId(eas.id);
+            setSelectedZoneCallout(
+              `${eas.label} (±${eas.bufferHalfWidthM} m · ${eas.operatorLabel}): Faixa linear subtraída à sua área obrigatória de limpeza.`
+            );
+          })
+          .addTo(group);
+      }
+
+      for (const ex of activeParcel.vectorContext.exemptFeatures) {
+        if (ex.centerline && ex.centerline.length >= 2) {
+          L.polyline(toLatLngs(ex.centerline), {
+            color: '#10B981',
+            weight: assistedSelectedId === ex.id ? 4 : 2.5,
+            dashArray: ex.source === 'USER_DEFINED' ? undefined : '3, 5',
+            interactive: allowOverlayClick,
+          })
+            .bindTooltip(`${ex.label} · ${ex.legalBasis}`, { sticky: true })
+            .on('click', () => {
+              setAssistedSelectedId(ex.id);
+              setSelectedZoneCallout(`${ex.label}: ${ex.legalBasis}`);
+            })
+            .addTo(group);
+        } else if (ex.polygon && ex.polygon.length >= 3) {
+          L.polygon(toLatLngs(ex.polygon), {
+            color: '#059669',
+            weight: assistedSelectedId === ex.id ? 3 : 2,
+            fillColor: '#10B981',
+            fillOpacity: 0.28,
+            interactive: allowOverlayClick,
+          })
+            .bindTooltip(`${ex.label} · ${ex.legalBasis}`, { sticky: true })
+            .on('click', () => {
+              setAssistedSelectedId(ex.id);
+              setSelectedZoneCallout(`${ex.label}: ${ex.legalBasis}`);
+            })
+            .addTo(group);
+        }
+      }
+    }
+
+    // 6. Own Building footprints (Crisp White, individually clickable when present in vectorContext)
+    const ownVectorBldgs = (activeParcel.vectorContext?.buildings ?? []).filter(
+      (b) => b.role === 'OWN' && b.footprint.length >= 3
+    );
+    if (ownVectorBldgs.length > 0) {
+      for (const bldg of ownVectorBldgs) {
+        L.polygon(toLatLngs(bldg.footprint), {
+          color: bldg.source === 'USER_DEFINED' ? '#14532D' : '#0F172A',
+          weight: assistedSelectedId === bldg.id ? 3 : 2,
+          fillColor: '#FFFFFF',
+          fillOpacity: 0.94,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(`${bldg.label} (${bldg.areaM2.toFixed(0)} m²)`, { sticky: true })
+          .on('click', () => {
+            setAssistedSelectedId(bldg.id);
+            setSelectedZoneCallout(
+              `${bldg.label} (${bldg.areaM2.toFixed(0)} m²): Edificação própria na parcela que gera as faixas concêntricas 0–2 m, 2–10 m e 10–50 m.`
+            );
+          })
+          .addTo(group);
+      }
+    } else {
+      const ownBldgCoords = toMultiPolyLatLngs(mp?.ownBuildings, sp.polygons.buildingFootprint);
+      if (ownBldgCoords.length > 0) {
+        L.polygon(ownBldgCoords, {
+          color: '#0F172A',
+          weight: 1.5,
+          fillColor: '#FFFFFF',
+          fillOpacity: 0.92,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `Edificação Própria na Parcela (${(meta?.ownBuildingsAreaM2 ?? 102).toFixed(0)} m²)`,
+            { sticky: true }
+          )
+          .addTo(group);
+      }
+    }
+
+    // 6B. Phase 2 & Phase 3 CV Detections: Individual Tree Crowns & Unmapped Roofs/Annexes
+    if (visibleLayers.orthophotoCv && activeParcel.cvAnalysis) {
+      for (const roof of activeParcel.cvAnalysis.detectedRoofs) {
+        if (
+          !roof.isUnmappedInOsm ||
+          roof.reviewStatus === 'DISMISSED' ||
+          roof.reviewStatus === 'ACCEPTED' ||
+          roof.footprintWgs84.length < 3
+        ) {
+          continue;
+        }
+        L.polygon(toLatLngs(roof.footprintWgs84), {
+          color: '#F43F5E',
+          weight: assistedSelectedId === roof.id ? 3.5 : 2.5,
+          dashArray: '4, 3',
+          fillColor: '#F43F5E',
+          fillOpacity: 0.52,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `${roof.label} · ${roof.areaM2.toFixed(1)} m² (Confiança ${Math.round(roof.confidence * 100)}%)`,
+            { sticky: true }
+          )
+          .on('click', () => {
+            setAssistedSelectedId(roof.id);
+            setSelectedZoneCallout(
+              `${roof.label} (${roof.areaM2.toFixed(1)} m²): Cobertura detetada em ortofoto 25 cm não constante no OSM/Cadastro. Pode validá-la ou descartá-la em Edição Assistida.`
+            );
+          })
+          .addTo(group);
+      }
+
+      for (const crown of activeParcel.cvAnalysis.crowns) {
+        if (crown.polygonWgs84.length < 3) continue;
+        const isProtectedOak = crown.humanOverride === 'PROTECTED_QUERCUS';
+        const isViolating = crown.violationRulePt !== null;
+        const strokeColor = isProtectedOak
+          ? '#D97706'
+          : isViolating
+            ? '#DC2626'
+            : '#15803D';
+        const fillColor = isProtectedOak
+          ? '#F59E0B'
+          : isViolating
+            ? '#EF4444'
+            : '#22C55E';
+        L.polygon(toLatLngs(crown.polygonWgs84), {
+          color: strokeColor,
+          weight: assistedSelectedId === crown.id ? 3 : isViolating || isProtectedOak ? 2 : 1.5,
+          dashArray: isViolating ? '3, 3' : undefined,
+          fillColor,
+          fillOpacity: isViolating ? 0.34 : isProtectedOak ? 0.32 : 0.2,
+          interactive: allowOverlayClick,
+        })
+          .bindTooltip(
+            `Copa Ø ${crown.diameterM.toFixed(1)} m (${
+              isProtectedOak
+                ? 'Sobreiro/Azinheira Protegida ICNF'
+                : crown.speciesGroup === 'RESINOUS_EUCALYPT'
+                  ? 'Pinheiro/Eucalipto'
+                  : 'Folhosa/Quercínea'
+            }) · Parede: ${crown.distanceToBuildingWallM.toFixed(1)} m · Copa vizinha: ${crown.nearestCrownDistanceM.toFixed(1)} m${isViolating ? ` · ${crown.violationRulePt}` : ' · Conforme'}`,
+            { sticky: true }
+          )
+          .on('click', () => {
+            setAssistedSelectedId(crown.id);
+            setSelectedZoneCallout(
+              `Copa Individual ${crown.id} (Ø ${crown.diameterM.toFixed(1)} m · ${crown.areaM2.toFixed(1)} m²): A ${crown.distanceToBuildingWallM.toFixed(1)} m da fachada — ${
+                isProtectedOak
+                  ? 'Marcada como Quercínea Protegida (DL 169/2001)'
+                  : crown.violationRulePt ?? 'Cumpre Despacho n.º 675/2026'
+              }.`
+            );
+          })
+          .addTo(group);
+      }
+    }
+
+    // 7. User Parcel Boundary (#FACC15 Laser Yellow Dashed)
     L.polygon(toLatLngs(sp.polygons.parcel), {
       color: '#FACC15',
       weight: 3,
       dashArray: '8, 6',
       fillColor: '#FACC15',
       fillOpacity: 0.05,
+      interactive: false,
     }).addTo(group);
 
     // 7. Drawn vertices preview (draggable + individually deletable) when in DRAW mode
@@ -631,6 +1154,53 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
           );
         });
 
+        marker.addTo(group);
+      });
+    }
+
+    // 7B. Assisted HITL multi-point draft preview (draggable handles)
+    if (mapToolMode === 'ASSISTED' && assistedDraftPoints.length > 0) {
+      const isLineDraft =
+        assistedSubTool === 'EASEMENT_LINE' ||
+        (assistedSubTool === 'EXEMPT_ZONE' && assistedExemptPreset === 'RIPARIAN_WATERWAY');
+
+      if (isLineDraft && assistedDraftPoints.length >= 2) {
+        L.polyline(toLatLngs(assistedDraftPoints), {
+          color: assistedSubTool === 'EASEMENT_LINE' ? '#06B6D4' : '#10B981',
+          weight: 3.5,
+          dashArray: '6, 4',
+        }).addTo(group);
+      } else if (!isLineDraft && assistedDraftPoints.length >= 3) {
+        L.polygon(toLatLngs(assistedDraftPoints), {
+          color: '#22C55E',
+          weight: 2.5,
+          fillColor: '#22C55E',
+          fillOpacity: 0.26,
+        }).addTo(group);
+      } else if (assistedDraftPoints.length === 2) {
+        L.polyline(toLatLngs(assistedDraftPoints), {
+          color: '#22C55E',
+          weight: 2.5,
+          dashArray: '5, 4',
+        }).addTo(group);
+      }
+
+      assistedDraftPoints.forEach((pt, idx) => {
+        const marker = L.marker([pt.lat, pt.lon], {
+          draggable: true,
+          icon: L.divIcon({
+            className: 'fs-hitl-draft-handle bg-transparent border-0',
+            html: `<div data-testid="hitl-draft-marker-${idx}" class="w-6 h-6 rounded-full bg-[#22C55E] border-2 border-[#0F172A] text-slate-950 text-[10px] font-mono font-bold flex items-center justify-center shadow-md cursor-grab">P${idx + 1}</div>`,
+            iconSize: [24, 24],
+            iconAnchor: [12, 12],
+          }),
+        });
+        marker.on('dragend', () => {
+          const pos = marker.getLatLng();
+          setAssistedDraftPoints((prev) =>
+            updatePolygonVertexAt(prev, idx, { lat: pos.lat, lon: pos.lng })
+          );
+        });
         marker.addTo(group);
       });
     }
@@ -714,6 +1284,11 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     drawnVertices,
     drawVertexActionMode,
     handleDeleteDrawnVertexAt,
+    mapToolMode,
+    assistedSubTool,
+    assistedExemptPreset,
+    assistedDraftPoints,
+    assistedSelectedId,
     fires,
     storms,
     proximityAlertRadiusKm,
@@ -852,6 +1427,311 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
       ? activeParcel.vertices.length
       : activeParcel.spatial.polygons.parcel.length;
 
+  const handleDetectVectorContext = async () => {
+    if (detectingContext) return;
+    setDetectingContext(true);
+    try {
+      let nextVectorContext: ParcelVectorContext | null = null;
+      let nextSpatial: SpatialZoneBreakdown | null = null;
+
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+      if (isBrowserOnline) {
+        try {
+          const res = await fetch('/api/spatial/vector-context', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              parcelId: activeParcel.id,
+              vertices: activeParcel.vertices,
+              buildingCenter: activeParcel.buildingCenter,
+              landClass: activeParcel.landClass,
+              hasEredesLine: activeParcel.hasEredesLine,
+              eredesType: activeParcel.eredesType,
+              hasProtectedOaks: activeParcel.hasProtectedOaks,
+              existingContext: activeParcel.vectorContext,
+              forceRefresh: true,
+            }),
+          });
+          if (res.ok) {
+            const payload = (await res.json()) as {
+              vectorContext?: ParcelVectorContext;
+              spatial?: SpatialZoneBreakdown;
+            };
+            if (payload.vectorContext && payload.spatial) {
+              nextVectorContext = payload.vectorContext;
+              nextSpatial = payload.spatial;
+            }
+          }
+        } catch {
+          // Offline or transient network error — compute deterministic cadastral context locally
+        }
+      }
+
+      if (!nextVectorContext || !nextSpatial) {
+        const autoSynth = synthesizeDeterministicCadastreContext({
+          parcelVertices: activeParcel.vertices,
+          buildingCenter: activeParcel.buildingCenter,
+          hasEredesLine: activeParcel.hasEredesLine,
+          eredesType: activeParcel.eredesType,
+          hasProtectedOaks: activeParcel.hasProtectedOaks,
+        });
+        nextVectorContext = mergePreservingUserDefinedContext(
+          autoSynth,
+          activeParcel.vectorContext
+        );
+        nextSpatial = computeParcelFgc({
+          vertices: activeParcel.vertices,
+          buildingCenter: activeParcel.buildingCenter,
+          landClass: activeParcel.landClass,
+          hasEredesLine: activeParcel.hasEredesLine,
+          eredesType: activeParcel.eredesType,
+          vectorContext: nextVectorContext,
+        });
+      }
+
+      const updatedParcel: ParcelRecord = {
+        ...activeParcel,
+        vectorContext: nextVectorContext,
+        spatial: nextSpatial,
+      };
+      onUpdateParcel?.(updatedParcel);
+      setVisibleLayers((prev) => ({ ...prev, detectedContext: true }));
+      setVectorStatusNotice({
+        parcelId: activeParcel.id,
+        summary: nextVectorContext.sourceSummaryPt,
+        detectedAtTime: new Date().toISOString().slice(11, 19) + ' UTC',
+      });
+    } finally {
+      setDetectingContext(false);
+    }
+  };
+
+  const handleRunOrthophotoCv = async () => {
+    if (runningOrthophotoCv) return;
+    setRunningOrthophotoCv(true);
+    try {
+      let nextCv: ParcelOrthophotoCvAnalysis | null = null;
+      let nextVectorContext: ParcelVectorContext | undefined = activeParcel.vectorContext;
+      let nextSpatial: SpatialZoneBreakdown = activeParcel.spatial;
+
+      const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
+      if (isBrowserOnline) {
+        try {
+          const res = await fetch('/api/spatial/orthophoto-cv', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              parcelId: activeParcel.id,
+              vertices: activeParcel.vertices,
+              buildingCenter: activeParcel.buildingCenter,
+              landClass: activeParcel.landClass,
+              hasEredesLine: activeParcel.hasEredesLine,
+              eredesType: activeParcel.eredesType,
+              vectorContext: activeParcel.vectorContext,
+              forceRefresh: true,
+            }),
+          });
+          if (res.ok) {
+            const payload = (await res.json()) as {
+              cvAnalysis?: ParcelOrthophotoCvAnalysis;
+              vectorContext?: ParcelVectorContext;
+              spatial?: SpatialZoneBreakdown;
+            };
+            if (payload.cvAnalysis) {
+              nextCv = payload.cvAnalysis;
+              if (payload.vectorContext) nextVectorContext = payload.vectorContext;
+              if (payload.spatial) nextSpatial = payload.spatial;
+            }
+          }
+        } catch {
+          // Offline or transient error — fall back to local isomorphic pixel CV pipeline
+        }
+      }
+
+      if (!nextCv) {
+        const localCtx =
+          nextVectorContext ??
+          synthesizeDeterministicCadastreContext({
+            parcelVertices: activeParcel.vertices,
+            buildingCenter: activeParcel.buildingCenter,
+            hasEredesLine: activeParcel.hasEredesLine,
+            eredesType: activeParcel.eredesType,
+            hasProtectedOaks: activeParcel.hasProtectedOaks,
+          });
+        nextVectorContext = localCtx;
+        const grid = computeParcelCvRasterGrid(activeParcel.vertices, 28, 224);
+        const synthRgba = synthesizeDeterministicParcelOrthophotoRgba({
+          grid,
+          parcelVertices: activeParcel.vertices,
+          landClass: activeParcel.landClass,
+          spatial: nextSpatial,
+          vectorContext: localCtx,
+        });
+        const localOut = runOrthophotoPixelPipeline({
+          rgba: synthRgba,
+          grid,
+          parcelVertices: activeParcel.vertices,
+          landClass: activeParcel.landClass,
+          spatial: nextSpatial,
+          vectorContext: localCtx,
+          imagerySourceLabel: 'Ortofoto Sintética Georreferenciada EPSG:3763 (Offline)',
+          engineMode: 'OFFLINE_SYNTHETIC_CV',
+        });
+        nextCv = localOut.analysis;
+      }
+
+      const updatedParcel: ParcelRecord = {
+        ...activeParcel,
+        vectorContext: nextVectorContext,
+        cvAnalysis: nextCv,
+        spatial: nextSpatial,
+      };
+      onUpdateParcel?.(updatedParcel);
+      setVisibleLayers((prev) => ({ ...prev, orthophotoCv: true }));
+      setCvStatusNotice({
+        parcelId: activeParcel.id,
+        summary: `${nextCv.imagerySourceLabel} · ${nextCv.crowns.length} copas · GSD ${nextCv.gsdMetersPerPx.toFixed(2)} m/px`,
+        analyzedAtTime: new Date().toISOString().slice(11, 19) + ' UTC',
+      });
+    } finally {
+      setRunningOrthophotoCv(false);
+    }
+  };
+
+  const handleFuseCvIntoBoolean = () => {
+    if (!activeParcel.cvAnalysis) return;
+    const baseCtx =
+      activeParcel.vectorContext ??
+      synthesizeDeterministicCadastreContext({
+        parcelVertices: activeParcel.vertices,
+        buildingCenter: activeParcel.buildingCenter,
+        hasEredesLine: activeParcel.hasEredesLine,
+        eredesType: activeParcel.eredesType,
+        hasProtectedOaks: activeParcel.hasProtectedOaks,
+      });
+
+    const fused = fuseCvDetectionsIntoVectorContext({
+      existingContext: baseCtx,
+      cvAnalysis: activeParcel.cvAnalysis,
+      parcelVertices: activeParcel.vertices,
+    });
+
+    const recomputedSpatial = computeParcelFgc({
+      vertices: activeParcel.vertices,
+      buildingCenter: activeParcel.buildingCenter,
+      landClass: activeParcel.landClass,
+      hasEredesLine: activeParcel.hasEredesLine,
+      eredesType: activeParcel.eredesType,
+      vectorContext: fused.vectorContext,
+    });
+
+    const updatedAuditSummary = activeParcel.cvAnalysis.zoneCompliance.auditSummaryPt.replace(
+      /\s*·\s*\d+\s*anexo\(s\)\/edifício\(s\)\s*omisso\(s\)\s*no\s*OSM/i,
+      fused.addedBuildingsCount > 0
+        ? ` · ${fused.addedBuildingsCount} anexo(s) CV fundido(s) nas faixas`
+        : ''
+    );
+
+    const updatedCv: ParcelOrthophotoCvAnalysis = {
+      ...activeParcel.cvAnalysis,
+      unmappedRoofsCount: 0,
+      fusedIntoVectorContext: true,
+      detectedRoofs: activeParcel.cvAnalysis.detectedRoofs.map((r) => ({
+        ...r,
+        isUnmappedInOsm: false,
+      })),
+      zoneCompliance: {
+        ...activeParcel.cvAnalysis.zoneCompliance,
+        auditSummaryPt: updatedAuditSummary,
+      },
+    };
+
+    const updatedParcel: ParcelRecord = {
+      ...activeParcel,
+      vectorContext: fused.vectorContext,
+      cvAnalysis: updatedCv,
+      spatial: recomputedSpatial,
+    };
+    onUpdateParcel?.(updatedParcel);
+    setVisibleLayers((prev) => ({ ...prev, zones675: true, detectedContext: true }));
+    setCvStatusNotice({
+      parcelId: activeParcel.id,
+      summary:
+        fused.addedBuildingsCount > 0
+          ? `${fused.addedBuildingsCount} estrutura(s) CV fundida(s) na álgebra booleana EPSG:3763`
+          : ' Geometria CV já sincronizada com as faixas booleanas EPSG:3763',
+      analyzedAtTime: new Date().toISOString().slice(11, 19) + ' UTC',
+    });
+  };
+
+  const handleCommitAssistedDraft = () => {
+    if (assistedSubTool === 'OWN_BUILDING' || assistedSubTool === 'NEIGHBOR_BUILDING') {
+      if (assistedDraftPoints.length < 3) return;
+      const role = assistedSubTool === 'OWN_BUILDING' ? 'OWN' : 'NEIGHBOR';
+      const next = addAssistedBuildingToParcel(activeParcel, {
+        footprint: assistedDraftPoints,
+        role,
+        label: assistedBldgLabel.trim() || undefined,
+      });
+      setAssistedDraftPoints([]);
+      setAssistedBldgLabel('');
+      commitAssistedParcelMutation(
+        next,
+        role === 'OWN'
+          ? 'Polígono de edificação própria guardado e faixas recalculadas em EPSG:3763.'
+          : 'Polígono de edifício vizinho guardado e obrigação confinante recalculada.'
+      );
+      return;
+    }
+
+    if (assistedSubTool === 'EASEMENT_LINE') {
+      if (assistedDraftPoints.length < 2) return;
+      const next = addAssistedEasementToParcel(activeParcel, {
+        centerline: assistedDraftPoints,
+        preset: assistedEasementPreset,
+        bufferHalfWidthM: assistedEasementWidthM,
+      });
+      setAssistedDraftPoints([]);
+      commitAssistedParcelMutation(
+        next,
+        `Servidão linear (±${assistedEasementWidthM} m) subtraída às faixas obrigatórias em EPSG:3763.`
+      );
+      return;
+    }
+
+    if (assistedSubTool === 'EXEMPT_ZONE') {
+      const next = addAssistedExemptZoneToParcel(activeParcel, {
+        points: assistedDraftPoints,
+        preset: assistedExemptPreset,
+        bufferHalfWidthM: assistedExemptWidthM,
+      });
+      if (next === activeParcel) return;
+      setAssistedDraftPoints([]);
+      commitAssistedParcelMutation(
+        next,
+        assistedExemptPreset === 'RIPARIAN_WATERWAY'
+          ? `Galeria ripícola (±${assistedExemptWidthM} m) protegida e recalculada em EPSG:3763.`
+          : 'Polígono agrícola regado classificado como zona isenta em EPSG:3763.'
+      );
+    }
+  };
+
+  const handleUndoAssistedEdit = () => {
+    if (assistedUndoStack.length === 0) return;
+    const [previousSnapshot, ...rest] = assistedUndoStack;
+    setAssistedUndoStack(rest);
+    onUpdateParcel?.(previousSnapshot);
+    setAssistedFeedback('Última edição assistida anulada e geometria EPSG:3763 restaurada.');
+  };
+
+  const handleResetAssistedToAuto = () => {
+    const next = resetParcelToAutomaticContext(activeParcel);
+    commitAssistedParcelMutation(
+      next,
+      'Edições manuais removidas — contexto vetorial e CV repostos para a base automática.'
+    );
+  };
+
   const handleExportParcelGeoJson = () => {
     const exportedAtIso = new Date().toISOString();
     const geoJsonContent = buildParcelVerticesGeoJson(activeParcel, exportedAtIso);
@@ -872,7 +1752,40 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     setExportedGeoJsonNotice({
       parcelId: activeParcel.id,
       filename,
-      vertexCount: activeVertexCount,
+      detailLabel: `${activeVertexCount} vértices`,
+      exportedAtTime: exportedAtIso.slice(11, 19) + ' UTC',
+    });
+  };
+
+  const handleExportLegalLayersGeoJson = () => {
+    const exportedAtIso = new Date().toISOString();
+    const geoJsonContent = buildParcelLegalDecompositionGeoJson(activeParcel, exportedAtIso);
+    const filename = buildParcelLegalGeoJsonFilename(activeParcel);
+    const parsedCount = (() => {
+      try {
+        const parsed = JSON.parse(geoJsonContent) as { features?: unknown[] };
+        return Array.isArray(parsed.features) ? parsed.features.length : 10;
+      } catch {
+        return 10;
+      }
+    })();
+
+    const blob = new Blob([geoJsonContent], {
+      type: 'application/geo+json;charset=utf-8',
+    });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 1500);
+
+    setExportedGeoJsonNotice({
+      parcelId: activeParcel.id,
+      filename,
+      detailLabel: `${parsedCount} camadas booleanas MultiPolygon`,
       exportedAtTime: exportedAtIso.slice(11, 19) + ' UTC',
     });
   };
@@ -960,12 +1873,13 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
           <div
             role="group"
             aria-label="Modo de interação cartográfica"
-            className="grid grid-cols-3 sm:inline-flex items-center gap-1 p-1 w-full sm:w-auto rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
+            className="grid grid-cols-2 sm:inline-flex items-center gap-1 p-1 w-full sm:w-auto rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
           >
             <button
               type="button"
+              data-testid="map-mode-inspect-btn"
               onClick={() => setMapToolMode('INSPECT')}
-              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap ${
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 ${
                 mapToolMode === 'INSPECT'
                   ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'text-slate-700 dark:text-slate-300'
@@ -977,8 +1891,23 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             </button>
             <button
               type="button"
+              data-testid="map-mode-assisted-btn"
+              onClick={() => setMapToolMode('ASSISTED')}
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 ${
+                mapToolMode === 'ASSISTED'
+                  ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                  : 'text-slate-700 dark:text-slate-300'
+              }`}
+            >
+              <MousePointerClick className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span className="hidden sm:inline">Edição Assistida</span>
+              <span className="sm:hidden">Assistida</span>
+            </button>
+            <button
+              type="button"
+              data-testid="map-mode-draw-btn"
               onClick={() => setMapToolMode('DRAW')}
-              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap ${
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 ${
                 mapToolMode === 'DRAW'
                   ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'text-slate-700 dark:text-slate-300'
@@ -990,8 +1919,9 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             </button>
             <button
               type="button"
+              data-testid="map-mode-caderneta-btn"
               onClick={() => setMapToolMode('CADERNETA')}
-              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap ${
+              className={`min-h-[40px] px-2 sm:px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 ${
                 mapToolMode === 'CADERNETA'
                   ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
                   : 'text-slate-700 dark:text-slate-300'
@@ -1003,16 +1933,40 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             </button>
           </div>
 
-          <button
-            type="button"
-            onClick={() =>
-              setBaseMapStyle((prev) => (prev === 'ORTHOPHOTO' ? 'VECTOR' : 'ORTHOPHOTO'))
-            }
-            className="min-h-[42px] w-full sm:w-auto px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap"
+          <div
+            role="group"
+            aria-label="Fundo cartográfico"
+            className="grid grid-cols-2 sm:inline-flex items-center gap-1 p-1 w-full sm:w-auto rounded-xl bg-slate-100 dark:bg-[#0B0F17] border border-slate-200 dark:border-[#263248]"
           >
-            <Layers className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
-            {baseMapStyle === 'ORTHOPHOTO' ? 'Ver Mapa Vetorial' : 'Ver Ortofoto 25 cm'}
-          </button>
+            <button
+              type="button"
+              data-testid="basemap-orthophoto-btn"
+              aria-pressed={baseMapStyle === 'ORTHOPHOTO'}
+              onClick={() => setBaseMapStyle('ORTHOPHOTO')}
+              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 ${
+                baseMapStyle === 'ORTHOPHOTO'
+                  ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                  : 'text-slate-700 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Ortofoto</span>
+            </button>
+            <button
+              type="button"
+              data-testid="basemap-vector-btn"
+              aria-pressed={baseMapStyle === 'VECTOR'}
+              onClick={() => setBaseMapStyle('VECTOR')}
+              className={`min-h-[40px] px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 ${
+                baseMapStyle === 'VECTOR'
+                  ? 'bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950'
+                  : 'text-slate-700 dark:text-slate-300 hover:bg-slate-200/70 dark:hover:bg-slate-800'
+              }`}
+            >
+              <Layers className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+              <span>Topográfico</span>
+            </button>
+          </div>
         </div>
       </div>
 
@@ -1025,7 +1979,11 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
               ref={mapContainerRef}
               data-testid="faixasegura-leaflet-map"
               data-zoom={currentZoom}
-              className="w-full h-[360px] sm:h-[420px] z-0"
+              className={`w-full h-[360px] sm:h-[420px] z-0 ${
+                mapToolMode === 'DRAW' || (mapToolMode === 'ASSISTED' && assistedSubTool !== 'REVIEW')
+                  ? 'cursor-crosshair'
+                  : ''
+              }`}
             />
             {leafletControlsHost &&
               createPortal(
@@ -1128,6 +2086,36 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
             >
               <span className="w-2.5 h-2.5 rounded-sm bg-[#A855F7] shrink-0" aria-hidden="true" />
               Vizinho em Risco
+            </button>
+            <button
+              type="button"
+              data-testid="layer-toggle-detected-context"
+              onClick={() =>
+                setVisibleLayers((v) => ({ ...v, detectedContext: !v.detectedContext }))
+              }
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                visibleLayers.detectedContext
+                  ? 'border-[#9333EA] bg-[#C084FC]/15 text-slate-900 dark:text-white'
+                  : 'border-slate-300 dark:border-slate-700 text-slate-500'
+              }`}
+            >
+              <span className="w-2.5 h-2.5 rounded-sm bg-[#C084FC] shrink-0" aria-hidden="true" />
+              Elementos Detetados
+            </button>
+            <button
+              type="button"
+              data-testid="layer-toggle-orthophoto-cv"
+              onClick={() =>
+                setVisibleLayers((v) => ({ ...v, orthophotoCv: !v.orthophotoCv }))
+              }
+              className={`min-h-[40px] px-2.5 py-1.5 rounded-lg text-xs font-semibold border transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
+                visibleLayers.orthophotoCv
+                  ? 'border-[#15803D] bg-[#15803D]/15 text-slate-900 dark:text-white'
+                  : 'border-slate-300 dark:border-slate-700 text-slate-500'
+              }`}
+            >
+              <span className="w-2.5 h-2.5 rounded-sm bg-[#15803D] shrink-0" aria-hidden="true" />
+              Segmentação CV 25 cm
             </button>
             <button
               type="button"
@@ -1351,8 +2339,98 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
           )}
         </div>
 
-        {/* Right Column: Contextual Inspector / Draw / Caderneta */}
+        {/* Right Column: Contextual Inspector / Assisted HITL / Draw / Caderneta */}
         <div className="md:col-span-5 space-y-4">
+          {mapToolMode === 'ASSISTED' && (
+            <AssistedHitlPanel
+              activeParcel={activeParcel}
+              subTool={assistedSubTool}
+              onSelectSubTool={(tool) => {
+                setAssistedSubTool(tool);
+                setAssistedDraftPoints([]);
+              }}
+              buildingDrawStyle={assistedBldgStyle}
+              onChangeBuildingDrawStyle={(style) => {
+                setAssistedBldgStyle(style);
+                setAssistedDraftPoints([]);
+              }}
+              buildingCustomLabel={assistedBldgLabel}
+              onChangeBuildingCustomLabel={setAssistedBldgLabel}
+              easementPreset={assistedEasementPreset}
+              onChangeEasementPreset={setAssistedEasementPreset}
+              easementHalfWidthM={assistedEasementWidthM}
+              onChangeEasementHalfWidthM={setAssistedEasementWidthM}
+              exemptPreset={assistedExemptPreset}
+              onChangeExemptPreset={(preset) => {
+                setAssistedExemptPreset(preset);
+                setAssistedDraftPoints([]);
+              }}
+              exemptHalfWidthM={assistedExemptWidthM}
+              onChangeExemptHalfWidthM={setAssistedExemptWidthM}
+              draftPoints={assistedDraftPoints}
+              onClearDraftPoints={() => setAssistedDraftPoints([])}
+              onRemoveLastDraftPoint={() =>
+                setAssistedDraftPoints((prev) => prev.slice(0, -1))
+              }
+              onCommitDraftGeometry={handleCommitAssistedDraft}
+              selectedElementId={assistedSelectedId}
+              onSelectElementId={setAssistedSelectedId}
+              onFocusMapLatLon={(pt) => mapInstanceRef.current?.panTo([pt.lat, pt.lon])}
+              onToggleBuildingRole={(buildingId) => {
+                const next = toggleAssistedBuildingRole(activeParcel, buildingId);
+                commitAssistedParcelMutation(
+                  next,
+                  'Papel da edificação (Próprio ↔ Vizinho) atualizado e faixas EPSG:3763 recalculadas.'
+                );
+              }}
+              onUpdateEasementWidth={(easementId, nextHalfWidthM) => {
+                const next = updateAssistedEasementWidth(
+                  activeParcel,
+                  easementId,
+                  nextHalfWidthM
+                );
+                commitAssistedParcelMutation(
+                  next,
+                  `Largura da servidão ajustada para ±${nextHalfWidthM} m e subtraída em EPSG:3763.`
+                );
+              }}
+              onRemoveVectorElement={(kind, id) => {
+                const next = removeAssistedVectorElement(activeParcel, kind, id);
+                if (assistedSelectedId === id) setAssistedSelectedId(null);
+                commitAssistedParcelMutation(
+                  next,
+                  'Elemento removido da decomposição e áreas legais recalculadas em EPSG:3763.'
+                );
+              }}
+              onReviewCvRoof={(roofId, decision) => {
+                const next = reviewCvRoofDetection(activeParcel, roofId, decision);
+                commitAssistedParcelMutation(
+                  next,
+                  decision === 'DISMISS_FALSE_POSITIVE'
+                    ? 'Falso positivo de cobertura descartado da auditoria CV.'
+                    : 'Cobertura validada pelo utilizador e fundida nos anéis booleanos EPSG:3763.'
+                );
+              }}
+              onOverrideCvCrown={(crownId, override) => {
+                const next = overrideCvCrownStatus(activeParcel, crownId, override);
+                commitAssistedParcelMutation(
+                  next,
+                  override === 'PROTECTED_QUERCUS'
+                    ? 'Copa classificada como Sobreiro/Azinheira protegida (DL 169/2001) — abate interdito sem licença ICNF.'
+                    : override === 'PRUNED_COMPLIANT'
+                      ? 'Copa registada como já desramada/conforme no terreno.'
+                      : 'Regra automática de auditoria CV reposta para esta copa.'
+                );
+              }}
+              undoCount={assistedUndoStack.length}
+              onUndoLastEdit={handleUndoAssistedEdit}
+              onResetToAutomatic={handleResetAssistedToAuto}
+              onRunOrthophotoCv={handleRunOrthophotoCv}
+              runningOrthophotoCv={runningOrthophotoCv}
+              statusFeedbackPt={assistedFeedback}
+            />
+          )}
+
           {mapToolMode === 'DRAW' && (
             <form
               onSubmit={handleSaveDrawnParcel}
@@ -1591,10 +2669,36 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   type="button"
                   disabled={extractingCaderneta}
                   onClick={() => handleExtractCaderneta()}
-                  className="flex-1 min-h-[44px] px-4 py-2 rounded-xl bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950 text-xs font-semibold"
+                  className="flex-1 min-h-[44px] px-4 py-2 rounded-xl bg-[#14532D] text-white dark:bg-[#22C55E] dark:text-slate-950 text-xs font-semibold whitespace-nowrap"
                 >
                   {extractingCaderneta ? 'A extrair...' : 'Extrair e Posicionar Lote'}
                 </button>
+              </div>
+
+              <div className="pt-3 border-t border-slate-200 dark:border-[#263248] space-y-2">
+                <button
+                  type="button"
+                  data-testid="lookup-dgt-cadastre-btn"
+                  disabled={lookingUpCadastre}
+                  onClick={() => void handleLookupOfficialDgtCadastre()}
+                  className="w-full min-h-[42px] px-3.5 py-2 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+                >
+                  <LocateFixed className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {lookingUpCadastre
+                      ? 'A consultar OGC API DGT...'
+                      : 'Consultar Cadastro Oficial DGT no Centro do Mapa'}
+                  </span>
+                </button>
+                {cadastreLookupNotice && (
+                  <p
+                    role="status"
+                    data-testid="dgt-cadastre-lookup-notice"
+                    className="text-xs text-slate-600 dark:text-slate-300 leading-relaxed"
+                  >
+                    {cadastreLookupNotice}
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -1666,10 +2770,18 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   <span className="w-3 h-3 rounded-sm bg-[#F59E0B] shrink-0" aria-hidden="true" />
                   <div>
                     <div className="font-semibold text-slate-900 dark:text-slate-100">
-                      Zona 3 · Interface Alargada (10–50 m)
+                      Zona 3 · Interface Alargada (10–{activeParcel.spatial.decompositionMeta?.outerBufferRadiusM ?? 50} m)
                     </div>
-                    <div className="text-slate-500 dark:text-slate-400">
+                    <div className="text-slate-500 dark:text-slate-400 tabular-nums">
                       Corte de mato e afastamento 10 m pinheiro/eucalipto
+                      {(activeParcel.spatial.decompositionMeta?.neighborInducedCleanAreaM2 ?? 0) > 0 && (
+                        <>
+                          {' · '}
+                          <span className="text-slate-700 dark:text-slate-300">
+                            {(activeParcel.spatial.decompositionMeta?.neighborInducedCleanAreaM2 ?? 0).toFixed(0)} m² por vizinho
+                          </span>
+                        </>
+                      )}
                     </div>
                   </div>
                 </div>
@@ -1683,11 +2795,15 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   <span className="w-3 h-3 rounded-sm bg-[#06B6D4] shrink-0" aria-hidden="true" />
                   <div>
                     <div className="font-semibold text-slate-900 dark:text-slate-100 flex items-center gap-1">
-                      Servidão E-REDES
+                      Servidões de Terceiros (E-REDES / Vias)
                       <Zap className="w-3 h-3 text-[#0284C7]" aria-hidden="true" />
                     </div>
-                    <div className="text-slate-500 dark:text-slate-400">
-                      Custo a cargo da utility (~{activeParcel.spatial.estimatedEredesSavingsEur.toFixed(0)} € poupados)
+                    <div className="text-slate-500 dark:text-slate-400 tabular-nums">
+                      E-REDES {(activeParcel.spatial.decompositionMeta?.eredesEasementM2 ?? activeParcel.spatial.thirdPartyEasementM2).toFixed(0)} m²
+                      {' · '}
+                      Viária {(activeParcel.spatial.decompositionMeta?.roadEasementM2 ?? 0).toFixed(0)} m²
+                      {' · '}
+                      ~{activeParcel.spatial.estimatedEredesSavingsEur.toFixed(0)} € poupados
                     </div>
                   </div>
                 </div>
@@ -1701,10 +2817,10 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   <span className="w-3 h-3 rounded-sm bg-[#4ADE80] shrink-0" aria-hidden="true" />
                   <div>
                     <div className="font-semibold text-slate-900 dark:text-slate-100">
-                      Zona Interior Isenta
+                      Zona Isenta &amp; Galeria Ripícola
                     </div>
-                    <div className="text-slate-500 dark:text-slate-400">
-                      Sem obrigação legal de gestão de combustível
+                    <div className="text-slate-500 dark:text-slate-400 tabular-nums">
+                      Ripícola/Agrícola protegida {(activeParcel.spatial.decompositionMeta?.riparianProtectedM2 ?? 0).toFixed(0)} m² · Fora de faixas
                     </div>
                   </div>
                 </div>
@@ -1721,29 +2837,262 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
               </div>
             )}
 
-            <div className="pt-3 border-t border-slate-200 dark:border-[#263248] space-y-2.5">
-              <div className="flex items-center justify-between gap-3">
+            {/* Boolean EPSG:3763 & Live OSM / Cadastre Vector Context Telemetry */}
+            <div
+              data-testid="boolean-vector-context-section"
+              className="pt-3 border-t border-slate-200 dark:border-[#263248] space-y-2.5"
+            >
+              <div className="flex flex-col gap-2">
                 <div className="min-w-0">
                   <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
-                    Interoperabilidade SIG / BUPi
+                    Álgebra Booleana EPSG:3763 &amp; Contexto Vetorial
+                  </div>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                    <span>
+                      Edifícios próprios: {activeParcel.spatial.decompositionMeta?.ownBuildingsCount ?? 1} (
+                      {(activeParcel.spatial.decompositionMeta?.ownBuildingsAreaM2 ?? 102).toFixed(0)} m²)
+                    </span>
+                    <span aria-hidden="true"> · </span>
+                    <span>
+                      Vizinhos ≤50 m: {activeParcel.spatial.decompositionMeta?.neighborBuildingsWithin50mCount ?? 0}
+                    </span>
+                    <span aria-hidden="true"> · </span>
+                    <span>
+                      Obrigação induzida: {(activeParcel.spatial.decompositionMeta?.neighborInducedCleanAreaM2 ?? 0).toFixed(0)} m²
+                    </span>
+                  </p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                    <span>
+                      Transbordo no vizinho: {(activeParcel.spatial.decompositionMeta?.neighborOverflowRiskM2 ?? 0).toFixed(0)} m² ({activeParcel.spatial.neighborDirection} · {activeParcel.spatial.neighborMinDistanceM.toFixed(1)} m)
+                    </span>
+                    <span aria-hidden="true"> · </span>
+                    <span>
+                      {activeParcel.vectorContext?.sourceMode === 'LIVE_OVERPASS_WFS'
+                        ? 'OSM Overpass Tempo Real'
+                        : 'Síntese Cadastral EPSG:3763'}
+                    </span>
+                  </p>
+                  {activeParcel.elevationMeta && (
+                    <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                      <span>Declive MDT {activeParcel.avgSlopePct}%</span>
+                      <span aria-hidden="true"> · </span>
+                      <span>
+                        Alt. {activeParcel.elevationMeta.minElevationM}–{activeParcel.elevationMeta.maxElevationM} m
+                      </span>
+                      <span aria-hidden="true"> · </span>
+                      <span>{activeParcel.elevationMeta.aspectLabelPt}</span>
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="detect-vector-context-btn"
+                    disabled={detectingContext}
+                    onClick={handleDetectVectorContext}
+                    className="min-h-[40px] px-3.5 py-1.5 rounded-xl border border-[#14532D]/40 dark:border-[#22C55E]/45 bg-[#14532D]/5 hover:bg-[#14532D]/10 dark:bg-[#22C55E]/10 dark:hover:bg-[#22C55E]/20 text-[#14532D] dark:text-[#4ADE80] text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 shrink-0 ${detectingContext ? 'animate-spin' : ''}`}
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {detectingContext
+                        ? 'A detetar OSM / E-REDES...'
+                        : 'Detetar Elementos Reais (OSM / E-REDES)'}
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="refresh-elevation-slope-btn"
+                    disabled={calculatingSlope}
+                    onClick={() => void handleRefreshElevationSlope()}
+                    className="min-h-[40px] px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 shrink-0 ${calculatingSlope ? 'animate-spin' : ''}`}
+                      aria-hidden="true"
+                    />
+                    <span>{calculatingSlope ? 'A medir MDT...' : 'Calcular Declive MDT'}</span>
+                  </button>
+                </div>
+              </div>
+
+              {vectorStatusNotice?.parcelId === activeParcel.id && (
+                <p
+                  role="status"
+                  aria-live="polite"
+                  data-testid="vector-context-status-notice"
+                  className="text-xs text-[#14532D] dark:text-[#4ADE80] flex items-center gap-1.5 tabular-nums"
+                >
+                  <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {vectorStatusNotice.summary} · {vectorStatusNotice.detectedAtTime}
+                  </span>
+                </p>
+              )}
+
+              {slopeStatusNotice?.parcelId === activeParcel.id && (
+                <p
+                  role="status"
+                  aria-live="polite"
+                  data-testid="elevation-slope-status-notice"
+                  className="text-xs text-[#14532D] dark:text-[#4ADE80] flex items-center gap-1.5 tabular-nums"
+                >
+                  <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>{slopeStatusNotice.summary}</span>
+                </p>
+              )}
+            </div>
+
+            {/* Phase 2: 25 cm Orthophoto Computer Vision & Crown Spacing Audit (ONNX / OBIA) */}
+            <div
+              data-testid="orthophoto-cv-section"
+              className="pt-3 border-t border-slate-200 dark:border-[#263248] space-y-2.5"
+            >
+              <div className="flex flex-col gap-2">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    Pipeline CV Ortofoto 25 cm (Copas, Mato &amp; Anexos)
+                  </div>
+
+                  {activeParcel.cvAnalysis ? (
+                    <>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                        <span>
+                          Zona 1 inerte: {activeParcel.cvAnalysis.zoneCompliance.zone1BareMineralPct.toFixed(0)}%
+                        </span>
+                        <span aria-hidden="true"> · </span>
+                        <span>Copas: {activeParcel.cvAnalysis.crowns.length}</span>
+                        <span aria-hidden="true"> · </span>
+                        <span
+                          className={
+                            activeParcel.cvAnalysis.zoneCompliance.zone2CrownsUnder5mCount > 0 ||
+                            activeParcel.cvAnalysis.zoneCompliance.crownSpacingViolationsCount > 0
+                              ? 'text-[#DC2626] dark:text-rose-400 font-semibold'
+                              : 'text-[#14532D] dark:text-[#4ADE80]'
+                          }
+                        >
+                          Infrações copas:{' '}
+                          {activeParcel.cvAnalysis.zoneCompliance.zone2CrownsUnder5mCount +
+                            activeParcel.cvAnalysis.zoneCompliance.crownSpacingViolationsCount}
+                        </span>
+                      </p>
+                      <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                        <span>
+                          Mato: {activeParcel.cvAnalysis.classAreasM2.SHRUB_SCRUB_FUEL.toFixed(0)} m²
+                        </span>
+                        <span aria-hidden="true"> · </span>
+                        <span>
+                          Copa arbórea: {activeParcel.cvAnalysis.classAreasM2.TREE_CANOPY_CROWN.toFixed(0)} m²
+                        </span>
+                        <span aria-hidden="true"> · </span>
+                        <span>
+                          Anexos omissos: {activeParcel.cvAnalysis.unmappedRoofsCount}
+                        </span>
+                      </p>
+                      <p className="text-xs text-slate-600 dark:text-slate-300 tabular-nums mt-0.5">
+                        {activeParcel.cvAnalysis.zoneCompliance.auditSummaryPt}
+                      </p>
+                    </>
+                  ) : (
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                      Segmentação semântica em 7 classes SGIFR, medição de copas individuais (&lt;5 m fachada / &lt;10 m pinhal) e deteção de anexos omissos no cadastro.
+                    </p>
+                  )}
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="run-orthophoto-cv-btn"
+                    disabled={runningOrthophotoCv}
+                    onClick={handleRunOrthophotoCv}
+                    className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] text-white dark:text-slate-950 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 shrink-0 ${runningOrthophotoCv ? 'animate-spin' : ''}`}
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {runningOrthophotoCv
+                        ? 'A segmentar ortofoto...'
+                        : activeParcel.cvAnalysis
+                          ? 'Reanalisar Ortofoto 25 cm'
+                          : 'Analisar Ortofoto 25 cm (CV)'}
+                    </span>
+                  </button>
+
+                  {activeParcel.cvAnalysis &&
+                    (activeParcel.cvAnalysis.unmappedRoofsCount > 0 ||
+                      !activeParcel.cvAnalysis.fusedIntoVectorContext) && (
+                      <button
+                        type="button"
+                        data-testid="fuse-cv-into-boolean-btn"
+                        onClick={handleFuseCvIntoBoolean}
+                        className="min-h-[40px] px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] bg-slate-50 hover:bg-slate-100 dark:bg-[#0B0F17] dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0"
+                      >
+                        <Layers className="w-3.5 h-3.5 text-[#F43F5E] shrink-0" aria-hidden="true" />
+                        <span>Fundir Anexos nas Faixas</span>
+                      </button>
+                    )}
+                </div>
+              </div>
+
+              {cvStatusNotice?.parcelId === activeParcel.id && (
+                <p
+                  role="status"
+                  aria-live="polite"
+                  data-testid="orthophoto-cv-status-notice"
+                  className="text-xs text-[#14532D] dark:text-[#4ADE80] flex items-center gap-1.5 tabular-nums"
+                >
+                  <Check className="w-3.5 h-3.5 shrink-0" aria-hidden="true" />
+                  <span>
+                    {cvStatusNotice.summary} · {cvStatusNotice.analyzedAtTime}
+                  </span>
+                </p>
+              )}
+            </div>
+
+            <div className="pt-3 border-t border-slate-200 dark:border-[#263248] space-y-2.5">
+              <div className="flex flex-col gap-2">
+                <div className="min-w-0">
+                  <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
+                    Interoperabilidade SIG / BUPi (RFC 7946)
                   </div>
                   <p className="text-xs text-slate-500 dark:text-slate-400 tabular-nums">
-                    <span>{activeVertexCount} vértices + polígono RFC 7946</span>
+                    <span>{activeVertexCount} vértices + anéis booleanos MultiPolygon</span>
                     <span aria-hidden="true"> · </span>
                     <span>QGIS / ArcGIS / PostGIS</span>
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={handleExportParcelGeoJson}
-                  className="min-h-[44px] px-4 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-slate-50 hover:bg-slate-100 dark:bg-[#0B0F17] dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-2 whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
-                >
-                  <Download
-                    className="w-4 h-4 text-[#14532D] dark:text-[#22C55E] shrink-0"
-                    aria-hidden="true"
-                  />
-                  Export GeoJSON
-                </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    data-testid="export-legal-layers-geojson-btn"
+                    onClick={handleExportLegalLayersGeoJson}
+                    className="min-h-[42px] px-3.5 py-2 rounded-xl border border-[#14532D]/35 dark:border-[#22C55E]/40 bg-slate-50 hover:bg-slate-100 dark:bg-[#0B0F17] dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
+                  >
+                    <Layers
+                      className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E] shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span>Exportar Camadas Legais</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleExportParcelGeoJson}
+                    className="min-h-[42px] px-3.5 py-2 rounded-xl border border-slate-300 dark:border-[#263248] bg-slate-50 hover:bg-slate-100 dark:bg-[#0B0F17] dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E]"
+                  >
+                    <Download
+                      className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E] shrink-0"
+                      aria-hidden="true"
+                    />
+                    <span>Export GeoJSON</span>
+                  </button>
+                </div>
               </div>
 
               {exportedGeoJsonNotice?.parcelId === activeParcel.id && (
@@ -1756,7 +3105,7 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   <span className="truncate">
                     Transferido: <span className="font-mono">{exportedGeoJsonNotice.filename}</span>
                     {' · '}
-                    {exportedGeoJsonNotice.vertexCount} vértices ({exportedGeoJsonNotice.exportedAtTime})
+                    {exportedGeoJsonNotice.detailLabel} ({exportedGeoJsonNotice.exportedAtTime})
                   </span>
                 </p>
               )}
