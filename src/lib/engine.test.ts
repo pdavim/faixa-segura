@@ -3244,6 +3244,272 @@ test('QR scanner hardware live connection status & #public-verify-code-input #15
   assert.ok(indexCssSrc.includes('@keyframes verify-input-success-border'));
 });
 
+test('OrthophotoInferenceService resolves KVM4/SegFormer endpoints, encodes 3-channel RGB24 crops, decodes SegFormer masks/logits & OrthoSeg LOCAL_PIXEL_METRIC polygons, and updates cvAnalysis state', async () => {
+  const {
+    DEFAULT_ORTHOPHOTO_CV_SERVICE_URL,
+    decodeSegFormerMaskPayload,
+    encodeRgbaToRgb24PngBuffer,
+    executeRemoteOrthophotoInference,
+    mapSegFormerLabelOrIdToSgifrClassIndex,
+    prepareUploadedOrthophotoCrop,
+    processRemoteInferencePayloadToCvAnalysis,
+    resolveConfiguredOrthophotoServiceUrl,
+    resolveOrthophotoServiceEndpoints,
+  } = await import('./orthophotoInferenceService.ts');
+  const { INITIAL_PARCELS } = await import('../data/seedCatalog.ts');
+  const { synthesizeDeterministicCadastreContext } = await import('./vectorContextIngestor.ts');
+  const { synthesizeDeterministicParcelOrthophotoRgba } = await import('./orthophotoCvPipeline.ts');
+
+  // 1. Endpoint resolution for the live sslip.io Hostinger KVM 4 URL & contract variants
+  assert.equal(
+    resolveConfiguredOrthophotoServiceUrl(''),
+    DEFAULT_ORTHOPHOTO_CV_SERVICE_URL
+  );
+  assert.equal(resolveConfiguredOrthophotoServiceUrl('local'), '');
+
+  const kvmEndpoints = resolveOrthophotoServiceEndpoints(
+    'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io/'
+  );
+  assert.equal(
+    kvmEndpoints.baseOriginUrl,
+    'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io'
+  );
+  assert.equal(
+    kvmEndpoints.healthzUrl,
+    'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io/healthz'
+  );
+  assert.equal(
+    kvmEndpoints.multipartAnalyzeUrl,
+    'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io/v1/analyze'
+  );
+  assert.equal(
+    kvmEndpoints.segformerContractUrl,
+    'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io/api/analyze-contract'
+  );
+  assert.equal(kvmEndpoints.preferredProtocol, 'MULTIPART_ANALYZE');
+
+  const contractEndpoints = resolveOrthophotoServiceEndpoints(
+    'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io/api/analyze-contract'
+  );
+  assert.equal(contractEndpoints.preferredProtocol, 'JSON_CONTRACT');
+
+  // 2. 24-bit 3-channel RGB PNG encoding (`colorType === 2` at PNG IHDR offset 25) + sub-crop bbox math
+  const sampleParcel = INITIAL_PARCELS[0];
+  const vectorCtx = synthesizeDeterministicCadastreContext({
+    parcelVertices: sampleParcel.vertices,
+    buildingCenter: sampleParcel.buildingCenter,
+    hasEredesLine: sampleParcel.hasEredesLine,
+    eredesType: sampleParcel.eredesType,
+  });
+
+  const baseGrid = {
+    width: 160,
+    height: 160,
+    bbox3763: [-98000, -90000, -97920, -89920] as [number, number, number, number],
+    bboxWgs84: [-9.464, 38.797, -9.462, 38.799] as [number, number, number, number],
+    leafletBounds: [
+      [38.797, -9.464],
+      [38.799, -9.462],
+    ] as [[number, number], [number, number]],
+    gsdMetersPerPx: 0.5,
+    pixelAreaM2: 0.25,
+    nw3763: [-98000, -89920] as [number, number],
+    ne3763: [-97920, -89920] as [number, number],
+    sw3763: [-98000, -90000] as [number, number],
+    se3763: [-97920, -90000] as [number, number],
+  };
+  const synthRgba = synthesizeDeterministicParcelOrthophotoRgba({
+    grid: baseGrid,
+    parcelVertices: sampleParcel.vertices,
+    landClass: sampleParcel.landClass,
+    spatial: sampleParcel.spatial,
+    vectorContext: vectorCtx,
+  });
+  const rgb24Buf = encodeRgbaToRgb24PngBuffer(synthRgba, 160, 160);
+  // PNG signature (8 bytes) + IHDR length/type (8 bytes) + width (4) + height (4) + bitDepth (1) -> byte 25 is colorType (2 = truecolor RGB)
+  assert.equal(rgb24Buf[25], 2, 'Encoded PNG must use colorType=2 (3-channel 24-bit RGB without alpha)');
+
+  const croppedPrep = prepareUploadedOrthophotoCrop({
+    imageBase64: `data:image/png;base64,${rgb24Buf.toString('base64')}`,
+    parcelVertices: sampleParcel.vertices,
+    bboxWgs84: [-9.464, 38.797, -9.462, 38.799],
+    cropRect: { x: 40, y: 40, width: 80, height: 80 },
+  });
+  assert.equal(croppedPrep.width, 80);
+  assert.equal(croppedPrep.height, 80);
+  assert.equal(croppedPrep.wasCropped, true);
+  assert.equal(croppedPrep.imageBuffer[25], 2);
+  assert.deepEqual(croppedPrep.grid.bboxWgs84, [-9.4635, 38.7975, -9.4625, 38.7985]);
+
+  // 3. SegFormer semantic label mapping & NCHW logits / 2D mask decoding
+  assert.equal(mapSegFormerLabelOrIdToSgifrClassIndex('building'), 2);
+  assert.equal(mapSegFormerLabelOrIdToSgifrClassIndex('coniferous'), 5);
+  assert.equal(mapSegFormerLabelOrIdToSgifrClassIndex('brushwood'), 4);
+  assert.equal(mapSegFormerLabelOrIdToSgifrClassIndex('impervious surface'), 1);
+  assert.equal(mapSegFormerLabelOrIdToSgifrClassIndex('bare_soil'), 0);
+  assert.equal(mapSegFormerLabelOrIdToSgifrClassIndex('water'), 6);
+
+  // Build 4x4 SegFormer logits `[1, 3, 4, 4]` with id2label mapping `{ "0": "bare_soil", "1": "brushwood", "2": "tree" }`
+  const plane = 16;
+  const logits = new Array<number>(3 * plane).fill(-1.0);
+  for (let i = 0; i < plane; i++) {
+    const winningCh = i < 4 ? 0 : i < 10 ? 1 : 2;
+    logits[winningCh * plane + i] = 4.5;
+  }
+  const decodedFromLogits = decodeSegFormerMaskPayload(
+    {
+      logits,
+      logitsShape: [1, 3, 4, 4],
+      id2label: { '0': 'bare_soil', '1': 'brushwood', '2': 'tree' },
+    },
+    8,
+    8
+  );
+  assert.ok(decodedFromLogits);
+  assert.equal(decodedFromLogits.length, 64);
+  assert.equal(decodedFromLogits[0], 0); // bare_soil -> MINERAL_INERT_BARE
+  assert.equal(decodedFromLogits[32], 4); // brushwood -> SHRUB_SCRUB_FUEL
+  assert.equal(decodedFromLogits[63], 5); // tree -> TREE_CANOPY_CROWN
+
+  // 4. OrthoSeg KVM `LOCAL_PIXEL_METRIC` (`0.08 m/px`) GeoJSON FeatureCollection -> ParcelOrthophotoCvAnalysis
+  const parcelGrid = prepareUploadedOrthophotoCrop({
+    rawImageBuffer: rgb24Buf,
+    parcelVertices: sampleParcel.vertices,
+  }).grid;
+
+  const mockOrthoSegGeoJson = {
+    type: 'FeatureCollection',
+    crs: { type: 'name', properties: { name: 'LOCAL_PIXEL_METRIC' } },
+    features: [
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          // Pixels [76..84, 76..84] * 0.08 = [6.08..6.72, -6.72..-6.08] near center of parcel
+          coordinates: [
+            [
+              [6.08, -6.72],
+              [6.72, -6.72],
+              [6.72, -6.08],
+              [6.08, -6.08],
+              [6.08, -6.72],
+            ],
+          ],
+        },
+        properties: {
+          class: 'tree_crown',
+          confidence: 0.91,
+          source_model: 'deepforest-retinanet',
+        },
+      },
+      {
+        type: 'Feature',
+        geometry: {
+          type: 'Polygon',
+          // Unmapped annex at pixels [105..118, 92..102] * 0.08 = [8.40..9.44, -8.16..-7.36]
+          coordinates: [
+            [
+              [8.4, -8.16],
+              [9.44, -8.16],
+              [9.44, -7.36],
+              [8.4, -7.36],
+              [8.4, -8.16],
+            ],
+          ],
+        },
+        properties: {
+          class: 'building',
+          confidence: 0.88,
+          source_model: 'aerial-building-onnx',
+        },
+      },
+    ],
+    metadata: {
+      crowns_detected: 1,
+      buildings_detected: 1,
+      elapsed_ms: 1420,
+    },
+  };
+
+  const processedNeural = processRemoteInferencePayloadToCvAnalysis({
+    remotePayload: mockOrthoSegGeoJson,
+    grid: parcelGrid,
+    rgba: new Uint8Array(synthRgba.buffer, synthRgba.byteOffset, synthRgba.byteLength),
+    parcelVertices: sampleParcel.vertices,
+    landClass: sampleParcel.landClass,
+    spatial: sampleParcel.spatial,
+    vectorContext: vectorCtx,
+    imagerySourceLabel: 'DGT Ortofotos 25 cm · OrthoSeg KVM',
+    configuredModelProfile: 'yolo11s-seg+segformer-b2-dgt25cm',
+  });
+  assert.equal(processedNeural.cvAnalysis.engineMode, 'ONNX_MICROSERVICE');
+  assert.ok(processedNeural.cvAnalysis.modelProfile.includes('deepforest-retinanet'));
+  assert.ok(processedNeural.cvAnalysis.crowns.length >= 1);
+  assert.ok(processedNeural.cvAnalysis.detectedRoofs.length >= 1);
+  assert.ok(processedNeural.cvAnalysis.overlayDataUrl?.startsWith('data:image/png;base64,'));
+
+  // 5. End-to-end `executeRemoteOrthophotoInference` with mocked fetch (Multipart success + 502 fallback)
+  const calledUrls: string[] = [];
+  let sawAuthHeader = false;
+  const mockSuccessFetch = async (input: string | URL | Request, init?: RequestInit) => {
+    const urlStr = String(input);
+    calledUrls.push(urlStr);
+    const hdrs = (init?.headers ?? {}) as Record<string, string>;
+    if (hdrs.Authorization === 'Bearer test-kvm-secret') {
+      sawAuthHeader = true;
+    }
+    if (urlStr.endsWith('/healthz')) {
+      return new Response(
+        JSON.stringify({
+          status: 'ok',
+          workers: 3,
+          workers_warmed: true,
+          execution_mode: 'cpu_avx512',
+          compat_endpoint: '/v1/analyze',
+        }),
+        { status: 200, headers: { 'Content-Type': 'application/json' } }
+      );
+    }
+    return new Response(JSON.stringify(mockOrthoSegGeoJson), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    });
+  };
+
+  const e2eSuccess = await executeRemoteOrthophotoInference({
+    parcelVertices: sampleParcel.vertices,
+    landClass: sampleParcel.landClass,
+    spatial: sampleParcel.spatial,
+    vectorContext: vectorCtx,
+    rawImageBuffer: rgb24Buf,
+    serviceUrl: 'https://goat-orthosegkv4service-8bwzr9-ae82ec-45-133-178-58.sslip.io/',
+    apiKey: 'test-kvm-secret',
+    fetchImpl: mockSuccessFetch,
+  });
+  assert.equal(e2eSuccess.telemetry.usedRemoteService, true);
+  assert.equal(e2eSuccess.telemetry.protocolUsed, 'MULTIPART_ANALYZE');
+  assert.equal(e2eSuccess.telemetry.executionMode, 'cpu_avx512');
+  assert.equal(e2eSuccess.cvAnalysis.engineMode, 'ONNX_MICROSERVICE');
+  assert.equal(sawAuthHeader, true);
+  assert.ok(calledUrls.some((u) => u.endsWith('/v1/analyze')));
+
+  // Verify resilient fallback to local OBIA when remote returns HTTP 502
+  const mockFailFetch = async () => new Response('Bad Gateway', { status: 502 });
+  const e2eFallback = await executeRemoteOrthophotoInference({
+    parcelVertices: sampleParcel.vertices,
+    landClass: sampleParcel.landClass,
+    spatial: sampleParcel.spatial,
+    vectorContext: vectorCtx,
+    rawImageBuffer: rgb24Buf,
+    serviceUrl: 'https://unreachable-orthoseg.example.com/',
+    fetchImpl: mockFailFetch,
+  });
+  assert.equal(e2eFallback.telemetry.usedRemoteService, false);
+  assert.equal(e2eFallback.telemetry.protocolUsed, 'LOCAL_OBIA_FALLBACK');
+  assert.ok(e2eFallback.cvAnalysis.crowns.length >= 1);
+});
+
+
 
 
 

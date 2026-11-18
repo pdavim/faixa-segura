@@ -4,7 +4,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { WebSocketServer, WebSocket } from 'ws';
-import * as pngjsNs from 'pngjs';
 import type {
   ActiveFireIncident,
   AnepcNationalSummary,
@@ -68,10 +67,14 @@ import {
   buildOrthophotoInferenceSpec,
   computeParcelCvRasterGrid,
   fuseCvDetectionsIntoVectorContext,
-  runOrthophotoPixelPipeline,
-  synthesizeDeterministicParcelOrthophotoRgba,
-  type ParcelCvRasterGrid,
 } from './src/lib/orthophotoCvPipeline.ts';
+import {
+  executeRemoteOrthophotoInference,
+  probeOrthophotoServiceHealth,
+  resolveConfiguredOrthophotoServiceUrl,
+  resolveOrthophotoServiceEndpoints,
+  type PixelCropRect,
+} from './src/lib/orthophotoInferenceService.ts';
 import {
   buildCopernicusOpenCatalogUrl,
   buildCopernicusStatsRequestBody,
@@ -98,14 +101,6 @@ import {
 import type { PushSubscription } from 'web-push';
 
 dotenv.config();
-
-const PNG =
-  (
-    pngjsNs as unknown as {
-      PNG?: typeof pngjsNs.PNG;
-      default?: { PNG: typeof pngjsNs.PNG };
-    }
-  ).PNG ?? (pngjsNs as unknown as { default: { PNG: typeof pngjsNs.PNG } }).default.PNG;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -400,124 +395,6 @@ interface OrthophotoCvCacheEntry {
   analysis: ParcelOrthophotoCvAnalysis;
 }
 const orthophotoCvCache = new Map<string, OrthophotoCvCacheEntry>();
-
-async function acquireParcelOrthophotoRgba(params: {
-  grid: ParcelCvRasterGrid;
-  parcelVertices: LatLon[];
-  landClass: LandClass;
-  spatial: ParcelRecord['spatial'];
-  vectorContext?: ParcelVectorContext;
-  timeoutMs?: number;
-}): Promise<{
-  rgba: Uint8Array;
-  sourceLabel: string;
-  engineMode: ParcelOrthophotoCvAnalysis['engineMode'];
-}> {
-  const { grid, parcelVertices, landClass, spatial, vectorContext } = params;
-  const [west, south, east, north] = grid.bboxWgs84;
-  const dgtWmsBase =
-    process.env.DGT_ORTHO_WMS_URL?.trim() ||
-    'https://cartografia.dgterritorio.gov.pt/ortos2021/service';
-
-  const candidates: Array<{ url: string; label: string }> = [
-    {
-      url: `${dgtWmsBase}?SERVICE=WMS&VERSION=1.1.1&REQUEST=GetMap&LAYERS=Ortos2021-RGB&STYLES=&SRS=EPSG:4326&BBOX=${west},${south},${east},${north}&WIDTH=${grid.width}&HEIGHT=${grid.height}&FORMAT=image/png`,
-      label: 'DGT Ortofotos Oficiais 25 cm (WMS PT)',
-    },
-    {
-      url: `https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/export?bbox=${west},${south},${east},${north}&bboxSR=4326&imageSR=4326&size=${grid.width},${grid.height}&format=png24&f=image`,
-      label: 'Ortofoto Aérea Real 25 cm (World Imagery RGB)',
-    },
-  ];
-
-  const perCandidateTimeout = Math.max(2000, params.timeoutMs ?? 4200);
-
-  for (const cand of candidates) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), perCandidateTimeout);
-    try {
-      const resp = await fetch(cand.url, {
-        headers: {
-          Accept: 'image/png,*/*;q=0.8',
-          'User-Agent': 'FaixaSeguraPT/2.0 (Pipeline CV Ortofoto 25cm)',
-        },
-        signal: ctrl.signal,
-      });
-      if (!resp.ok) continue;
-      const contentType = (resp.headers.get('content-type') || '').toLowerCase();
-      if (contentType.includes('xml') || contentType.includes('html') || contentType.includes('json')) {
-        continue;
-      }
-
-      const buf = Buffer.from(await resp.arrayBuffer());
-      if (buf.length < 256) continue;
-      const decoded = PNG.sync.read(buf);
-      if (decoded.width < 32 || decoded.height < 32) continue;
-
-      let rgba: Uint8Array;
-      if (decoded.width === grid.width && decoded.height === grid.height) {
-        rgba = new Uint8Array(decoded.data.buffer, decoded.data.byteOffset, decoded.data.byteLength);
-      } else {
-        // Nearest-neighbor resample to exact grid dimensions
-        rgba = new Uint8Array(grid.width * grid.height * 4);
-        for (let r = 0; r < grid.height; r++) {
-          const srcR = Math.min(decoded.height - 1, Math.floor((r * decoded.height) / grid.height));
-          for (let c = 0; c < grid.width; c++) {
-            const srcC = Math.min(decoded.width - 1, Math.floor((c * decoded.width) / grid.width));
-            const sIdx = (srcR * decoded.width + srcC) * 4;
-            const dIdx = (r * grid.width + c) * 4;
-            rgba[dIdx] = decoded.data[sIdx];
-            rgba[dIdx + 1] = decoded.data[sIdx + 1];
-            rgba[dIdx + 2] = decoded.data[sIdx + 2];
-            rgba[dIdx + 3] = decoded.data[sIdx + 3];
-          }
-        }
-      }
-
-      // Reject blank/uniform tiles (e.g. empty white WMS frame) via luminance standard deviation
-      const pxCount = grid.width * grid.height;
-      let sumLum = 0;
-      let sumSqLum = 0;
-      let opaqueCount = 0;
-      for (let i = 0; i < pxCount; i++) {
-        const bIdx = i * 4;
-        if (rgba[bIdx + 3] > 20) opaqueCount++;
-        const l = 0.299 * rgba[bIdx] + 0.587 * rgba[bIdx + 1] + 0.114 * rgba[bIdx + 2];
-        sumLum += l;
-        sumSqLum += l * l;
-      }
-      const meanL = sumLum / pxCount;
-      const variance = Math.max(0, sumSqLum / pxCount - meanL * meanL);
-      const stdDev = Math.sqrt(variance);
-      if (opaqueCount < pxCount * 0.75 || stdDev < 4.5) {
-        continue;
-      }
-
-      return {
-        rgba,
-        sourceLabel: cand.label,
-        engineMode: 'REAL_ORTHOPHOTO_PIXEL_CV',
-      };
-    } catch {
-      // Try next imagery provider
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  const synth = synthesizeDeterministicParcelOrthophotoRgba({
-    grid,
-    parcelVertices,
-    landClass,
-    spatial,
-    vectorContext,
-  });
-  return {
-    rgba: new Uint8Array(synth.buffer, synth.byteOffset, synth.byteLength),
-    sourceLabel: 'Ortofoto Sintética Georreferenciada EPSG:3763 (Modo Offline)',
-    engineMode: 'OFFLINE_SYNTHETIC_CV',
-  };
-}
 
 async function fetchLiveParcelVectorContext(params: {
   vertices: LatLon[];
@@ -815,7 +692,7 @@ self.addEventListener('notificationclick', (event) => {
 async function startServer() {
   const app = express();
   const httpServer = createHttpServer(app);
-  app.use(express.json({ limit: '6mb' }));
+  app.use(express.json({ limit: '12mb' }));
 
   app.get('/api/health', (_req, res) => {
     const integrations: ServerIntegrationCapabilities = {
@@ -827,7 +704,7 @@ async function startServer() {
         process.env.COPERNICUS_CLIENT_ID?.trim() && process.env.COPERNICUS_CLIENT_SECRET?.trim()
       ),
       eredesApiKeyConfigured: Boolean(process.env.EREDES_OPENDATA_API_KEY?.trim()),
-      orthophotoCvMicroserviceConfigured: Boolean(process.env.ORTHOPHOTO_CV_SERVICE_URL?.trim()),
+      orthophotoCvMicroserviceConfigured: Boolean(resolveConfiguredOrthophotoServiceUrl()),
       ollamaApiKeyConfigured: Boolean(process.env.OLLAMA_API_KEY?.trim()),
       telegramBotConfigured: Boolean(
         process.env.TELEGRAM_BOT_TOKEN?.trim() && process.env.TELEGRAM_DEFAULT_CHAT_ID?.trim()
@@ -1574,15 +1451,40 @@ async function startServer() {
   app.get('/api/spatial/orthophoto-cv/spec', (_req, res) => {
     const profile =
       process.env.ORTHOPHOTO_ONNX_PROFILE?.trim() || 'yolo11s-seg+segformer-b2-dgt25cm';
+    const resolvedUrl = resolveConfiguredOrthophotoServiceUrl();
+    const endpoints = resolvedUrl ? resolveOrthophotoServiceEndpoints(resolvedUrl) : null;
     res.json({
       ...buildOrthophotoInferenceSpec(profile),
-      externalMicroserviceConfigured: Boolean(process.env.ORTHOPHOTO_CV_SERVICE_URL?.trim()),
+      externalMicroserviceConfigured: Boolean(resolvedUrl),
+      remoteProtocol: endpoints?.preferredProtocol ?? null,
     });
   });
 
-  // Phase 2B: 25 cm Aerial Orthophoto Acquisition + 7-Class Segmentation + Crown & Annex Audit
-  app.post('/api/spatial/orthophoto-cv', async (req, res) => {
-    const body = req.body as {
+  // Phase 2A-Health: Live Probe of Configured Remote OrthoSeg KVM / SegFormer Service
+  app.get('/api/spatial/orthophoto-cv/health', async (req, res) => {
+    const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+    const health = await probeOrthophotoServiceHealth({ forceRefresh });
+    res.json({
+      reachable: health.reachable,
+      configured: health.configured,
+      status: health.status,
+      workers: health.workers,
+      workersWarmed: health.workersWarmed,
+      executionMode: health.executionMode,
+      buildingModelSource: health.buildingModelSource,
+      latencyMs: health.latencyMs,
+      checkedAtIso: health.checkedAtIso,
+      errorMessage: health.errorMessage,
+    });
+  });
+
+  // Shared handler for Parcel BBox Crop & Client Cropped-Image Orthophoto Inference
+  const handleOrthophotoCvInferenceRequest = async (
+    req: express.Request,
+    res: express.Response
+  ) => {
+    const isRawBinary = Buffer.isBuffer(req.body);
+    const body = (isRawBinary ? {} : req.body ?? {}) as {
       parcelId?: string;
       vertices?: LatLon[];
       buildingCenter?: LatLon;
@@ -1590,20 +1492,42 @@ async function startServer() {
       hasEredesLine?: boolean;
       eredesType?: ParcelRecord['eredesType'];
       vectorContext?: ParcelVectorContext;
+      croppedImageBase64?: string;
+      imageBase64?: string;
+      bboxWgs84?: [number, number, number, number];
+      cropRect?: PixelCropRect;
       fuseIntoBoolean?: boolean;
       forceRefresh?: boolean;
     };
 
-    const existing = body.parcelId ? parcelsStore.find((p) => p.id === body.parcelId) : undefined;
+    const parcelId =
+      body.parcelId ?? (typeof req.query.parcelId === 'string' ? req.query.parcelId : undefined);
+    const existing = parcelId ? parcelsStore.find((p) => p.id === parcelId) : undefined;
     const vertices =
       Array.isArray(body.vertices) && body.vertices.length >= 3
         ? body.vertices
         : (existing?.vertices ?? []);
 
     if (vertices.length < 3) {
-      res.status(400).json({ error: 'Indique pelo menos 3 vértices geográficos para analisar a ortofoto.' });
+      res.status(400).json({
+        error: 'Indique pelo menos 3 vértices geográficos ou um parcelId válido para analisar a ortofoto.',
+      });
       return;
     }
+
+    let queryBbox: [number, number, number, number] | undefined = body.bboxWgs84;
+    if (!queryBbox && typeof req.query.bboxWgs84 === 'string') {
+      const parts = req.query.bboxWgs84.split(',').map((n) => Number(n.trim()));
+      if (parts.length === 4 && parts.every((n) => Number.isFinite(n))) {
+        queryBbox = [parts[0], parts[1], parts[2], parts[3]];
+      }
+    }
+
+    const croppedImageBase64 = body.croppedImageBase64 ?? body.imageBase64;
+    const rawImageBuffer = isRawBinary && (req.body as Buffer).length > 0 ? (req.body as Buffer) : undefined;
+    const hasCustomCropInput = Boolean(
+      rawImageBuffer || (croppedImageBase64 && croppedImageBase64.trim()) || body.cropRect || queryBbox
+    );
 
     const landClass = body.landClass ?? existing?.landClass ?? 'FOREST_SCRUB';
     const hasEredesLine =
@@ -1613,6 +1537,7 @@ async function startServer() {
     const eredesType: ParcelRecord['eredesType'] = hasEredesLine
       ? (body.eredesType ?? existing?.eredesType ?? 'MT 15kV (Faixa 7m)')
       : 'Sem linha aérea';
+
     let vectorContext = body.vectorContext ?? existing?.vectorContext;
     if (!vectorContext) {
       vectorContext = synthesizeDeterministicCadastreContext({
@@ -1632,101 +1557,62 @@ async function startServer() {
       vectorContext,
     });
 
-    const grid = computeParcelCvRasterGrid(vertices, 28, 224);
-    const cacheKey = `${grid.bboxWgs84.join(',')}:${landClass}:${vectorContext.buildings.length}`;
+    const gridForKey = computeParcelCvRasterGrid(vertices, 20, 400);
+    const cacheKey = `${gridForKey.bboxWgs84.join(',')}:${landClass}:${vectorContext.buildings.length}`;
     const modelProfile =
       process.env.ORTHOPHOTO_ONNX_PROFILE?.trim() || 'yolo11s-seg+segformer-b2-dgt25cm';
 
     let cvAnalysis: ParcelOrthophotoCvAnalysis | null = null;
-    const cachedCv = !body.forceRefresh ? orthophotoCvCache.get(cacheKey) : undefined;
+    let inferenceTelemetry: Awaited<
+      ReturnType<typeof executeRemoteOrthophotoInference>
+    >['telemetry'] | null = null;
+
+    const cachedCv =
+      !body.forceRefresh && !hasCustomCropInput ? orthophotoCvCache.get(cacheKey) : undefined;
     if (cachedCv && cachedCv.expiresAt > Date.now() && !body.fuseIntoBoolean) {
       cvAnalysis = cachedCv.analysis;
     }
 
-    // Optional external ONNX Runtime / PyTorch FastAPI microservice bridge
-    const externalServiceUrl = process.env.ORTHOPHOTO_CV_SERVICE_URL?.trim();
-    if (!cvAnalysis && externalServiceUrl) {
-      const ctrl = new AbortController();
-      const timer = setTimeout(() => ctrl.abort(), 5500);
-      const cvHeaders: Record<string, string> = { 'Content-Type': 'application/json' };
-      const cvApiKey = process.env.ORTHOPHOTO_CV_API_KEY?.trim();
-      if (cvApiKey) {
-        cvHeaders.Authorization = `Bearer ${cvApiKey}`;
-      }
-      try {
-        const extResp = await fetch(externalServiceUrl, {
-          method: 'POST',
-          headers: cvHeaders,
-          body: JSON.stringify({
-            specVersion: 'SGIFR-ORTHOPHOTO-ONNX-V2',
-            modelProfile,
-            bboxWgs84: grid.bboxWgs84,
-            width: grid.width,
-            height: grid.height,
-            parcelVertices: vertices,
-            landClass,
-            vectorContext,
-          }),
-          signal: ctrl.signal,
-        });
-        if (extResp.ok) {
-          const extJson = (await extResp.json()) as { cvAnalysis?: ParcelOrthophotoCvAnalysis };
-          if (extJson.cvAnalysis) {
-            cvAnalysis = {
-              ...extJson.cvAnalysis,
-              engineMode: 'ONNX_MICROSERVICE',
-            };
-          }
-        }
-      } catch {
-        // External ONNX microservice unreachable — seamlessly execute built-in pixel CV pipeline
-      } finally {
-        clearTimeout(timer);
-      }
-    }
-
     if (!cvAnalysis) {
-      const acquired = await acquireParcelOrthophotoRgba({
-        grid,
-        parcelVertices: vertices,
-        landClass,
-        spatial,
-        vectorContext,
-        timeoutMs: 4200,
-      });
+      try {
+        const result = await executeRemoteOrthophotoInference({
+          parcelVertices: vertices,
+          landClass,
+          spatial,
+          vectorContext,
+          croppedImageBase64,
+          rawImageBuffer,
+          bboxWgs84: queryBbox,
+          cropRect: body.cropRect,
+          modelProfile,
+        });
+        cvAnalysis = result.cvAnalysis;
+        inferenceTelemetry = result.telemetry;
 
-      const pipelineOut = runOrthophotoPixelPipeline({
-        rgba: acquired.rgba,
-        grid,
-        parcelVertices: vertices,
-        landClass,
-        spatial,
-        vectorContext,
-        imagerySourceLabel: acquired.sourceLabel,
-        engineMode: acquired.engineMode,
-        modelProfile,
-      });
-
-      const pngOut = new PNG({ width: grid.width, height: grid.height });
-      pngOut.data = Buffer.from(
-        pipelineOut.overlayRgba.buffer,
-        pipelineOut.overlayRgba.byteOffset,
-        pipelineOut.overlayRgba.byteLength
-      );
-      const encodedPng = PNG.sync.write(pngOut);
-      cvAnalysis = {
-        ...pipelineOut.analysis,
-        overlayDataUrl: `data:image/png;base64,${encodedPng.toString('base64')}`,
-      };
-
-      orthophotoCvCache.set(cacheKey, {
-        expiresAt: Date.now() + 10 * 60_000,
-        analysis: cvAnalysis,
-      });
+        if (!hasCustomCropInput) {
+          orthophotoCvCache.set(cacheKey, {
+            expiresAt: Date.now() + 10 * 60_000,
+            analysis: cvAnalysis,
+          });
+        }
+      } catch (err) {
+        res.status(400).json({
+          error:
+            err instanceof Error
+              ? err.message
+              : 'Falha ao processar o recorte da ortofoto no serviço de inferência.',
+        });
+        return;
+      }
     }
 
     let addedBuildingsCount = 0;
-    if (body.fuseIntoBoolean) {
+    const fuseFlag =
+      Boolean(body.fuseIntoBoolean) ||
+      req.query.fuseIntoBoolean === '1' ||
+      req.query.fuseIntoBoolean === 'true';
+
+    if (fuseFlag) {
       const fused = fuseCvDetectionsIntoVectorContext({
         existingContext: vectorContext,
         cvAnalysis,
@@ -1748,15 +1634,18 @@ async function startServer() {
       };
     }
 
+    let updatedParcel: ParcelRecord | undefined;
     if (existing) {
       const idx = parcelsStore.findIndex((p) => p.id === existing.id);
       if (idx !== -1) {
-        parcelsStore[idx] = {
+        updatedParcel = {
           ...parcelsStore[idx],
           vectorContext,
           cvAnalysis,
           spatial,
         };
+        parcelsStore[idx] = updatedParcel;
+        void infraBridge.persistParcelPostgis(updatedParcel);
       }
     }
 
@@ -1765,8 +1654,23 @@ async function startServer() {
       vectorContext,
       spatial,
       addedBuildingsCount,
+      parcel: updatedParcel,
+      telemetry: inferenceTelemetry,
     });
-  });
+  };
+
+  // Phase 2B: 25 cm Aerial Orthophoto Acquisition + Remote SegFormer / OrthoSeg KVM Inference
+  app.post('/api/spatial/orthophoto-cv', handleOrthophotoCvInferenceRequest);
+
+  // Phase 2C: Explicit Cropped Orthophoto Upload Endpoint (JSON base64 + cropRect OR raw binary PNG/JPEG)
+  app.post(
+    '/api/spatial/orthophoto-cv/crop',
+    express.raw({
+      type: ['image/png', 'image/jpeg', 'application/octet-stream'],
+      limit: '12mb',
+    }),
+    handleOrthophotoCvInferenceRequest
+  );
 
   // Official DGT / BUPi Cadastre OGC API Features Lookup around map target point
   app.post('/api/spatial/official-cadastre', async (req, res) => {

@@ -20,6 +20,7 @@ import {
   RotateCcw,
   ShieldAlert,
   Trash2,
+  Upload,
   Wifi,
   Zap,
 } from 'lucide-react';
@@ -271,6 +272,15 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     summary: string;
     analyzedAtTime: string;
   } | null>(null);
+  const [cvCropError, setCvCropError] = useState<string | null>(null);
+  const croppedImageInputRef = useRef<HTMLInputElement | null>(null);
+  const [remoteCvHealth, setRemoteCvHealth] = useState<{
+    reachable: boolean;
+    configured: boolean;
+    workers?: number;
+    executionMode?: string;
+    latencyMs?: number;
+  } | null>(null);
   const [lookingUpCadastre, setLookingUpCadastre] = useState(false);
   const [cadastreLookupNotice, setCadastreLookupNotice] = useState<string | null>(null);
   const [calculatingSlope, setCalculatingSlope] = useState(false);
@@ -482,6 +492,35 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
       }
     };
   }, [refreshCacheOverview]);
+
+  useEffect(() => {
+    if (!isOnline) return;
+    let cancelled = false;
+    void fetch('/api/spatial/orthophoto-cv/health')
+      .then(async (resp) => {
+        if (!resp.ok || cancelled) return;
+        const data = (await resp.json()) as {
+          reachable?: boolean;
+          configured?: boolean;
+          workers?: number;
+          executionMode?: string;
+          latencyMs?: number;
+        };
+        if (!cancelled) {
+          setRemoteCvHealth({
+            reachable: Boolean(data.reachable),
+            configured: Boolean(data.configured),
+            workers: data.workers,
+            executionMode: data.executionMode,
+            latencyMs: data.latencyMs,
+          });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [isOnline]);
 
   const handleTileServed = useCallback(
     (source: TileServeSource) => {
@@ -1506,18 +1545,26 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
     }
   };
 
-  const handleRunOrthophotoCv = async () => {
+  const handleRunOrthophotoCv = async (opts?: {
+    croppedImageBase64?: string;
+    customBboxWgs84?: [number, number, number, number];
+  }) => {
     if (runningOrthophotoCv) return;
     setRunningOrthophotoCv(true);
+    setCvCropError(null);
     try {
       let nextCv: ParcelOrthophotoCvAnalysis | null = null;
       let nextVectorContext: ParcelVectorContext | undefined = activeParcel.vectorContext;
       let nextSpatial: SpatialZoneBreakdown = activeParcel.spatial;
+      let telemetrySummary: string | null = null;
 
       const isBrowserOnline = typeof navigator === 'undefined' || navigator.onLine !== false;
       if (isBrowserOnline) {
+        const endpoint = opts?.croppedImageBase64
+          ? '/api/spatial/orthophoto-cv/crop'
+          : '/api/spatial/orthophoto-cv';
         try {
-          const res = await fetch('/api/spatial/orthophoto-cv', {
+          const res = await fetch(endpoint, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
@@ -1528,6 +1575,8 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
               hasEredesLine: activeParcel.hasEredesLine,
               eredesType: activeParcel.eredesType,
               vectorContext: activeParcel.vectorContext,
+              croppedImageBase64: opts?.croppedImageBase64,
+              bboxWgs84: opts?.customBboxWgs84,
               forceRefresh: true,
             }),
           });
@@ -1536,12 +1585,26 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
               cvAnalysis?: ParcelOrthophotoCvAnalysis;
               vectorContext?: ParcelVectorContext;
               spatial?: SpatialZoneBreakdown;
+              telemetry?: {
+                usedRemoteService?: boolean;
+                elapsedMs?: number;
+                sourceModels?: string[];
+              } | null;
             };
             if (payload.cvAnalysis) {
               nextCv = payload.cvAnalysis;
               if (payload.vectorContext) nextVectorContext = payload.vectorContext;
               if (payload.spatial) nextSpatial = payload.spatial;
+              if (payload.telemetry?.usedRemoteService) {
+                const secs = ((payload.telemetry.elapsedMs ?? 0) / 1000).toFixed(1);
+                const modelTag = payload.telemetry.sourceModels?.join(' + ') || nextCv.modelProfile;
+                telemetrySummary = `Inferência remota (${modelTag}) · ${nextCv.crowns.length} copas · GSD ${nextCv.gsdMetersPerPx.toFixed(2)} m/px · ${secs} s`;
+              }
             }
+          } else if (opts?.croppedImageBase64) {
+            const errJson = (await res.json().catch(() => ({}))) as { error?: string };
+            setCvCropError(errJson.error ?? 'Falha ao analisar o recorte da ortofoto.');
+            return;
           }
         } catch {
           // Offline or transient error — fall back to local isomorphic pixel CV pipeline
@@ -1590,11 +1653,53 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
       setVisibleLayers((prev) => ({ ...prev, orthophotoCv: true }));
       setCvStatusNotice({
         parcelId: activeParcel.id,
-        summary: `${nextCv.imagerySourceLabel} · ${nextCv.crowns.length} copas · GSD ${nextCv.gsdMetersPerPx.toFixed(2)} m/px`,
+        summary:
+          telemetrySummary ??
+          `${nextCv.imagerySourceLabel} · ${nextCv.crowns.length} copas · GSD ${nextCv.gsdMetersPerPx.toFixed(2)} m/px`,
         analyzedAtTime: new Date().toISOString().slice(11, 19) + ' UTC',
       });
     } finally {
       setRunningOrthophotoCv(false);
+    }
+  };
+
+  const handleUploadCroppedOrthophotoFile = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    setCvCropError(null);
+
+    try {
+      const objectUrl = URL.createObjectURL(file);
+      const img = await new Promise<HTMLImageElement>((resolve, reject) => {
+        const el = new Image();
+        el.onload = () => resolve(el);
+        el.onerror = () => reject(new Error('Não foi possível ler o ficheiro de imagem.'));
+        el.src = objectUrl;
+      });
+      URL.revokeObjectURL(objectUrl);
+
+      const maxDim = 640;
+      const scale = Math.min(1, maxDim / Math.max(img.naturalWidth || 1, img.naturalHeight || 1));
+      const targetW = Math.max(64, Math.round(((img.naturalWidth || 256) * scale) / 8) * 8);
+      const targetH = Math.max(64, Math.round(((img.naturalHeight || 256) * scale) / 8) * 8);
+
+      const canvas = document.createElement('canvas');
+      canvas.width = targetW;
+      canvas.height = targetH;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) {
+        setCvCropError('Contexto gráfico indisponível para normalizar o recorte.');
+        return;
+      }
+      ctx.drawImage(img, 0, 0, targetW, targetH);
+      const dataUrl = canvas.toDataURL('image/png');
+
+      await handleRunOrthophotoCv({ croppedImageBase64: dataUrl });
+    } catch (err) {
+      setCvCropError(
+        err instanceof Error ? err.message : 'Erro ao preparar recorte da ortofoto.'
+      );
     }
   };
 
@@ -2957,10 +3062,46 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                   <div className="text-xs font-semibold text-slate-900 dark:text-slate-100">
                     Pipeline CV Ortofoto 25 cm (Copas, Mato &amp; Anexos)
                   </div>
+                  <p
+                    data-testid="orthophoto-remote-service-status"
+                    className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5"
+                  >
+                    {remoteCvHealth?.reachable ? (
+                      <>
+                        <span className="text-[#14532D] dark:text-[#4ADE80] font-semibold">
+                          Inferência neural remota ligada
+                        </span>
+                        {remoteCvHealth.workers !== undefined && (
+                          <>
+                            <span aria-hidden="true"> · </span>
+                            <span>{remoteCvHealth.workers} workers</span>
+                          </>
+                        )}
+                        {remoteCvHealth.executionMode && (
+                          <>
+                            <span aria-hidden="true"> · </span>
+                            <span>{remoteCvHealth.executionMode}</span>
+                          </>
+                        )}
+                        {remoteCvHealth.latencyMs !== undefined && (
+                          <>
+                            <span aria-hidden="true"> · </span>
+                            <span>{remoteCvHealth.latencyMs} ms</span>
+                          </>
+                        )}
+                      </>
+                    ) : (
+                      <span>
+                        {isOnline
+                          ? 'Serviço CV Node.js pronto · SegFormer + DeepForest ONNX'
+                          : 'Modo sem rede · Segmentação espectral local ativa'}
+                      </span>
+                    )}
+                  </p>
 
                   {activeParcel.cvAnalysis ? (
                     <>
-                      <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-0.5">
+                      <p className="text-xs text-slate-500 dark:text-slate-400 font-mono tabular-nums mt-1">
                         <span>
                           Zona 1 inerte: {activeParcel.cvAnalysis.zoneCompliance.zone1BareMineralPct.toFixed(0)}%
                         </span>
@@ -2998,18 +3139,27 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                       </p>
                     </>
                   ) : (
-                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-0.5">
+                    <p className="text-xs text-slate-500 dark:text-slate-400 mt-1">
                       Segmentação semântica em 7 classes SGIFR, medição de copas individuais (&lt;5 m fachada / &lt;10 m pinhal) e deteção de anexos omissos no cadastro.
                     </p>
                   )}
                 </div>
+
+                <input
+                  ref={croppedImageInputRef}
+                  type="file"
+                  accept="image/png,image/jpeg,image/webp"
+                  aria-label="Carregar imagem recortada da ortofoto"
+                  onChange={(ev) => void handleUploadCroppedOrthophotoFile(ev)}
+                  className="hidden"
+                />
 
                 <div className="flex flex-wrap items-center gap-2">
                   <button
                     type="button"
                     data-testid="run-orthophoto-cv-btn"
                     disabled={runningOrthophotoCv}
-                    onClick={handleRunOrthophotoCv}
+                    onClick={() => void handleRunOrthophotoCv()}
                     className="min-h-[40px] px-3.5 py-1.5 rounded-xl bg-[#14532D] hover:bg-[#0F3F22] dark:bg-[#22C55E] dark:hover:bg-[#16A34A] text-white dark:text-slate-950 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
                   >
                     <RefreshCw
@@ -3023,6 +3173,18 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                           ? 'Reanalisar Ortofoto 25 cm'
                           : 'Analisar Ortofoto 25 cm (CV)'}
                     </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    data-testid="upload-cropped-orthophoto-btn"
+                    disabled={runningOrthophotoCv || !isOnline}
+                    onClick={() => croppedImageInputRef.current?.click()}
+                    title="Enviar imagem recortada (PNG/JPEG) para o serviço remoto de inferência CV"
+                    className="min-h-[40px] px-3.5 py-1.5 rounded-xl border border-slate-300 dark:border-[#263248] bg-slate-50 hover:bg-slate-100 dark:bg-[#0B0F17] dark:hover:bg-slate-800 text-slate-900 dark:text-slate-100 text-xs font-semibold transition-colors inline-flex items-center justify-center gap-1.5 whitespace-nowrap shrink-0 disabled:opacity-50"
+                  >
+                    <Upload className="w-3.5 h-3.5 text-[#14532D] dark:text-[#22C55E] shrink-0" aria-hidden="true" />
+                    <span>Enviar Recorte Ortofoto</span>
                   </button>
 
                   {activeParcel.cvAnalysis &&
@@ -3040,6 +3202,12 @@ export const MapZonesView: React.FC<MapZonesViewProps> = ({
                     )}
                 </div>
               </div>
+
+              {cvCropError && (
+                <p role="alert" className="text-xs font-semibold text-[#DC2626]">
+                  {cvCropError}
+                </p>
+              )}
 
               {cvStatusNotice?.parcelId === activeParcel.id && (
                 <p
