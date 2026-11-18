@@ -1260,7 +1260,7 @@ export default function App() {
               onClick={() => void handleShareActiveParcel()}
               aria-label={`Share deep-link for ${activeParcel.label}`}
               title={`Copy deep-link URL for ${activeParcel.label}`}
-              className={`min-h-[42px] min-w-[44px] px-3 py-1.5 rounded-xl border transition-colors inline-flex items-center justify-center shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E] ${
+              className={`hidden min-h-[42px] min-w-[44px] px-3 py-1.5 rounded-xl border transition-colors items-center justify-center shrink-0 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#14532D] dark:focus-visible:ring-[#22C55E] ${
                 shareToast?.parcelId === activeParcel.id
                   ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D] dark:bg-[#22C55E] text-white dark:text-slate-950'
                   : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-[#14532D] dark:text-[#22C55E] hover:bg-[#14532D]/10 dark:hover:bg-[#22C55E]/15'
@@ -1276,7 +1276,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => setShowHistoryModal(true)}
-                className={`min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl border text-xs font-semibold transition-colors inline-flex items-center gap-1.5 whitespace-nowrap shrink-0 tabular-nums ${
+                className={`hidden min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl border text-xs font-semibold transition-colors items-center gap-1.5 whitespace-nowrap shrink-0 tabular-nums ${
                   userProfile
                     ? 'border-[#14532D] dark:border-[#22C55E] bg-[#14532D]/10 dark:bg-[#22C55E]/15 text-[#14532D] dark:text-[#22C55E]'
                     : 'border-slate-300 dark:border-[#263248] bg-white dark:bg-[#161E2E] text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800'
@@ -1322,7 +1322,7 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => updateDarkMode((d) => !d)}
-                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                className="hidden min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 {darkMode ? (
                   <>
@@ -1344,7 +1344,7 @@ export default function App() {
                 type="button"
                 onClick={() => void handleSignOutAll()}
                 aria-label="Terminar sessão"
-                className="min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 inline-flex items-center gap-1.5 whitespace-nowrap shrink-0"
+                className="hidden min-h-[40px] px-2.5 sm:px-3 py-1.5 rounded-xl bg-white dark:bg-[#161E2E] border border-slate-300 dark:border-[#263248] text-xs font-semibold text-slate-800 dark:text-slate-200 hover:bg-slate-50 dark:hover:bg-slate-800 items-center gap-1.5 whitespace-nowrap shrink-0"
               >
                 <LogOut className="w-3.5 h-3.5 text-slate-600 dark:text-slate-300" aria-hidden="true" />
                 <span className="hidden sm:inline">Terminar Sessão</span>
